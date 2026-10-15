@@ -12,6 +12,8 @@ int APS5_VABI scePthreadAttrSetdetachstate(PthreadAttr* attr, int state);
 int APS5_VABI scePthreadAttrGetdetachstate(const PthreadAttr* attr, int* state);
 int APS5_VABI scePthreadAttrSetschedpolicy(PthreadAttr* attr, int policy);
 int APS5_VABI scePthreadAttrSetinheritsched(PthreadAttr* attr, int inheritSched);
+int APS5_VABI scePthreadAttrGetschedpolicy(const PthreadAttr* attr, int* policy);
+int APS5_VABI scePthreadAttrGetinheritsched(const PthreadAttr* attr, int* inheritSched);
 int APS5_VABI scePthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param);
 int APS5_VABI scePthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedParam* param);
 int APS5_VABI scePthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask);
@@ -36,10 +38,19 @@ int main() {
     for (int state : {0, 1}) Require(scePthreadAttrSetdetachstate(&attr, state) == SCE_OK);
 
     for (int policy : {-1, 0, 2, 4}) Require(scePthreadAttrSetschedpolicy(&attr, policy) == SCE_KERNEL_ERROR_EOPNOTSUPP);
-    for (int policy : {1, 3}) Require(scePthreadAttrSetschedpolicy(&attr, policy) == SCE_OK);
+    int read = 0;
+    Require(scePthreadAttrGetschedpolicy(&attr, &read) == SCE_OK && read == 1);
+    for (int policy : {1, 3}) {
+        Require(scePthreadAttrSetschedpolicy(&attr, policy) == SCE_OK);
+        Require(scePthreadAttrGetschedpolicy(&attr, &read) == SCE_OK && read == policy);
+    }
 
     for (int inherit : {-1, 1, 2, 8}) Require(scePthreadAttrSetinheritsched(&attr, inherit) == SCE_KERNEL_ERROR_EOPNOTSUPP);
-    for (int inherit : {0, 4}) Require(scePthreadAttrSetinheritsched(&attr, inherit) == SCE_OK);
+    Require(scePthreadAttrGetinheritsched(&attr, &read) == SCE_OK && read == 4);
+    for (int inherit : {0, 4}) {
+        Require(scePthreadAttrSetinheritsched(&attr, inherit) == SCE_OK);
+        Require(scePthreadAttrGetinheritsched(&attr, &read) == SCE_OK && read == inherit);
+    }
 
     KernelSchedParam param{};
     for (int priority : {-1, 0, 255, 768, 900, 960}) {
@@ -62,6 +73,8 @@ int main() {
     Require(scePthreadAttrGetstacksize(&attr, nullptr) == SCE_KERNEL_ERROR_EINVAL);
     Require(scePthreadAttrGetdetachstate(&attr, nullptr) == SCE_KERNEL_ERROR_EINVAL);
     Require(scePthreadAttrGetschedparam(&attr, nullptr) == SCE_KERNEL_ERROR_EINVAL);
+    Require(scePthreadAttrGetschedpolicy(&attr, nullptr) == SCE_KERNEL_ERROR_EINVAL);
+    Require(scePthreadAttrGetinheritsched(&attr, nullptr) == SCE_KERNEL_ERROR_EINVAL);
 
     for (PthreadAttr* missing : {static_cast<PthreadAttr*>(nullptr), static_cast<PthreadAttr*>(&attr)}) {
         PthreadAttr unset = nullptr;
@@ -77,6 +90,8 @@ int main() {
         Require(scePthreadAttrGetdetachstate(target, &state) == SCE_KERNEL_ERROR_EINVAL);
         Require(scePthreadAttrGetschedparam(target, &param) == SCE_KERNEL_ERROR_EINVAL);
         Require(scePthreadAttrGetaffinity(target, &mask) == SCE_KERNEL_ERROR_EINVAL);
+        Require(scePthreadAttrGetschedpolicy(target, &state) == SCE_KERNEL_ERROR_EINVAL);
+        Require(scePthreadAttrGetinheritsched(target, &state) == SCE_KERNEL_ERROR_EINVAL);
         Require(scePthreadAttrDestroy(target) == SCE_KERNEL_ERROR_EINVAL);
     }
 

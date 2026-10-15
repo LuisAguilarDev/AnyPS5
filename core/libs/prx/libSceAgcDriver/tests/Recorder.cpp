@@ -5550,7 +5550,7 @@ void pendingKeyStoreTests(const Device& device, Recorder& recorder) {
         return;
     }
     recorder.Sync();
-    std::memset(keys, 0x00, keyCount);
+    std::memset(keys, 0x00, bytes);
     MarkDccUncompressed(context, address, surfaceBytes);
     Require(recorder.PendingWriteOverlaps(address, keyCount) && keys[0] == 0x00, "the uncompressed key store did not stay pending");
     Require(CurrentDccKeys(address, surfaceBytes) == DccKeys::Uncompressed, "the keys after a pending uncompressed store do not read as uncompressed");
@@ -7429,6 +7429,43 @@ int pipelineCacheFileTests(const Device& device) {
         PipelineCache idle(context, properties);
     }
     Require(contents(path) == stored, "an object that added no pipelines rewrote the cache file");
+    {
+        PipelineCache unseeded(context, properties, false);
+        Require(!holds(unseeded.Handle(), 0), "a cache created without the file already held a pipeline of the file");
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0) && holds(reloaded.Handle(), 1), "an unseeded cache dropped pipelines from the cache file when it saved");
+    }
+    std::filesystem::remove_all(directory);
+    {
+        PipelineCache writer(context, properties);
+        build(writer.Handle(), 0);
+    }
+    {
+        PipelineCache unseeded(context, properties, false);
+        unseeded.SaveNow();
+        build(unseeded.Handle(), 1);
+        unseeded.SaveNow();
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0) && holds(reloaded.Handle(), 1), "an unseeded cache that saved twice over an unchanged file lost pipelines of the file");
+    }
+    std::filesystem::remove_all(directory);
+    {
+        PipelineCache writer(context, properties);
+        build(writer.Handle(), 0);
+    }
+    {
+        PipelineCache extender(context, properties);
+        Require(holds(extender.Handle(), 0), "the cache file lost a pipeline");
+        build(extender.Handle(), 1);
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0) && holds(reloaded.Handle(), 1), "a cache that saved over an unchanged file lost pipelines");
+    }
     {
         std::ofstream corrupt(path, std::ios::binary | std::ios::trunc);
         corrupt << "not a pipeline cache";

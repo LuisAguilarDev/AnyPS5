@@ -258,13 +258,13 @@ VkStencilOpState stencilFace(std::uint32_t compare, std::uint32_t ops, std::uint
 void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValExport, State& result) {
     zero(cx, 0x000, 0x00001f9cu, "depth copy, resummarize or decompress draws (DB_RENDER_CONTROL)");
     const bool depthClear = (read(cx, 0x000) & 1u) != 0;
-    const bool stencilClear = (read(cx, 0x000) & 2u) != 0;
     const auto view = read(cx, 0x002);
     zero(cx, 0x002, 0x3c000000u, "depth mips (DB_DEPTH_VIEW MIP_LEVEL)");
     zero(cx, 0x010, 0x000f1000u, "partially resident or mipmapped depth (DB_Z_INFO)");
     zero(cx, 0x011, 0x00001000u, "partially resident stencil (DB_STENCIL_INFO)");
     const auto zFormat = read(cx, 0x010) & 3u;
     const bool stencil = (read(cx, 0x011) & 1u) != 0;
+    const bool stencilClear = stencil && (read(cx, 0x000) & 2u) != 0;
     Require(zFormat != 2, "Z_24 depth is unsupported");
     if (zFormat == 0) depthControl &= ~6u;
     if (!stencil) depthControl &= ~1u;
@@ -274,7 +274,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     };
     const bool depthReadOnly = (view & 0x01000000u) != 0;
     const bool stencilReadOnly = (view & 0x02000000u) != 0;
-    Require(!stencilClear || (stencil && !stencilReadOnly), "stencil clear requires a writable stencil plane");
+    Require(!stencilClear || !stencilReadOnly, "stencil clear requires a writable stencil plane");
     Require(!stencilClear || !testValExport, "stencil clear with a pixel shader that exports the stencil test value is unsupported");
     Require(!depthClear || (zFormat != 0 && !depthReadOnly), "depth clear requires a writable depth plane");
     DepthTarget depth{};
@@ -1623,10 +1623,11 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x200, word)) {
         const auto renderControl = find(cx, 0x000);
         const bool depthClear = renderControl != cx.end() && (renderControl->second & 1u) != 0;
-        const bool stencilClear = renderControl != cx.end() && (renderControl->second & 2u) != 0;
+        std::uint32_t stencilInfo = 0;
+        const bool stencilClear = renderControl != cx.end() && (renderControl->second & 2u) != 0 && !(value(cx, 0x011, stencilInfo) && (stencilInfo & 1u) == 0);
         if (stencilClear && !depthPlanesAbsent(cx)) {
-            std::uint32_t stencil = 0, view = 0;
-            if ((value(cx, 0x011, stencil) && (stencil & 1u) == 0) || (value(cx, 0x002, view) && (view & 0x02000000u) != 0)) return require(false, "stencil clear requires a writable stencil plane");
+            std::uint32_t view = 0;
+            if (value(cx, 0x002, view) && (view & 0x02000000u) != 0) return require(false, "stencil clear requires a writable stencil plane");
         }
         if (depthClear && !depthPlanesAbsent(cx)) {
             std::uint32_t z = 0, view = 0;

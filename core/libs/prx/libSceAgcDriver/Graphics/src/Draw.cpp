@@ -335,6 +335,14 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+enum RecordPart : std::size_t { RecordPrologue, RecordBindings, RecordPass, RecordBarriers, RecordBegin, RecordContinue, RecordBind, RecordPush, RecordCommands, RecordLeave, RecordPartCount };
+constexpr std::array<const char*, RecordPartCount> RecordPartNames{"prologue", "bindings", "pass", "barriers", "begin", "continue", "bind", "push", "commands", "leave"};
+
+struct RecordSplit {
+    bool used = false;
+    std::array<double, RecordPartCount> us{};
+    ShaderResources::DrawBindingsProfile bindings;
+};
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
@@ -457,6 +465,13 @@ struct DrawProfile {
     // Draw packets that drew nothing, by DrawSkip, and their time.
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
+    std::uint64_t splitDraws = 0;
+    double splitRecordUs = 0;
+    std::array<double, RecordPartCount> splitUs{};
+    ShaderResources::DrawBindingsProfile splitBindings;
+    std::array<std::uint64_t, KindCount> splitKindDraws{};
+    std::array<std::uint64_t, KindCount> splitKindSets{};
+    std::array<std::uint64_t, KindCount> splitKindFreshSets{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
@@ -467,9 +482,72 @@ DrawProfile& Profile() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
-void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
+void addBindingsProfile(ShaderResources::DrawBindingsProfile& total, const ShaderResources::DrawBindingsProfile& draw) {
+    total.snapshotUs += draw.snapshotUs;
+    total.allocateUs += draw.allocateUs;
+    total.writeUs += draw.writeUs;
+    total.sets += draw.sets;
+    total.freshSets += draw.freshSets;
+    total.updateCalls += draw.updateCalls;
+    total.writes += draw.writes;
+    total.descriptors += draw.descriptors;
+    total.snapshots += draw.snapshots;
+    total.movedSnapshots += draw.movedSnapshots;
+    total.snapshotBytes += draw.snapshotBytes;
+    total.copiedSnapshots += draw.copiedSnapshots;
+    total.copiedBytes += draw.copiedBytes;
+}
+
+void addRecordSplit(DrawProfile& profile, const RecordSplit& split, double recordUs, std::size_t kind) {
+    ++profile.splitDraws;
+    profile.splitRecordUs += recordUs;
+    for (std::size_t i = 0; i < RecordPartCount; ++i) profile.splitUs[i] += split.us[i];
+    addBindingsProfile(profile.splitBindings, split.bindings);
+    if (kind >= KindCount) return;
+    ++profile.splitKindDraws[kind];
+    profile.splitKindSets[kind] += split.bindings.sets;
+    profile.splitKindFreshSets[kind] += split.bindings.freshSets;
+}
+
+void printRecordSplit(const DrawProfile& profile) {
+    const auto perDraw = [&](double total) { return profile.splitDraws != 0 ? total / static_cast<double>(profile.splitDraws) : 0.0; };
+    const auto& bindings = profile.splitBindings;
+    double partsUs = 0;
+    for (const auto part : profile.splitUs) partsUs += part;
+    char line[2048];
+    int n = std::snprintf(line, sizeof(line), "[draws] record split over 10 s (total ms/avg us per draw), %llu recorded draws, record=%.1f/%.2f:", static_cast<unsigned long long>(profile.splitDraws), profile.splitRecordUs / 1000.0, perDraw(profile.splitRecordUs));
+    const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
+    for (std::size_t i = 0; i < RecordPartCount && room(); ++i) {
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1f/%.2f", RecordPartNames[i], profile.splitUs[i] / 1000.0, perDraw(profile.splitUs[i]));
+        if (i != RecordBindings || !room()) continue;
+        const auto otherUs = std::max(0.0, profile.splitUs[RecordBindings] - bindings.snapshotUs - bindings.allocateUs - bindings.writeUs);
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (snapshot %.1f/%.2f, allocate %.1f/%.2f, write %.1f/%.2f, other %.1f/%.2f)", bindings.snapshotUs / 1000.0, perDraw(bindings.snapshotUs), bindings.allocateUs / 1000.0, perDraw(bindings.allocateUs), bindings.writeUs / 1000.0, perDraw(bindings.writeUs), otherUs / 1000.0, perDraw(otherUs));
+    }
+    const auto otherUs = std::max(0.0, profile.splitRecordUs - partsUs);
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " other=%.1f/%.2f; descriptor sets per draw %.2f (%llu, %llu fresh), by kind:", otherUs / 1000.0, perDraw(otherUs), perDraw(static_cast<double>(bindings.sets)), static_cast<unsigned long long>(bindings.sets), static_cast<unsigned long long>(bindings.freshSets));
+    for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
+        const auto draws = profile.splitKindDraws[kind];
+        const auto average = draws != 0 ? static_cast<double>(profile.splitKindSets[kind]) / static_cast<double>(draws) : 0.0;
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f (%llu draws, %llu fresh)", DrawKindNames[kind], average, static_cast<unsigned long long>(draws), static_cast<unsigned long long>(profile.splitKindFreshSets[kind]));
+    }
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; vkUpdateDescriptorSets per draw %.2f (%.2f writes, %.2f descriptors); snapshots per draw %.2f (%.2f moved, %.2f copied, %.0f bytes copied, %.0f bytes bound)", perDraw(static_cast<double>(bindings.updateCalls)), perDraw(static_cast<double>(bindings.writes)), perDraw(static_cast<double>(bindings.descriptors)), perDraw(static_cast<double>(bindings.snapshots)), perDraw(static_cast<double>(bindings.movedSnapshots)), perDraw(static_cast<double>(bindings.copiedSnapshots)), perDraw(static_cast<double>(bindings.copiedBytes)), perDraw(static_cast<double>(bindings.snapshotBytes)));
+    std::fprintf(stderr, "%s\n", line);
+}
+
+void resetRecordSplit(DrawProfile& profile) {
+    profile.splitDraws = 0;
+    profile.splitRecordUs = 0;
+    profile.splitUs.fill(0);
+    profile.splitBindings = {};
+    profile.splitKindDraws.fill(0);
+    profile.splitKindSets.fill(0);
+    profile.splitKindFreshSets.fill(0);
+}
+
+void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& split, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
+    if (split.used) addRecordSplit(profile, split, us[PhaseRecord], outcome.kind);
     double drawUs = 0;
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         profile.totalsUs[i] += us[i];
@@ -558,6 +636,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    if (profile.splitDraws != 0) printRecordSplit(profile);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
@@ -583,6 +662,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.indirectReadUs = 0;
     profile.skips.fill(0);
     profile.skipUs.fill(0);
+    resetRecordSplit(profile);
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -866,6 +946,7 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
+    RecordSplit split;
     explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
         if (!profile) return;
@@ -873,6 +954,16 @@ struct DrawTimer {
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
     }
+    void part(RecordPart which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
+        us[PhaseRecord] += elapsed;
+        split.us[which] += elapsed;
+        split.used = true;
+        phaseStart = now;
+    }
+    ShaderResources::DrawBindingsProfile* bindingsProfile() { return profile ? &split.bindings : nullptr; }
 };
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
@@ -892,7 +983,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
         }
         std::fprintf(stderr, "%s\n", line);
     }
-    reportDraw(timer.us, built, outcome);
+    reportDraw(timer.us, timer.split, built, outcome);
 }
 
 }
@@ -1748,7 +1839,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    timer.part(RecordPrologue);
+    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.bindingsProfile());
+    timer.part(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -1792,6 +1885,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
+    timer.part(RecordPass);
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -1800,6 +1894,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(commands, state);
+        timer.part(RecordContinue);
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
@@ -1824,7 +1919,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        timer.part(RecordBarriers);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        timer.part(RecordBegin);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -1835,8 +1932,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     } else {
         resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
     }
+    timer.part(RecordBind);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
+    timer.part(RecordPush);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     else {
@@ -1855,6 +1954,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
+    timer.part(RecordCommands);
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && !record.proxies.empty()) {
         storeProxies = [proxies = record.proxies](VkCommandBuffer passCommands) {
@@ -1865,6 +1965,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    timer.part(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);

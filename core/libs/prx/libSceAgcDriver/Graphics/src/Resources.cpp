@@ -106,11 +106,21 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     }
 }
 
+Buffer::Buffer(std::shared_ptr<Buffer> source, VkDeviceSize offset, std::size_t size) : context(source->context), size(size), capacity(size), usage(source->usage), properties(source->properties), parent(std::move(source)), viewOffset(offset) {
+    Require(size != 0, "zero-sized GPU buffer view");
+    Require(parent->mapping != nullptr && parent->parent == nullptr, "a buffer view needs a mapped buffer of its own");
+    Require(offset <= parent->size && size <= parent->size - offset, "a buffer view exceeds its buffer");
+    buffer = parent->buffer;
+    mapping = static_cast<std::byte*>(parent->mapping) + offset;
+    deviceAddress = parent->deviceAddress != 0 ? parent->deviceAddress + offset : 0;
+}
+
 Buffer::~Buffer() {
     release();
 }
 
 void Buffer::release() noexcept {
+    if (parent != nullptr) return;
     if (ready && cache) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
         return;
@@ -135,6 +145,7 @@ std::span<std::byte> Buffer::Bytes() {
 }
 
 void Buffer::Invalidate() {
+    if (parent != nullptr) return parent->Invalidate();
     Require(mapping != nullptr, "cannot invalidate an unmapped GPU buffer");
     VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     range.memory = memory;

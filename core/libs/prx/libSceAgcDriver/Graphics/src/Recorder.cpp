@@ -2565,6 +2565,29 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     unwrittenBytes += bytes;
 }
 
+std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
+    static const bool separate = std::getenv("APS5_NO_DRAW_SNAPSHOT_ARENA") != nullptr;
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (separate || bytes > DrawSnapshotSliceBytes) return std::make_shared<Buffer>(context, bytes, usage);
+    // Slices start on a cache line and the storage buffer offset alignment. Only the slices keep the
+    // arena alive past this recorder's hold: a recorded draw keeps its bindings (and so its slices)
+    // until its batch completed, so an arena no slice holds any more is free to be filled again
+    // (the fence orders that after the release of its last slice).
+    constexpr std::size_t cacheLine = 64;
+    const auto alignment = std::max<std::size_t>(static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment), cacheLine);
+    auto offset = (snapshotArenaUsed + alignment - 1) / alignment * alignment;
+    if (snapshotArena != nullptr && snapshotArena.use_count() == 1) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        offset = 0;
+    }
+    if (snapshotArena == nullptr || offset + bytes > DrawSnapshotArenaBytes) {
+        snapshotArena = std::make_shared<Buffer>(context, DrawSnapshotArenaBytes, usage);
+        offset = 0;
+    }
+    snapshotArenaUsed = offset + bytes;
+    return std::make_shared<Buffer>(snapshotArena, static_cast<VkDeviceSize>(offset), bytes);
+}
+
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};

@@ -2661,6 +2661,90 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// Draw bindings of a template hit whose seven read-only ranges moved to fresh constant-ring bytes
+// on every draw (the Xenoverse 2 pattern: ~775 draws a frame), timed per draw with the bindings
+// profile. --benchmark-draw-snapshots; APS5_NO_DRAW_SNAPSHOT_ARENA=1 times the earlier path.
+void drawSnapshotBenchmark(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = std::size_t{4} << 20u;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: draw snapshot benchmark skipped\n";
+        return;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    Require(HostImportFor(context, address, bytes) != nullptr, "benchmark block import refused");
+    constexpr std::size_t elements = 7;
+    constexpr std::size_t elementBytes = 352;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = elements;
+    for (std::size_t i = 0; i < elements; ++i) {
+        const auto element = address + 4096 + i * 512;
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u});
+    }
+    binding.bufferWritten.assign(elements, false);
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    Recorder snapshotRecorder(snapshotContext);
+    snapshotRecorder.Activate();
+    ShaderResources resources(snapshotContext, compute);
+    constexpr std::size_t drawsPerFrame = 775;
+    std::uint64_t ring = 65536;
+    for (int round = 0; round < 2; ++round) {
+        ShaderResources::DrawBindingsProfile profile;
+        double total = 0;
+        constexpr int frames = 20;
+        for (int frame = 0; frame < frames; ++frame) {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            for (std::size_t draw = 0; draw < drawsPerFrame; ++draw) {
+                std::array<ShaderResources::MovedBuffer, elements> moved;
+                for (std::size_t i = 0; i < elements; ++i) {
+                    if (ring + elementBytes > bytes) ring = 65536;
+                    std::memset(reinterpret_cast<void*>(address + ring), static_cast<int>(draw + i), elementBytes);
+                    moved[i] = {i, address + ring, elementBytes, {}};
+                    ring += 384;
+                }
+                const auto start = std::chrono::steady_clock::now();
+                const auto bindings = resources.PrepareDrawBindings(snapshotRecorder, moved, &profile);
+                total += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                Require(bindings != nullptr && bindings->snapshots.size() == elements, "benchmark draw lost its snapshots");
+            }
+            snapshotRecorder.Submit();
+        }
+        snapshotRecorder.Sync();
+        const double draws = static_cast<double>(frames * drawsPerFrame);
+        std::printf("draw snapshot benchmark round %d: prepare %.2f us/draw (snapshot %.2f, allocate %.2f, write %.2f); %.2f snapshots, %.2f copied per draw\n", round, total / draws, profile.snapshotUs / draws, profile.allocateUs / draws, profile.writeUs / draws, profile.snapshots / draws, profile.copiedSnapshots / draws);
+    }
+}
+
 void drawSnapshotPatchTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
@@ -8139,6 +8223,11 @@ int main(int argc, char** argv) {
             return pipelineCacheFileTests(device);
         }
 
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-draw-snapshots") {
+            std::unique_lock gpu(GpuMutex());
+            drawSnapshotBenchmark(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-only") {
             descriptorPoolTests(device);
             return 0;

@@ -1768,7 +1768,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
             const auto bytes = snapshot.buffer->Bytes();
-            addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), 0, bytes.data());
+            addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.buffer->ViewOffset(), bytes.data());
         }
     }
     for (const auto& [begin, end] : resources.InPlaceReads()) {

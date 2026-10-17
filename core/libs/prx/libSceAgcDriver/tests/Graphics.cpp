@@ -4308,6 +4308,57 @@ void descriptorSnapshotTests() {
     }
 }
 
+// Draw snapshots of moved guest ranges take slices of one arena buffer: the descriptors bind it at
+// distinct aligned offsets holding each range's bytes, and a run of draws makes no buffer per
+// snapshot (each used to make or re-create one, see Recorder::DrawSnapshotBuffer).
+void drawSnapshotArenaTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        binding.bufferWritten = {false, false};
+        vertex.bindings.push_back(binding);
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const auto address = [](const auto& data) { return reinterpret_cast<std::uint64_t>(data.data()); };
+        const std::array<ShaderResources::MovedBuffer, 2> moved{{{0, address(guestSecond), 32, {}}, {1, address(guestFirst) + 4, 12, {}}}};
+        const std::array<const void*, 2> expected{guestSecond.data(), guestFirst.data() + 1};
+        const auto check = [&](const std::shared_ptr<ShaderResources::DrawBindings>& draw) {
+            Require(draw != nullptr && draw->snapshots.size() == 2, "moved guest ranges were not snapshotted");
+            const auto& write = mock.writes.back();
+            Require(write.binding == 0 && write.count == 2, "the snapshot update did not write the moved binding");
+            Require(write.buffers[0].buffer == write.buffers[1].buffer, "moved guest range snapshots did not share the arena buffer");
+            Require(write.buffers[0].offset != write.buffers[1].offset && write.buffers[0].offset % 64 == 0 && write.buffers[1].offset % 64 == 0, "arena slices overlap or are misaligned");
+            for (std::size_t index = 0; index < 2; ++index) {
+                const auto& descriptor = write.buffers[index];
+                Require(descriptor.offset == draw->snapshots[index].buffer->ViewOffset() && descriptor.range == moved[index].size, "a snapshot descriptor lost its slice offset or range");
+                Require(sameBytes(bufferBytes(descriptor.buffer).subspan(static_cast<std::size_t>(descriptor.offset)), expected[index], moved[index].size), "an arena slice does not hold its guest bytes");
+            }
+        };
+        mock.writes.clear();
+        check(resources.PrepareDrawBindings(recorder, moved));
+        const auto created = mock.bufferSizes.size();
+        ShaderResources::DrawBindingsProfile profile;
+        for (int draw = 0; draw < 64; ++draw) {
+            AgcDriver::GuestMemory::MarkWritten(address(guestFirst), 4);
+            check(resources.PrepareDrawBindings(recorder, moved, &profile));
+        }
+        Require(profile.copiedSnapshots >= 64, "the draws reused their snapshots instead of copying them");
+        Require(mock.bufferSizes.size() <= created + 1, "draw snapshots made a buffer per snapshot");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "draw snapshot arenas leaked Vulkan objects");
+}
+
 // A Buffer keeps only its device of the context (BufferDevice): every snapshot and upload allocates
 // one, and a whole Context copy made that allocation cost ~0.8 us.
 static_assert(sizeof(AgcDriver::Graphics::Buffer) <= 256, "a Buffer object copies its whole Context again");
@@ -7993,6 +8044,7 @@ int main(int argc, char** argv) {
         resourceTests();
         oversizedDescriptorTests();
         descriptorSnapshotTests();
+        drawSnapshotArenaTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();
         imageTableAllocationTests();

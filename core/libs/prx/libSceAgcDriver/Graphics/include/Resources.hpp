@@ -20,6 +20,9 @@ struct BufferDevice {
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // A view of `size` bytes at `offset` inside a mapped `source`: it shares the source's handle and
+    // mapping and keeps it alive. A descriptor binds it at ViewOffset() (0 for any other buffer).
+    Buffer(std::shared_ptr<Buffer> source, VkDeviceSize offset, std::size_t size);
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
@@ -29,6 +32,7 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    VkDeviceSize ViewOffset() const { return viewOffset; }
     void Invalidate();
 
 private:
@@ -50,6 +54,8 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
+    std::shared_ptr<Buffer> parent;
+    VkDeviceSize viewOffset = 0;
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered

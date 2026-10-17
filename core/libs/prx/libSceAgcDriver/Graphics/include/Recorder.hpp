@@ -106,6 +106,15 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // The buffer a draw snapshot of guest memory is copied into: a slice of the snapshot arena, one
+    // host-visible buffer of DrawSnapshotArenaBytes the slices share (made or taken from the buffer
+    // pool once per arena, not per snapshot), or a buffer of its own past DrawSnapshotSliceBytes. A
+    // kept slice holds its whole arena, so the arena stays small (a snapshot cache entry holds one
+    // arena at most). APS5_NO_DRAW_SNAPSHOT_ARENA=1 gives every snapshot a buffer of its own, as
+    // before.
+    std::shared_ptr<Buffer> DrawSnapshotBuffer(std::size_t bytes);
+    static constexpr std::size_t DrawSnapshotArenaBytes = std::size_t{64} << 10u;
+    static constexpr std::size_t DrawSnapshotSliceBytes = std::size_t{4} << 10u;
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -842,6 +851,8 @@ private:
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    std::shared_ptr<Buffer> snapshotArena;
+    std::size_t snapshotArenaUsed = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;

@@ -723,6 +723,62 @@ void verifyTypeZeroImageMaterialization() {
     }
 }
 
+void verifyResultMemoMovedTable() {
+    using namespace ShaderRecompiler;
+    const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000280u, 0xe0700000u, 0x80010000u, 0xbf810000u};
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    alignas(16) static std::array<std::uint32_t, 4> other{};
+    const auto buffer = [](const std::array<std::uint32_t, 4>& target) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(target.data()));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 16u, 0x00027facu};
+    };
+    alignas(16) static std::array<std::uint32_t, 4> first{};
+    alignas(16) static std::array<std::uint32_t, 4> moved{};
+    alignas(16) static std::array<std::uint32_t, 4> retargeted{};
+    first = buffer(output);
+    moved = buffer(output);
+    retargeted = buffer(other);
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const auto materialize = [&](const std::array<std::uint32_t, 4>& table, bool cached) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+        const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
+        request.context.waveSize = 32u;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = cached;
+        AgcDriver::ShaderMemory memory({});
+        const auto capture = memory.Capture(request);
+        request.context.memory = memory.Regions();
+        return Recompile(request, *capture);
+    };
+    const auto same = [](const RecompileResult& a, const RecompileResult& b) {
+        bool equal = a.pushConstants == b.pushConstants && a.bindings.size() == b.bindings.size() && a.shaderDataUserWords == b.shaderDataUserWords;
+        for (std::size_t i = 0; equal && i < a.bindings.size(); ++i) equal = a.bindings[i].role == b.bindings[i].role && a.bindings[i].guestDescriptor == b.bindings[i].guestDescriptor;
+        return equal;
+    };
+    const bool patching = std::getenv("APS5_NO_MEMO_USER_WORD_PATCH") == nullptr;
+    static_cast<void>(materialize(first, true));
+    const auto before = ResultMemoUserWordPatches();
+    const auto patched = materialize(moved, true);
+    require(ResultMemoUserWordPatches() - before == (patching ? 1u : 0u), patching ? "result memo: a shader whose SRT moved with the same contents materialized again" : "result memo: APS5_NO_MEMO_USER_WORD_PATCH=1 still patched a result");
+    require(same(*patched, *materialize(moved, false)), "result memo: the result patched with the moved SRT's user words differs from a fresh one");
+    const auto retargetedBefore = ResultMemoUserWordPatches();
+    const auto changed = materialize(retargeted, true);
+    require(ResultMemoUserWordPatches() == retargetedBefore && same(*changed, *materialize(retargeted, false)), "result memo: a moved SRT holding another V# was patched from the old result");
+}
+
 void verifyOutOfRangeConstantReads() {
     std::vector<std::uint32_t> code{0xf40c0200u, 0xfa000000u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf4000400u, 0xfa000050u, 0xf4080a00u, 0xfa000080u, 0xbf8cc07fu, 0xf42c0814u, 0xfa000000u, 0xbf8cc07fu, 0xbf068010u, 0xbf850008u};
     for (std::uint32_t dword = 0; dword < 8u; dword++) {
@@ -5159,6 +5215,11 @@ int main(int argc, char** argv) {
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-moved-table") {
+            verifyResultMemoMovedTable();
+            std::cout << "The result memo patches a result over a moved SRT with the same contents\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {
             verifyLayoutPair();
             std::cout << "Both push-constant layouts of a pixel shader compile from one program unchanged\n";
@@ -5198,6 +5259,7 @@ int main(int argc, char** argv) {
         verifySignedSrtComparison();
         verifyTypeZeroImageMaterialization();
         verifyOutOfRangeConstantReads();
+        verifyResultMemoMovedTable();
         verifySignedMinimum();
         verifyMayEvaluate();
         verifyPureFlatSlots();

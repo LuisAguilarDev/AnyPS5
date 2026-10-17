@@ -1870,6 +1870,51 @@ Recorder::PassTarget passTarget(const State& state) {
     return target;
 }
 
+const ShaderRecompiler::RecompileResult* fragmentProgram(std::span<const CompiledShader> shaders) {
+    const auto fragment = std::find_if(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr; });
+    return fragment != shaders.end() ? fragment->program : nullptr;
+}
+
+// The Recorder::FragmentFlag bits of a fragment module, from its bindings and a walk of its words
+// (remembered by content hash per thread; only APS5_PROFILE_GPU asks).
+std::uint8_t fragmentFlags(const ShaderRecompiler::RecompileResult* program) {
+    if (program == nullptr) return 0;
+    constexpr std::size_t RememberedModules = 4096;
+    thread_local std::unordered_map<std::uint64_t, std::uint8_t> remembered;
+    const auto hash = program->spirv.ContentHash().low;
+    if (const auto found = remembered.find(hash); found != remembered.end()) return found->second;
+    std::uint8_t flags = 0;
+    for (const auto& binding : program->bindings) {
+        if (binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) flags |= Recorder::FaultStores;
+        if ((binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && !binding.readOnly) || binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) flags |= Recorder::GuestStores;
+    }
+    const auto words = program->spirv.Words();
+    constexpr std::size_t HeaderWords = 5;
+    constexpr std::uint32_t OpExecutionMode = 16, OpKill = 252, OpTerminateInvocation = 4416, OpDemoteToHelperInvocation = 5380, EarlyFragmentTests = 9;
+    for (std::size_t at = HeaderWords; at < words.size();) {
+        const auto count = words[at] >> 16u;
+        const auto opcode = words[at] & 0xffffu;
+        if (count == 0 || at + count > words.size()) break;
+        if (opcode == OpExecutionMode && count >= 3 && words[at + 2] == EarlyFragmentTests) flags |= Recorder::EarlyFragments;
+        if (opcode == OpKill || opcode == OpTerminateInvocation || opcode == OpDemoteToHelperInvocation) flags |= Recorder::Discards;
+        at += count;
+    }
+    if (remembered.size() >= RememberedModules) remembered.clear();
+    remembered.emplace(hash, flags);
+    return flags;
+}
+
+Recorder::PassSample passSample(const State& state, std::span<const CompiledShader> shaders) {
+    Recorder::PassSample sample;
+    if (!state.colors.empty()) sample.colorAddress = state.colors.front().address;
+    if (const auto* fragment = fragmentProgram(shaders)) {
+        sample.fragmentHash = fragment->spirv.ContentHash().low;
+        sample.fragmentWords = fragment->spirv.size();
+        sample.fragmentFlags = fragmentFlags(fragment);
+    }
+    return sample;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1976,7 +2021,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         timer.part(RecordBarriers);
-        if (Recorder::GpuTimingEnabled()) recorder->BeginPassTiming(passTarget(state));
+        if (Recorder::GpuTimingEnabled()) recorder->BeginPassTiming(passTarget(state), passSample(state, shaders));
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
         timer.part(RecordBegin);
     }
@@ -2022,7 +2067,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
-    recorder->CountPassDraw();
+    recorder->CountPassDraw(Recorder::GpuTimingEnabled() ? fragmentFlags(fragmentProgram(shaders)) : 0);
     timer.part(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);

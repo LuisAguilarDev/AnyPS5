@@ -83,14 +83,38 @@ public:
         VkFormat depth = VK_FORMAT_UNDEFINED;
         auto operator<=>(const PassTarget&) const = default;
     };
-    void BeginPassTiming(const PassTarget& target);
-    void CountPassDraw();
+    // How a draw's fragment module can keep the device from testing depth before shading it
+    // (PassSample::fragmentFlags, CountPassDraw): EarlyFragments when it declares EarlyFragmentTests;
+    // FaultStores when it has the fault buffer (emulator stores, made only on a guest fault);
+    // GuestStores when it writes guest buffers or storage images; Discards when it can kill or
+    // demote. Without EarlyFragments, any of the others makes the tests run after the shader.
+    enum FragmentFlag : std::uint8_t { EarlyFragments = 1, FaultStores = 2, GuestStores = 4, Discards = 8 };
+    static constexpr bool LateFragmentTests(std::uint8_t flags) { return (flags & EarlyFragments) == 0 && (flags & (FaultStores | GuestStores | Discards)) != 0; }
+    // Late only because of the fault buffer: no guest stores (a discard may be the fault stop).
+    static constexpr bool LateForFaults(std::uint8_t flags) { return LateFragmentTests(flags) && (flags & FaultStores) != 0 && (flags & GuestStores) == 0; }
+    // What names a timed pass's first draw, for finding its shaders: the first color target's guest
+    // address (APS5_DUMP_DRAW_SHADERS takes it), the fragment module's content hash and words, and
+    // its FragmentFlag bits.
+    struct PassSample {
+        std::uint64_t colorAddress = 0;
+        std::uint64_t fragmentHash = 0;
+        std::size_t fragmentWords = 0;
+        std::uint8_t fragmentFlags = 0;
+    };
+    void BeginPassTiming(const PassTarget& target, const PassSample& sample = {});
+    void CountPassDraw(std::uint8_t fragmentFlags = 0);
     // The [gpu-passes] totals since the last 10 s report (or since start), by target: passes,
     // draws and GPU milliseconds of the pass bodies. For tests.
     struct PassTotals {
         std::uint64_t passes = 0;
         std::uint64_t draws = 0;
         double ms = 0;
+        // Draws whose fragment tests ran late (LateFragmentTests), and those late only for faults.
+        std::uint64_t lateDraws = 0;
+        std::uint64_t faultLateDraws = 0;
+        // The slowest pass of the target and its first draw.
+        double slowestMs = 0;
+        PassSample slowest;
     };
     static std::vector<std::pair<PassTarget, PassTotals>> PassTimingTotals();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -618,6 +642,9 @@ private:
             std::uint32_t timing;
             PassTarget target;
             std::uint32_t draws;
+            PassSample sample;
+            std::uint32_t lateDraws = 0;
+            std::uint32_t faultLateDraws = 0;
         };
         std::vector<TimedPass> timedPasses;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).

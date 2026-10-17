@@ -151,9 +151,25 @@ public:
     static constexpr std::size_t UnwrittenSnapshotEntries = 4096;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
+    // APS5_DEVICE_LOCAL_DRAW_BUFFERS: a draw input whose device-local copies are not reused (its
+    // guest bytes change between draws, or its range is not write-watched, so no copy is kept) is
+    // bound in place from its host import again, sparing the CPU a copy per draw of bytes the GPU
+    // reads about once per copy anyway. NoteDrawInputCopy records each copy's outcome by the
+    // input's address: StreamedInputMisses stale copies in a row (an untracked one counts as that
+    // many) make StreamedDrawInput answer true, binding the input in place for
+    // StreamedInputRetryUses draws, after which it is copied again (one more stale copy binds it in
+    // place again). A reused copy clears the count. APS5_NO_STREAMED_DRAW_INPUTS=1 copies every
+    // input.
+    enum class DrawInputOutcome : std::uint8_t { Reused, Stale, Absent, Untracked };
+    void NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome);
+    bool StreamedDrawInput(std::uint64_t address);
+    static constexpr std::uint32_t StreamedInputMisses = 2;
+    static constexpr std::uint32_t StreamedInputRetryUses = 256;
+    static constexpr std::size_t StreamedInputEntries = 65536;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    // `stale`, when given, says whether a miss found an entry whose guest bytes changed since.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, bool* stale = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     // The buffer a draw snapshot of guest memory is copied into: a slice of the snapshot arena, one
     // host-visible buffer of DrawSnapshotArenaBytes the slices share (made or taken from the buffer
@@ -924,6 +940,11 @@ private:
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::shared_ptr<Buffer> snapshotArena;
     std::size_t snapshotArenaUsed = 0;
+    struct StreamedInput {
+        std::uint32_t misses = 0;
+        std::uint32_t inPlaceUses = 0;
+    };
+    std::unordered_map<std::uint64_t, StreamedInput> streamedInputs;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;

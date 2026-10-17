@@ -2744,12 +2744,14 @@ std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
     return std::make_shared<Buffer>(snapshotArena, static_cast<VkDeviceSize>(offset), bytes);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* stale) {
+    if (stale != nullptr) *stale = false;
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+            if (stale != nullptr) *stale = true;
             eraseDrawSnapshot(found);
             return {};
         }
@@ -2759,6 +2761,30 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
     return found->second.buffer;
+}
+
+void Recorder::NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome) {
+    if (outcome == DrawInputOutcome::Absent) return;
+    const auto found = streamedInputs.find(address);
+    if (outcome == DrawInputOutcome::Reused) {
+        if (found != streamedInputs.end()) found->second.misses = 0;
+        return;
+    }
+    if (found == streamedInputs.end() && streamedInputs.size() >= StreamedInputEntries) streamedInputs.clear();
+    auto& entry = streamedInputs[address];
+    entry.misses += outcome == DrawInputOutcome::Untracked ? StreamedInputMisses : 1u;
+    entry.inPlaceUses = 0;
+}
+
+bool Recorder::StreamedDrawInput(std::uint64_t address) {
+    static const bool copyAll = std::getenv("APS5_NO_STREAMED_DRAW_INPUTS") != nullptr;
+    if (copyAll) return false;
+    const auto found = streamedInputs.find(address);
+    if (found == streamedInputs.end() || found->second.misses < StreamedInputMisses) return false;
+    if (++found->second.inPlaceUses < StreamedInputRetryUses) return true;
+    found->second.misses = StreamedInputMisses - 1;
+    found->second.inPlaceUses = 0;
+    return false;
 }
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {

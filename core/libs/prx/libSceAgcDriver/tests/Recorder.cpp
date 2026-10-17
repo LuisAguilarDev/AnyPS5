@@ -3285,6 +3285,23 @@ void deviceLocalDrawInputTests(const Device& device, Recorder& recorder) {
     recorder.NotePendingWrite(address + 20480, 16);
     Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && behind, "a vertex input behind a pending GPU write was not left in place");
     recorder.Sync();
+    // An input rewritten before every copy is bound in place once StreamedInputMisses of its copies
+    // went stale (at once when the import is not write-watched, so no copy is kept), and copied
+    // again after StreamedInputRetryUses draws.
+    const auto streamed = address + 8192;
+    std::uint32_t copies = 0;
+    behind = false;
+    while (InPlaceDrawInput(context, streamed, 256, 4, &behind) == nullptr) {
+        Require(++copies <= Recorder::StreamedInputMisses + 1, "a vertex input whose copies went stale was not bound in place");
+        const auto rewritten = CopyDrawInput(context, &recorder, streamed, 256, 1, Use::Vertex);
+        Require(!rewritten.reused, "a rewritten vertex input reused its copy");
+        KeepDrawInput(&recorder, streamed, rewritten, Use::Vertex, 0);
+        words[8192 / sizeof(std::uint32_t)] += 1;
+    }
+    Require(copies != 0 && !behind, "a vertex input was bound in place before it was copied");
+    for (std::uint32_t use = 2; use < Recorder::StreamedInputRetryUses; ++use) Require(InPlaceDrawInput(context, streamed, 256, 4, &behind) != nullptr, "a streamed vertex input was copied before the retry interval");
+    Require(InPlaceDrawInput(context, streamed, 256, 4, &behind) == nullptr, "a streamed vertex input was not copied again after the retry interval");
+    recorder.Sync();
 }
 
 void drawInputInPlaceTests(const Device& device, Recorder& recorder) {

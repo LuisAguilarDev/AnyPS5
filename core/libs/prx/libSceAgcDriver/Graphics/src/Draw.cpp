@@ -591,6 +591,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     const auto now = std::chrono::steady_clock::now();
     if (now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
+    ReportDrawInputs();
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
@@ -1001,6 +1002,69 @@ bool DeviceLocalDrawBuffersRequested() {
 // not take the buffer), reported on the first and every power-of-two count.
 std::atomic<std::uint64_t> deviceLocalFallbacks{0};
 
+bool DrawInputsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+// The [draw-inputs] line (APS5_PROFILE_DRAW, after the [draws] line): vertex and
+// index copies by outcome (Recorder::DrawInputOutcome), zero-padded vertex copies, the bytes and the
+// time spent getting their buffers and copying into them, and the inputs bound in place because
+// their copies were not reused (Recorder::StreamedDrawInput) or behind a pending GPU write.
+struct DrawInputCounters {
+    std::array<std::atomic<std::uint64_t>, 4> copies{};
+    std::atomic<std::uint64_t> zeroPadded{0};
+    std::atomic<std::uint64_t> copiedBytes{0};
+    std::atomic<std::uint64_t> bufferNs{0};
+    std::atomic<std::uint64_t> copyNs{0};
+    std::atomic<std::uint64_t> streamed{0};
+    std::atomic<std::uint64_t> behind{0};
+};
+
+DrawInputCounters& drawInputCounters() {
+    static DrawInputCounters counters;
+    return counters;
+}
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+// A buffer for a copy and the copy of `validBytes` guest bytes into it, timed for [draw-inputs].
+void copyIntoDrawInput(const Context& context, DrawInputCopy& copy, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t alignment, VkBufferUsageFlags usage) {
+    const bool profiled = DrawInputsProfiled();
+    auto& counters = drawInputCounters();
+    auto start = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    copy.buffer = DrawInputBuffer(context, bytes, usage, &copy.hostReadable);
+    if (profiled) {
+        counters.bufferNs.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+        start = std::chrono::steady_clock::now();
+    }
+    const auto span = copy.buffer->Bytes();
+    GuestMemory::Read(address, span.subspan(0, validBytes), alignment);
+    if (validBytes < bytes) std::fill(span.begin() + static_cast<std::ptrdiff_t>(validBytes), span.end(), std::byte{0});
+    if (profiled) {
+        counters.copyNs.fetch_add(nanosecondsSince(start), std::memory_order_relaxed);
+        counters.copiedBytes.fetch_add(validBytes, std::memory_order_relaxed);
+    }
+}
+
+}
+
+void ReportDrawInputs() {
+    if (!DrawInputsProfiled()) return;
+    auto& counters = drawInputCounters();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    const auto reused = take(counters.copies[static_cast<std::size_t>(Recorder::DrawInputOutcome::Reused)]);
+    const auto stale = take(counters.copies[static_cast<std::size_t>(Recorder::DrawInputOutcome::Stale)]);
+    const auto absent = take(counters.copies[static_cast<std::size_t>(Recorder::DrawInputOutcome::Absent)]);
+    const auto untracked = take(counters.copies[static_cast<std::size_t>(Recorder::DrawInputOutcome::Untracked)]);
+    const auto zeroPadded = take(counters.zeroPadded);
+    const auto bytes = take(counters.copiedBytes);
+    const auto bufferNs = take(counters.bufferNs);
+    const auto copyNs = take(counters.copyNs);
+    const auto made = stale + absent + untracked + zeroPadded;
+    std::fprintf(stderr, "[draw-inputs] 10 s, device-local %s: %llu vertex/index copies looked up (%llu reused, %llu stale, %llu new, %llu untracked) + %llu zero-padded; %.1f MiB copied (%.1f KiB per copy made), buffers %.1f ms, copying %.1f ms (%.2f GB/s); bound in place: %llu streamed, %llu behind a GPU write\n", DeviceLocalDrawBuffersRequested() ? "on" : "off", static_cast<unsigned long long>(reused + stale + absent + untracked), static_cast<unsigned long long>(reused), static_cast<unsigned long long>(stale), static_cast<unsigned long long>(absent), static_cast<unsigned long long>(untracked), static_cast<unsigned long long>(zeroPadded), static_cast<double>(bytes) / 1048576.0, made != 0 ? static_cast<double>(bytes) / 1024.0 / static_cast<double>(made) : 0.0, static_cast<double>(bufferNs) / 1e6, static_cast<double>(copyNs) / 1e6, copyNs != 0 ? static_cast<double>(bytes) / static_cast<double>(copyNs) : 0.0, static_cast<unsigned long long>(take(counters.streamed)), static_cast<unsigned long long>(take(counters.behind)));
 }
 
 bool DeviceLocalDrawBuffers(const Context& context) {
@@ -1034,15 +1098,18 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         GuestMemory::FlushGpuWrites(address, bytes);
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
+        bool stale = false;
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &stale);
+        const auto outcome = copy.buffer != nullptr ? Recorder::DrawInputOutcome::Reused : copy.generation == 0 ? Recorder::DrawInputOutcome::Untracked : stale ? Recorder::DrawInputOutcome::Stale : Recorder::DrawInputOutcome::Absent;
+        if (DeviceLocalDrawBuffers(context)) recorder->NoteDrawInputCopy(address, outcome);
+        if (DrawInputsProfiled()) drawInputCounters().copies[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
         if (copy.buffer != nullptr) {
             copy.reused = true;
             copy.hostReadable = !DeviceLocalDrawBuffers(context);
             return copy;
         }
     }
-    copy.buffer = DrawInputBuffer(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &copy.hostReadable);
-    GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    copyIntoDrawInput(context, copy, address, bytes, bytes, alignment, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     return copy;
 }
 
@@ -1050,10 +1117,8 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
     GuestMemory::FlushGpuWrites(address, bytes);
     DrawInputCopy copy;
-    copy.buffer = DrawInputBuffer(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &copy.hostReadable);
-    const auto span = copy.buffer->Bytes();
-    GuestMemory::Read(address, span.subspan(0, validBytes), 1);
-    std::fill(span.begin() + static_cast<std::ptrdiff_t>(validBytes), span.end(), std::byte{0});
+    if (DrawInputsProfiled()) drawInputCounters().zeroPadded.fetch_add(1, std::memory_order_relaxed);
+    copyIntoDrawInput(context, copy, address, bytes, validBytes, 1, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     return copy;
 }
 
@@ -1073,8 +1138,12 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
     }
-    // The opt-in device-local copies replace the PCIe reads, except behind a pending GPU write.
-    if (!behind && DeviceLocalDrawBuffers(context)) return nullptr;
+    // The opt-in device-local copies replace the PCIe reads, except behind a pending GPU write and
+    // for inputs whose copies are not reused (Recorder::StreamedDrawInput).
+    if (DeviceLocalDrawBuffers(context)) {
+        if (!behind && !recorder->StreamedDrawInput(address)) return nullptr;
+        if (DrawInputsProfiled()) (behind ? drawInputCounters().behind : drawInputCounters().streamed).fetch_add(1, std::memory_order_relaxed);
+    }
     if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;

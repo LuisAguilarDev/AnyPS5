@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <random>
 #include <stdexcept>
@@ -152,6 +154,22 @@ void testShaderSetKey() {
     check(DrawShaderSetKey(queue, first) != DrawShaderSetKey(queue, second), "different shader snapshots shared a shader-set key");
 }
 
+void testOffsetProgramUses() {
+    constexpr std::uint32_t Nop = 0xbf800000u, EndProgram = 0xbf810000u;
+    constexpr std::uint32_t Bits = 1u << 22u;
+    ShaderSnapshot snapshot;
+    snapshot.code = {Nop, Nop, 0xf80008dfu, 0x03020100u, EndProgram, EndProgram};
+    const auto layout = [&](std::size_t offset) { return PositionExportLayout(&snapshot, offset, std::span<const std::uint32_t>(snapshot.code).subspan(offset), Bits); };
+    const bool cached = std::getenv("APS5_NO_OFFSET_PROGRAM_USE_CACHE") == nullptr;
+    const auto before = ProgramUseDecodes();
+    check(layout(2) == Bits, "a program at a code offset exporting pos1 lost its position export bits");
+    check(layout(2) == Bits, "a repeated program at a code offset lost its position export bits");
+    check(ProgramUseDecodes() - before == (cached ? 1u : 2u), "a repeated program at a code offset was decoded again for its position exports");
+    check(layout(4) == 0 && layout(4) == 0, "a program at another code offset took the position export bits of the first");
+    check(!ProgramUsesWorkgroup(snapshot, 2) && !ProgramUsesWorkgroup(snapshot, 2), "a program without LDS or barriers at a code offset used the workgroup");
+    check(ProgramUseDecodes() - before == (cached ? 3u : 6u), "programs at code offsets were not decoded once per offset and question");
+}
+
 
 }
 
@@ -159,6 +177,7 @@ int main() {
     try {
         testFingerprints();
         testShaderSetKey();
+        testOffsetProgramUses();
         std::puts("Register fingerprint dependencies and mutations passed");
         return 0;
     } catch (const std::exception& error) {

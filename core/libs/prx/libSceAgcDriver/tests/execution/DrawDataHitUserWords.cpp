@@ -83,10 +83,14 @@ void PixelUserData(std::vector<std::uint32_t>& commands, const std::uint32_t* po
     Append(commands, 0x76, {0x00e, unread});
 }
 
-std::vector<std::uint32_t> Setup(bool triangle = false) {
+struct Modes {
+    bool verify = false, rebase = true;
+};
+
+std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(triangle ? TriangleVertexCode.data() : VertexCode.data());
-    const auto pixel = reinterpret_cast<std::uintptr_t>(triangle ? ArithmeticPixelCode.data() : PixelCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(triangle && !loadPixel ? ArithmeticPixelCode.data() : PixelCode.data());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
@@ -131,21 +135,27 @@ std::string Counts(const AgcDriver::DriverDetail::DrawEntryCounters& counters) {
     return std::to_string(counters.lookups) + " lookups, " + std::to_string(counters.dataHits) + " data-only hits, stages " + std::to_string(counters.dataStagesReused) + " reused / " + std::to_string(counters.dataStagesCompiled) + " compiled / " + std::to_string(counters.dataVerified) + " verified";
 }
 
-void UnreadUserWordsKeepTheStage(bool verify) {
+void Describe(std::uint32_t* table, std::uint32_t* data, float value) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    data[0] = std::bit_cast<std::uint32_t>(value);
+    table[0] = static_cast<std::uint32_t>(address);
+    table[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+    table[2] = 16;
+    table[3] = 0x31016facu;
+}
+
+std::string CandidateCounts(const AgcDriver::DriverDetail::DrawCandidateCounters& counters) {
+    return std::to_string(counters.tried) + " candidates tried, equal " + std::to_string(counters.equal) + " / " + std::to_string(counters.equalData) + ", rebased " + std::to_string(counters.rebased) + " / " + std::to_string(counters.rebasedData) + ", refused " + std::to_string(counters.refusedUntagged) + " untagged / " + std::to_string(counters.refusedOff) + " off, differing " + std::to_string(counters.differingEqual) + " / " + std::to_string(counters.differingRebased);
+}
+
+void UnreadUserWordsKeepTheStage(const Modes& modes) {
+    const bool verify = modes.verify;
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     auto* first = GuestBlock();
-    auto* second = GuestBlock();
-    const auto describe = [](std::uint32_t* table, std::uint32_t* data, float value) {
-        const auto address = reinterpret_cast<std::uintptr_t>(data);
-        data[0] = std::bit_cast<std::uint32_t>(value);
-        table[0] = static_cast<std::uint32_t>(address);
-        table[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
-        table[2] = 16;
-        table[3] = 0x4bfacu;
-    };
-    describe(first, first + 1024, 1.0f);
-    describe(second, second + 1024, 0.5f);
+    auto* second = first + 2048;
+    Describe(first, first + 1024, 1.0f);
+    std::copy_n(first, 4, second);
 
     auto commands = Setup();
     PixelUserData(commands, first, 0x11);
@@ -175,8 +185,17 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     const auto moved = counters;
     counters = Submit(std::move(commands));
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
-    Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
-    if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+    const auto movedReused = counters.dataStagesReused - moved.dataStagesReused;
+    const auto movedCompiled = counters.dataStagesCompiled - moved.dataStagesCompiled;
+    if (verify) {
+        Require(movedCompiled == 2, "verify mode: a draw that moved the pixel stage's table did not build both stages: " + Counts(counters));
+    } else if (modes.rebase) {
+        Require(movedReused == 2 && movedCompiled == 0, "a draw that moved only the pixel stage's table pointer did not reuse both stages: " + Counts(counters) + "; " + CandidateCounts(counters.candidates));
+        Require(counters.candidates.rebased - moved.candidates.rebased == 1, "the moved table was not reused by a rebased candidate: " + CandidateCounts(counters.candidates));
+    } else {
+        Require(movedCompiled >= 1, "rebasing off: a draw that moved the pixel stage's table reused the pixel stage: " + Counts(counters));
+        Require(movedReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+    }
 }
 
 unsigned BrightestColorByte() {
@@ -208,6 +227,52 @@ void ReadUserWordsChangeTheOutput() {
     Require(withinTwo(second, 191), "a pixel stage adding user word 2 changed to 0.5 wrote " + std::to_string(second) + ", expected 191 (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
+void MovedTablesRenderTheirBuffers(const Modes& modes) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* block = GuestBlock();
+    auto* tableA = block;
+    auto* tableB = block + 256;
+    auto* tableC = block + 512;
+    auto* dataA = block + 4096;
+    auto* dataC = block + 8192;
+    Describe(tableA, dataA, 0.25f);
+    std::copy_n(tableA, 4, tableB);
+    Describe(tableC, dataC, 0.5f);
+    const auto draw = [&](const std::uint32_t* table, bool setup) {
+        auto commands = setup ? Setup(true, true) : std::vector<std::uint32_t>{};
+        PixelUserData(commands, table, 0x33);
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    const auto counters = [] { return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters(); };
+    draw(tableA, true);
+    const auto a = draw(tableA, false);
+    Require(withinTwo(a, 64), "the pixel stage loading 0.25 through table A wrote " + std::to_string(a) + ", expected 64");
+
+    const auto beforeB = counters();
+    const auto b = draw(tableB, false);
+    const auto afterB = counters();
+    Require(withinTwo(b, 64), "the pixel stage loading 0.25 through table B wrote " + std::to_string(b) + ", expected 64 (" + CandidateCounts(afterB.candidates) + ")");
+    Require(afterB.dataHits == beforeB.dataHits + 1, "moving the table pointer was not a data-only hit: " + Counts(afterB));
+    if (!modes.rebase) {
+        Require(afterB.candidates.rebased == beforeB.candidates.rebased && afterB.candidates.refusedOff > beforeB.candidates.refusedOff, "rebasing off: the moved table was rebased: " + CandidateCounts(afterB.candidates));
+    } else {
+        Require(afterB.candidates.rebased - beforeB.candidates.rebased == 1, "the copied table was not reused by a rebased candidate: " + CandidateCounts(afterB.candidates));
+        if (modes.verify) Require(afterB.dataVerified - beforeB.dataVerified == 2, "verify mode: the rebased draw was not built and compared on both stages: " + Counts(afterB));
+        else Require(afterB.dataDrawsReused - beforeB.dataDrawsReused == 1, "the rebased draw did not reuse both stages: " + Counts(afterB));
+    }
+
+    const auto c = draw(tableC, false);
+    Require(withinTwo(c, 128), "the pixel stage loading 0.5 through table C wrote " + std::to_string(c) + ", expected 128 (" + CandidateCounts(counters().candidates) + ")");
+
+    dataA[0] = std::bit_cast<std::uint32_t>(0.75f);
+    const auto again = draw(tableB, false);
+    Require(withinTwo(again, 191), "the pixel stage loading 0.75 through table B wrote " + std::to_string(again) + ", expected 191 (" + CandidateCounts(counters().candidates) + ")");
+}
+
 }
 
 int main() {
@@ -219,11 +284,14 @@ int main() {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
-        const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
-        UnreadUserWordsKeepTheStage(verify);
+        Modes modes;
+        modes.verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr || std::getenv("APS5_VERIFY_DRAW_REBASE") != nullptr;
+        modes.rebase = std::getenv("APS5_NO_DRAW_REBASE") == nullptr;
+        UnreadUserWordsKeepTheStage(modes);
         ReadUserWordsChangeTheOutput();
+        MovedTablesRenderTheirBuffers(modes);
         AgcDriverShutdown_nid_postfix();
-        std::cout << "Data-only hits " << (verify ? "verified" : "reused") << " the stages whose read user words did not change\n";
+        std::cout << "Data-only hits " << (modes.verify ? "verified" : "reused") << " the stages whose read user words did not change" << (modes.rebase ? " or whose tables only moved" : "") << '\n';
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

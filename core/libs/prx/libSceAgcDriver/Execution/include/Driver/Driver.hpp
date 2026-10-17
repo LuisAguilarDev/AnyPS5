@@ -149,7 +149,16 @@ private:
     static std::uint64_t drawIdentityKey(const QueueState& queue, const ShaderRegistry& registry);
     static bool drawRelocationEnabled();
     static std::uint64_t relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable);
-    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords);
+    static bool drawRebaseEnabled();
+    static bool drawRebaseFetch();
+    static bool candidateDataWords();
+    static bool verifyDrawRebase();
+    static bool verifyDataCandidates();
+    static std::vector<std::pair<std::uint64_t, std::int32_t>> vertexFetchReads(const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads, std::span<const std::uint32_t> userData, std::uint32_t hiddenWords);
+    static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::pair<std::uint64_t, std::int32_t>> fetchReads = {});
+    static std::shared_ptr<DispatchVariant> copyVariant(const DispatchVariant& variant);
+    static void rebaseVariantWord(DispatchVariant& copy, std::uint32_t index, std::uint32_t from, std::uint32_t to);
+    std::shared_ptr<DispatchVariant> dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters);
     static void applyShaderDataPatches(DispatchVariant& variant);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);

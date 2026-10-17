@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -10,6 +11,7 @@ namespace {
 
 thread_local bool poolThread = false;
 thread_local bool exemptThread = false;
+thread_local std::uint64_t threadWaitedNs = 0;
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -31,6 +33,20 @@ bool DrawPrepPool::InPoolThread() {
 
 void DrawPrepPool::ExemptThisThread() {
     exemptThread = true;
+}
+
+bool DrawPrepPool::WriteBounds() {
+    static const bool bounded = std::getenv("APS5_NO_PREP_POOL_WRITE_BOUNDS") == nullptr;
+    return bounded;
+}
+
+bool DrawPrepPool::VerifyWriteBounds() {
+    static const bool verify = std::getenv("APS5_VERIFY_PREP_POOL_WRITE_BOUNDS") != nullptr;
+    return verify;
+}
+
+double DrawPrepPool::ThreadWaitedMs() {
+    return static_cast<double>(threadWaitedNs) / 1e6;
 }
 
 DrawPrepPool& DrawPrepPool::Get() {
@@ -76,7 +92,7 @@ void DrawPrepPool::run() {
     }
 }
 
-void DrawPrepPool::Submit(Job job) {
+void DrawPrepPool::Submit(Job job, std::optional<std::vector<Range>> bound) {
     std::unique_lock lock(mutex);
     if (submitted.load(std::memory_order_relaxed) - turn.load(std::memory_order_relaxed) >= maxInFlight) {
         const auto start = std::chrono::steady_clock::now();
@@ -87,6 +103,7 @@ void DrawPrepPool::Submit(Job job) {
     inFlightSum += seq - turn.load(std::memory_order_relaxed);
     ++jobs;
     tasks.push_back({seq, std::move(job)});
+    bounds.emplace_back(seq, std::move(bound));
     submitted.store(seq + 1, std::memory_order_release);
     lock.unlock();
     work.notify_one();
@@ -103,6 +120,17 @@ void DrawPrepPool::WaitTurn(std::uint64_t seq) {
 void DrawPrepPool::FinishTurn(std::uint64_t seq, std::span<const Range> writes) {
     {
         std::lock_guard lock(mutex);
+        const auto bound = std::find_if(bounds.begin(), bounds.end(), [&](const auto& pending) { return pending.first == seq; });
+        if (bound != bounds.end()) {
+            if (VerifyWriteBounds() && bound->second) {
+                for (const auto& [begin, end] : writes) {
+                    if (std::any_of(bound->second->begin(), bound->second->end(), [&](const Range& range) { return range.first <= begin && end <= range.second; })) continue;
+                    std::fprintf(stderr, "APS5_VERIFY_PREP_POOL_WRITE_BOUNDS: prep-pool job %llu wrote 0x%llx-0x%llx outside the bound it was submitted with\n", static_cast<unsigned long long>(seq), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+                    std::abort();
+                }
+            }
+            bounds.erase(bound);
+        }
         history.emplace_back(seq, std::vector<Range>(writes.begin(), writes.end()));
         while (history.size() > 4096) history.pop_front();
         turn.store(seq + 1, std::memory_order_release);
@@ -126,20 +154,36 @@ bool DrawPrepPool::WrittenBetween(std::uint64_t from, std::uint64_t to, std::spa
     return false;
 }
 
+bool DrawPrepPool::MayWrite(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    boundedChecks.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(mutex);
+    for (const auto& [seq, bound] : bounds) {
+        if (!bound) return true;
+        for (const auto& [begin, limit] : *bound) {
+            if (address < limit && begin < end) return true;
+        }
+    }
+    if (!bounds.empty()) waitsAvoided.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
 void DrawPrepPool::WaitAll() {
     if (poolThread || exemptThread || !Pending()) return;
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
     progress.wait(lock, [&] { return submitted.load(std::memory_order_relaxed) == turn.load(std::memory_order_relaxed); });
+    const auto waited = elapsedNs(start);
     ++waitAlls;
-    waitAllNs += elapsedNs(start);
+    waitAllNs += waited;
+    threadWaitedNs += waited;
 }
 
 void DrawPrepPool::report() {
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
-    std::fprintf(stderr, "[prep-pool] 10 s: %llu jobs on %zu threads, avg %.1f in flight; front waited for all %llu times (%.0f ms), for room %.0f ms; turn waits %.0f ms; redos %llu, front-read conflicts %llu, skipped %llu\n", static_cast<unsigned long long>(jobs), threads.size(), jobs != 0 ? static_cast<double>(inFlightSum) / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(waitAlls), waitAllNs / 1e6, submitWaitNs / 1e6, turnWaitNs / 1e6, static_cast<unsigned long long>(redos.exchange(0)), static_cast<unsigned long long>(frontReadConflicts.exchange(0)), static_cast<unsigned long long>(skips.exchange(0)));
+    std::fprintf(stderr, "[prep-pool] 10 s: %llu jobs on %zu threads, avg %.1f in flight; front waited for all %llu times (%.0f ms), for room %.0f ms; turn waits %.0f ms; redos %llu, front-read conflicts %llu, skipped %llu; write-bound checks %llu, waits avoided %llu\n", static_cast<unsigned long long>(jobs), threads.size(), jobs != 0 ? static_cast<double>(inFlightSum) / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(waitAlls), waitAllNs / 1e6, submitWaitNs / 1e6, turnWaitNs / 1e6, static_cast<unsigned long long>(redos.exchange(0)), static_cast<unsigned long long>(frontReadConflicts.exchange(0)), static_cast<unsigned long long>(skips.exchange(0)), static_cast<unsigned long long>(boundedChecks.exchange(0)), static_cast<unsigned long long>(waitsAvoided.exchange(0)));
     jobs = 0;
     waitAlls = 0;
     waitAllNs = 0;

@@ -205,17 +205,64 @@ bool CommittedAbi(const ShaderSnapshot& snapshot, std::span<const std::uint64_t>
 
 }
 
+namespace {
+
+constexpr std::uint8_t UseUnknown = 0, UseAbsent = 1, UsePresent = 2;
+
+std::atomic<std::uint64_t> programUseDecodes{0};
+
+bool offsetUsesCached() {
+    static const bool cached = std::getenv("APS5_NO_OFFSET_PROGRAM_USE_CACHE") == nullptr;
+    return cached;
+}
+
+bool cachesOffset(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code) {
+    return codeOffset != 0 && offsetUsesCached() && codeOffset < snapshot.code.size() && code.data() == snapshot.code.data() + codeOffset && code.size() == snapshot.code.size() - codeOffset;
+}
+
+std::uint8_t offsetUse(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint8_t OffsetProgramUse::*field) {
+    std::lock_guard lock(snapshot.offsetUses->mutex);
+    const auto& entries = snapshot.offsetUses->entries;
+    const auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.codeOffset == codeOffset; });
+    return found != entries.end() ? (*found).*field : UseUnknown;
+}
+
+void noteOffsetUse(const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint8_t OffsetProgramUse::*field, bool used) {
+    std::lock_guard lock(snapshot.offsetUses->mutex);
+    auto& entries = snapshot.offsetUses->entries;
+    auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) { return entry.codeOffset == codeOffset; });
+    if (found == entries.end()) {
+        if (entries.size() >= OffsetProgramUses::Capacity) entries.erase(entries.begin());
+        found = entries.insert(entries.end(), OffsetProgramUse{codeOffset});
+    }
+    (*found).*field = used ? UsePresent : UseAbsent;
+}
+
+}
+
+std::uint64_t ProgramUseDecodes() {
+    return programUseDecodes.load(std::memory_order_relaxed);
+}
+
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset) {
     constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
     if (codeOffset == 0) {
         const auto cached = snapshot.workgroupUse->load(std::memory_order_acquire);
         if (cached != Unknown) return cached == Used;
     }
+    const auto code = std::span<const std::uint32_t>(snapshot.code).subspan(std::min(codeOffset, snapshot.code.size()));
+    const bool offsetCached = cachesOffset(snapshot, codeOffset, code);
+    if (offsetCached) {
+        const auto cached = offsetUse(snapshot, codeOffset, &OffsetProgramUse::workgroup);
+        if (cached != UseUnknown) return cached == UsePresent;
+    }
+    programUseDecodes.fetch_add(1, std::memory_order_relaxed);
     const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(std::span(snapshot.code).subspan(codeOffset));
     const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
         return instruction.family == ShaderRecompiler::RdnaInstructionFamily::DS || instruction.op == ShaderRecompiler::RdnaOpcode::SBarrier;
     });
     if (codeOffset == 0) snapshot.workgroupUse->store(used ? Used : Unused, std::memory_order_release);
+    if (offsetCached) noteOffsetUse(snapshot, codeOffset, &OffsetProgramUse::workgroup, used);
     return used;
 }
 
@@ -229,11 +276,18 @@ std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t c
         const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
         if (use != Unknown) return use == Used ? bits : 0;
     }
+    const bool offsetCached = snapshot != nullptr && cachesOffset(*snapshot, codeOffset, code);
+    if (offsetCached) {
+        const auto use = offsetUse(*snapshot, codeOffset, &OffsetProgramUse::positionVector);
+        if (use != UseUnknown) return use == UsePresent ? bits : 0;
+    }
+    programUseDecodes.fetch_add(1, std::memory_order_relaxed);
     const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
         return instruction.family == ShaderRecompiler::RdnaInstructionFamily::EXP && instruction.exportTarget >= 0x0du && instruction.exportTarget <= 0x0fu && instruction.exportEnableMask != 0;
     });
     if (cached) snapshot->positionVectorUse->store(used ? Used : Unused, std::memory_order_release);
+    if (offsetCached) noteOffsetUse(*snapshot, codeOffset, &OffsetProgramUse::positionVector, used);
     return used ? bits : 0;
 }
 

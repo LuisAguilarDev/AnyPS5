@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <algorithm>
@@ -67,6 +69,7 @@ void DrawPipeline::rethrowFailure() {
 }
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
     rethrowFailure();
@@ -118,6 +121,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    DrawPrepPool::ExemptThisThread();
+    PinWorkerThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
@@ -161,6 +166,7 @@ void DrawPipeline::run() {
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
@@ -181,6 +187,7 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
+    if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     if (bytes == 0 || bytes > 8) return std::nullopt;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
@@ -196,6 +203,11 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
+    if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
+    return OverlapsQueued(address, bytes);
+}
+
+bool DrawPipeline::OverlapsQueued(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (const auto& item : items) {

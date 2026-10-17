@@ -98,7 +98,7 @@ private:
 class IrNode {
 public:
     IrNode() = default;
-    explicit IrNode(IrValue* value) : _value(value->Resolve()) {}
+    IrNode(IrValue* value) : _value(value->Resolve()) {}
     static IrNode From(const IrResourcePlan&, IrValue* value) { return IrNode(value); }
     static IrNode SrtRead(const IrResourcePlan& program, std::uint32_t slot) { return IrNode(program.srtReads[slot].value); }
     static IrNode SourceDword(const IrResourcePlan& program, std::uint32_t source, std::uint32_t dword) { return IrNode(program.descriptorSources[source].dwords[dword]); }

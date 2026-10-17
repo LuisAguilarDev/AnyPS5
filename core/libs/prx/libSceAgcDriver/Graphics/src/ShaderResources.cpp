@@ -4560,23 +4560,42 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
+            // The words of a template hit whose data descriptors differ from the template's (the
+            // per-draw constants of a Xenoverse 2 draw) go into a slice of the snapshot arena, like a
+            // moved guest range: a buffer of their own per draw cost a pool take and, for a size the
+            // pooled buffer was not made at, a VkBuffer destroyed, created and bound again. The slice
+            // is not held for a later draw with the same words (a held slice would keep its whole
+            // arena alive); copying the words again costs less than comparing them. Words past a
+            // slice (a full ShaderData block) keep a buffer of their own, held by words. Debug aid:
+            // APS5_NO_WORD_SNAPSHOT_ARENA=1 gives every word set a buffer of its own.
+            static const bool ownBuffers = std::getenv("APS5_NO_WORD_SNAPSHOT_ARENA") != nullptr;
             const auto wordStart = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            constexpr std::size_t MovedWordBufferSlots = 8;
-            const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
-            std::shared_ptr<Buffer> buffer;
-            countSnapshot(override->size, true, held == movedWordBuffers.end());
-            if (held != movedWordBuffers.end()) {
-                buffer = held->buffer;
-            } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-                std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            const auto fill = [&](Buffer& buffer) {
+                std::memcpy(buffer.Bytes().data(), override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
-                    if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                    if (patch.allocation == index && patch.byte < override->size) buffer.Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-                MovedWordBuffer entry{index, override->words, override->size, buffer};
-                if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
-                else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+            };
+            std::shared_ptr<Buffer> buffer;
+            bool copied = true;
+            if (!ownBuffers && override->size <= Recorder::DrawSnapshotSliceBytes) {
+                buffer = recorder.DrawSnapshotBuffer(override->size);
+                fill(*buffer);
+            } else {
+                constexpr std::size_t MovedWordBufferSlots = 8;
+                const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
+                copied = held == movedWordBuffers.end();
+                if (!copied) {
+                    buffer = held->buffer;
+                } else {
+                    buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                    fill(*buffer);
+                    MovedWordBuffer entry{index, override->words, override->size, buffer};
+                    if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
+                    else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+                }
             }
+            countSnapshot(override->size, true, copied);
             if (profile != nullptr) {
                 ++profile->wordSnapshots;
                 profile->wordUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - wordStart).count();

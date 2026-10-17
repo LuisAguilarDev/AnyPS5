@@ -89,6 +89,24 @@ struct DataMask {
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 
+struct ValidateSteps {
+    std::uint64_t calls = 0, runs = 0, bytes = 0, pipelineNs = 0, syncNs = 0, gatesNs = 0, compareNs = 0;
+
+    ValidateSteps Since(const ValidateSteps& before) const {
+        return {calls - before.calls, runs - before.runs, bytes - before.bytes, pipelineNs - before.pipelineNs, syncNs - before.syncNs, gatesNs - before.gatesNs, compareNs - before.compareNs};
+    }
+    ValidateSteps& operator+=(const ValidateSteps& other) {
+        calls += other.calls;
+        runs += other.runs;
+        bytes += other.bytes;
+        pipelineNs += other.pipelineNs;
+        syncNs += other.syncNs;
+        gatesNs += other.gatesNs;
+        compareNs += other.compareNs;
+        return *this;
+    }
+};
+
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 
 }

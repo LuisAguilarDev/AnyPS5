@@ -150,6 +150,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             const auto poolWaitedBeforeValidate = profile ? DrawPrepPool::ThreadWaitedMs() : 0.0;
+            const auto stepsBefore = validateSteps();
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
@@ -214,6 +215,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.stageValidations += stageValidations;
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
+            counters.validateSteps += validateSteps().Since(stepsBefore);
             if (drawHit) {
                 ++counters.hits;
                 counters.stageDataHits += dataStages;
@@ -275,6 +277,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             DrawCandidateCounters tally;
+            const auto stepsBefore = validateSteps();
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
                 std::optional<SampledReadScope> sampling;
@@ -294,6 +297,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.candidates += tally;
+            drawEntryCounters.validateSteps += validateSteps().Since(stepsBefore);
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

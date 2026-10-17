@@ -116,6 +116,18 @@ int APS5_VABI scePthreadAttrGetschedparam(const PthreadAttr* attr, KernelSchedPa
     return SCE_OK;
 }
 
+int APS5_VABI scePthreadAttrGetinheritsched(const PthreadAttr* attr, int* inherit_sched) {
+    if (!attr || !*attr || !inherit_sched) return SCE_KERNEL_ERROR_EINVAL;
+    *inherit_sched = (*attr)->_inheritsched;
+    return SCE_OK;
+}
+
+int APS5_VABI scePthreadAttrGetschedpolicy(const PthreadAttr* attr, int* policy) {
+    if (!attr || !*attr || !policy) return SCE_KERNEL_ERROR_EINVAL;
+    *policy = (*attr)->_schedpolicy;
+    return SCE_OK;
+}
+
 int APS5_VABI scePthreadAttrGetsolosched(const PthreadAttr* attr, int* solosched) {
     if (!attr || !*attr) return SCE_KERNEL_ERROR_EINVAL;
     if (!solosched) throw std::runtime_error(std::string(__func__) + ": null output");

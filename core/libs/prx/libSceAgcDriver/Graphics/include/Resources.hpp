@@ -32,6 +32,8 @@ public:
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
     std::span<std::byte> Bytes();
     bool Mapped() const { return mapping != nullptr; }
+    // The memory properties the buffer was requested with (a view: its source's).
+    VkMemoryPropertyFlags Properties() const { return properties; }
     VkDeviceSize ViewOffset() const { return viewOffset; }
     void Invalidate();
 

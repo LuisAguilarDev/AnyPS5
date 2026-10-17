@@ -27,7 +27,22 @@ struct DrawInputCopy {
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    // False for a copy in write-combined device-local memory (DeviceLocalDrawBuffers): the CPU
+    // reads the guest bytes it was made from instead of its mapping.
+    bool hostReadable = true;
 };
+// APS5_DEVICE_LOCAL_DRAW_BUFFERS=1 (opt-in): vertex and index inputs are copied into host-visible
+// device-local memory (resizable BAR) instead of being read by the GPU in place from host imports
+// in system memory, over PCIe; the copies are reused across draws while their guest bytes are
+// unchanged (Recorder::ReusableDrawSnapshot). An input behind a pending recorded GPU write stays in
+// place, since its copy would wait for that write. The draw snapshot arena (small storage-buffer
+// snapshots, Recorder::DrawSnapshotBuffer) and the moved constant words of a template hit
+// (ShaderResources) move to that memory too. The CPU only writes those buffers. Off, or without
+// such a memory type, everything is bound as before.
+bool DeviceLocalDrawBuffers(const Context& context);
+// A host-visible buffer for a draw input: device-local when DeviceLocalDrawBuffers, else (or when
+// that memory cannot be had) the default host memory. `hostReadable` says which.
+std::shared_ptr<Buffer> DrawInputBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, bool* hostReadable = nullptr);
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);

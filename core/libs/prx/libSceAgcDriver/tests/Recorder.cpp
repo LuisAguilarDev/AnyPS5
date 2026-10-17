@@ -3221,6 +3221,72 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// APS5_DEVICE_LOCAL_DRAW_BUFFERS=1 (set by the test's registration): draw input copies land in
+// host-visible device-local memory and are reused while unchanged, and an imported input is copied
+// instead of read in place, unless a pending GPU write covers it.
+void deviceLocalDrawInputTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    using Use = Recorder::SnapshotUse;
+    auto context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    Require(block != nullptr, "write watching is unavailable");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* words = static_cast<std::uint32_t*>(block);
+    for (std::uint32_t i = 0; i < bytes / sizeof(std::uint32_t); ++i) words[i] = i * 7;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    constexpr std::size_t size = 512;
+    const auto copy = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
+    Require(!copy.reused && !copy.hostReadable, "a vertex input copy was not placed in device-local memory");
+    Require(std::memcmp(copy.buffer->Bytes().data(), block, size) == 0, "the device-local vertex copy differs from the guest bytes");
+    KeepDrawInput(&recorder, address, copy, Use::Vertex, 0);
+    const auto again = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
+    Require(again.reused && again.buffer == copy.buffer && !again.hostReadable, "an unchanged device-local vertex copy was not reused");
+    const auto indices = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
+    Require(!indices.hostReadable && std::memcmp(indices.buffer->Bytes().data(), block, size) == 0, "an index input copy was not placed in device-local memory");
+    Require((recorder.DrawSnapshotBuffer(64)->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0, "a draw snapshot slice was not placed in device-local memory");
+    Require((recorder.DrawSnapshotBuffer(Recorder::DrawSnapshotSliceBytes + 1)->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0, "a draw snapshot of its own, which the CPU reads back, was placed in device-local memory");
+    words[3] = 0xbeef;
+    const auto changed = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
+    Require(!changed.reused && changed.buffer != copy.buffer && std::memcmp(changed.buffer->Bytes().data(), block, size) == 0, "a device-local vertex copy outlived a CPU store");
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: in-place fallback not tested\n";
+        recorder.Sync();
+        return;
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: in-place fallback not tested\n";
+        recorder.Sync();
+        return;
+    }
+    context.recorder = &recorder;
+    recorder.Sync();
+    bool behind = false;
+    Require(InPlaceDrawInput(context, address + 4096, 256, 4, &behind) == nullptr && !behind, "an imported vertex input was read in place instead of copied");
+    Require(InPlaceDrawInput(context, address + 4096, 256, 4) == nullptr, "an imported index input was read in place instead of copied");
+    recorder.NotePendingWrite(address + 20480, 16);
+    Require(InPlaceDrawInput(context, address + 20480, 256, 4, &behind) != nullptr && behind, "a vertex input behind a pending GPU write was not left in place");
+    recorder.Sync();
+}
+
 void drawInputInPlaceTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     constexpr std::size_t bytes = 65536;
@@ -8358,6 +8424,15 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--metadata-pass-only") {
             metadataPassTests(device, recorder);
             std::cout << "Color metadata pass tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--device-local-draw-inputs-only") {
+            if (!DeviceLocalDrawBuffers(device.GetContext())) {
+                std::cout << "skipped, APS5_DEVICE_LOCAL_DRAW_BUFFERS is unset or the device has no host-visible device-local memory\n";
+                return 77;
+            }
+            deviceLocalDrawInputTests(device, recorder);
+            std::cout << "Device-local draw input tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-key-stores-only") {

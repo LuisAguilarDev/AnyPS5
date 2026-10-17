@@ -4567,7 +4567,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (held != movedWordBuffers.end()) {
                 buffer = held->buffer;
             } else {
-                buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+                buffer = DrawInputBuffer(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                 std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
                 for (const auto& patch : dataPatches) {
                     if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);

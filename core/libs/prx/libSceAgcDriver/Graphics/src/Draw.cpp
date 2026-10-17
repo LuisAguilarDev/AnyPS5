@@ -988,6 +988,45 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+namespace {
+
+constexpr VkMemoryPropertyFlags DeviceLocalHostMemory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+bool DeviceLocalDrawBuffersRequested() {
+    static const bool requested = std::getenv("APS5_DEVICE_LOCAL_DRAW_BUFFERS") != nullptr;
+    return requested;
+}
+
+// Allocations that fell back to host memory (the device-local heap is full, or its memory type does
+// not take the buffer), reported on the first and every power-of-two count.
+std::atomic<std::uint64_t> deviceLocalFallbacks{0};
+
+}
+
+bool DeviceLocalDrawBuffers(const Context& context) {
+    if (!DeviceLocalDrawBuffersRequested()) return false;
+    for (std::uint32_t i = 0; i < context.memory.memoryTypeCount; ++i) {
+        const auto& type = context.memory.memoryTypes[i];
+        if ((type.propertyFlags & DeviceLocalHostMemory) == DeviceLocalHostMemory && (context.memory.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) return true;
+    }
+    return false;
+}
+
+std::shared_ptr<Buffer> DrawInputBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, bool* hostReadable) {
+    if (hostReadable != nullptr) *hostReadable = true;
+    if (DeviceLocalDrawBuffers(context)) {
+        try {
+            auto buffer = std::make_shared<Buffer>(context, bytes, usage, DeviceLocalHostMemory);
+            if (hostReadable != nullptr) *hostReadable = false;
+            return buffer;
+        } catch (const std::exception& error) {
+            const auto count = deviceLocalFallbacks.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] device-local draw input of %zu bytes placed in host memory (%s); %llu such fallbacks\n", bytes, error.what(), static_cast<unsigned long long>(count));
+        }
+    }
+    return std::make_shared<Buffer>(context, bytes, usage);
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
@@ -998,10 +1037,11 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            copy.hostReadable = !DeviceLocalDrawBuffers(context);
             return copy;
         }
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    copy.buffer = DrawInputBuffer(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &copy.hostReadable);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
     return copy;
 }
@@ -1010,7 +1050,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
     GuestMemory::FlushGpuWrites(address, bytes);
     DrawInputCopy copy;
-    copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    copy.buffer = DrawInputBuffer(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &copy.hostReadable);
     const auto span = copy.buffer->Bytes();
     GuestMemory::Read(address, span.subspan(0, validBytes), 1);
     std::fill(span.begin() + static_cast<std::ptrdiff_t>(validBytes), span.end(), std::byte{0});
@@ -1033,6 +1073,8 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
         behind = recorder->PendingWriteOverlaps(address, bytes);
     }
+    // The opt-in device-local copies replace the PCIe reads, except behind a pending GPU write.
+    if (!behind && DeviceLocalDrawBuffers(context)) return nullptr;
     if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
@@ -1182,7 +1224,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+            const auto copied = copy.hostReadable ? copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)) : std::span<std::byte>(reinterpret_cast<std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes));
+            highest = HighestDrawIndex(copied, draw.indexSize, skipRestart);
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -1215,7 +1258,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(!fanGeometry || !state.primitiveRestart || *highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = *highest;
         if (skipRestart && state.stages.mesh && state.stages.mesh->inputPrimitive == 6) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import != nullptr || !copy.hostReadable ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {

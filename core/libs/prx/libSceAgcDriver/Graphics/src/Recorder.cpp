@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2710,7 +2711,9 @@ std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
         offset = 0;
     }
     if (snapshotArena == nullptr || offset + bytes > DrawSnapshotArenaBytes) {
-        snapshotArena = std::make_shared<Buffer>(context, DrawSnapshotArenaBytes, usage);
+        // Device-local under APS5_DEVICE_LOCAL_DRAW_BUFFERS (see DrawInputBuffer): the CPU only
+        // copies into the slices, so the shaders read them from video memory.
+        snapshotArena = DrawInputBuffer(context, DrawSnapshotArenaBytes, usage);
         offset = 0;
     }
     snapshotArenaUsed = offset + bytes;

@@ -136,7 +136,9 @@ public:
     // pool once per arena, not per snapshot), or a buffer of its own past DrawSnapshotSliceBytes. A
     // kept slice holds its whole arena, so the arena stays small (a snapshot cache entry holds one
     // arena at most). APS5_NO_DRAW_SNAPSHOT_ARENA=1 gives every snapshot a buffer of its own, as
-    // before.
+    // before. Under APS5_DEVICE_LOCAL_DRAW_BUFFERS=1 the arena is in host-visible device-local memory
+    // (DrawInputBuffer); the buffers of their own stay in host memory, since refreshDrawSnapshot
+    // reads them back.
     std::shared_ptr<Buffer> DrawSnapshotBuffer(std::size_t bytes);
     static constexpr std::size_t DrawSnapshotArenaBytes = std::size_t{64} << 10u;
     static constexpr std::size_t DrawSnapshotSliceBytes = std::size_t{4} << 10u;

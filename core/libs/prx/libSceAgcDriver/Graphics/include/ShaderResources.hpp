@@ -81,7 +81,7 @@ public:
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Free(const SetAllocation& allocation) noexcept;
-    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt, bool* reused = nullptr);
     void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
@@ -168,7 +168,22 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    struct DrawBindingsProfile {
+        double snapshotUs = 0;
+        double allocateUs = 0;
+        double writeUs = 0;
+        std::uint64_t sets = 0;
+        std::uint64_t freshSets = 0;
+        std::uint64_t updateCalls = 0;
+        std::uint64_t writes = 0;
+        std::uint64_t descriptors = 0;
+        std::uint64_t snapshots = 0;
+        std::uint64_t movedSnapshots = 0;
+        std::uint64_t snapshotBytes = 0;
+        std::uint64_t copiedSnapshots = 0;
+        std::uint64_t copiedBytes = 0;
+    };
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();

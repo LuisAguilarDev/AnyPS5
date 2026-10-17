@@ -101,7 +101,8 @@ public:
         std::size_t fragmentWords = 0;
         std::uint8_t fragmentFlags = 0;
     };
-    void BeginPassTiming(const PassTarget& target, const PassSample& sample = {});
+    void BeginPassTiming(const PassTarget& target, const PassSample& sample);
+    void BeginPassTiming(const PassTarget& target) { BeginPassTiming(target, PassSample{}); }
     void CountPassDraw(std::uint8_t fragmentFlags = 0);
     // The [gpu-passes] totals since the last 10 s report (or since start), by target: passes,
     // draws and GPU milliseconds of the pass bodies. For tests.

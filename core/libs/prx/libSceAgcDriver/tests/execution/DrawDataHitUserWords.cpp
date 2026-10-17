@@ -84,7 +84,7 @@ void PixelUserData(std::vector<std::uint32_t>& commands, const std::uint32_t* po
 }
 
 struct Modes {
-    bool verify = false, rebase = true;
+    bool verify = false, rebase = true, forwarded = true;
 };
 
 std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false) {
@@ -145,7 +145,7 @@ void Describe(std::uint32_t* table, std::uint32_t* data, float value) {
 }
 
 std::string CandidateCounts(const AgcDriver::DriverDetail::DrawCandidateCounters& counters) {
-    return std::to_string(counters.tried) + " candidates tried, equal " + std::to_string(counters.equal) + " / " + std::to_string(counters.equalData) + ", rebased " + std::to_string(counters.rebased) + " / " + std::to_string(counters.rebasedData) + ", refused " + std::to_string(counters.refusedUntagged) + " untagged / " + std::to_string(counters.refusedOff) + " off, differing " + std::to_string(counters.differingEqual) + " / " + std::to_string(counters.differingRebased);
+    return std::to_string(counters.tried) + " candidates tried, equal " + std::to_string(counters.equal) + " / " + std::to_string(counters.equalData) + ", rebased " + std::to_string(counters.rebased) + " / " + std::to_string(counters.rebasedData) + ", forwarded " + std::to_string(counters.forwarded) + ", refused " + std::to_string(counters.refusedUntagged) + " untagged / " + std::to_string(counters.refusedOff) + " off, differing " + std::to_string(counters.differingEqual) + " / " + std::to_string(counters.differingRebased);
 }
 
 void UnreadUserWordsKeepTheStage(const Modes& modes) {
@@ -205,7 +205,7 @@ unsigned BrightestColorByte() {
     return brightest;
 }
 
-void ReadUserWordsChangeTheOutput() {
+void ReadUserWordsChangeTheOutput(const Modes& modes) {
     Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(ArithmeticPixelHeader, ArithmeticPixelCode.data(), sizeof(ArithmeticPixelCode), 1);
     PixelConstant[0] = 0.25f;
@@ -225,6 +225,15 @@ void ReadUserWordsChangeTheOutput() {
     const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
     Require(withinTwo(first, 128), "a pixel stage adding user word 2 (0.25) to a loaded 0.25 wrote " + std::to_string(first) + ", expected 128");
     Require(withinTwo(second, 191), "a pixel stage adding user word 2 changed to 0.5 wrote " + std::to_string(second) + ", expected 191 (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.dataHits == before.dataHits + 1, "changing a forwarded user word was not a data-only hit: " + Counts(after));
+    const auto forwarded = after.candidates.forwarded - before.candidates.forwarded;
+    if (!modes.rebase || !modes.forwarded) {
+        Require(forwarded == 0, "forwarded words off: the pixel stage was reused with its forwarded user word patched: " + CandidateCounts(after.candidates));
+    } else {
+        Require(forwarded == 1, "the pixel stage whose forwarded user word changed was not reused with the word patched: " + CandidateCounts(after.candidates));
+        if (modes.verify) Require(after.dataVerified - before.dataVerified == 2, "verify mode: the patched draw was not built and compared on both stages: " + Counts(after));
+        else Require(after.dataDrawsReused - before.dataDrawsReused == 1, "the draw whose forwarded user word changed did not reuse both stages: " + Counts(after));
+    }
 }
 
 void MovedTablesRenderTheirBuffers(const Modes& modes) {
@@ -287,8 +296,9 @@ int main() {
         Modes modes;
         modes.verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr || std::getenv("APS5_VERIFY_DRAW_REBASE") != nullptr;
         modes.rebase = std::getenv("APS5_NO_DRAW_REBASE") == nullptr;
+        modes.forwarded = std::getenv("APS5_NO_DRAW_FORWARDED_WORDS") == nullptr;
         UnreadUserWordsKeepTheStage(modes);
-        ReadUserWordsChangeTheOutput();
+        ReadUserWordsChangeTheOutput(modes);
         MovedTablesRenderTheirBuffers(modes);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (modes.verify ? "verified" : "reused") << " the stages whose read user words did not change" << (modes.rebase ? " or whose tables only moved" : "") << '\n';

@@ -152,6 +152,11 @@ private:
     static bool drawRebaseEnabled();
     static bool drawRebaseFetch();
     static bool candidateDataWords();
+    static bool drawForwardedWords();
+    static std::uint64_t fetchTableWords(const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo);
+    static std::uint64_t forwardedOnlyWords(const DispatchVariant& variant, std::uint64_t fetchWords);
+    static DrawRefusedWord refusedWordRole(const DispatchVariant& variant, std::uint32_t index, std::uint64_t fetchWords, std::uint32_t hiddenWords);
+    static void forwardVariantWord(DispatchVariant& copy, std::uint32_t index, std::uint32_t to);
     static bool verifyDrawRebase();
     static bool verifyDataCandidates();
     static std::vector<std::pair<std::uint64_t, std::int32_t>> vertexFetchReads(const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads, std::span<const std::uint32_t> userData, std::uint32_t hiddenWords);

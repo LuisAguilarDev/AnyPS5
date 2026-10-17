@@ -65,6 +65,35 @@ bool Driver::drawRebaseFetch() {
     return enabled;
 }
 
+bool Driver::drawForwardedWords() {
+    static const bool enabled = drawRebaseEnabled() && std::getenv("APS5_NO_DRAW_FORWARDED_WORDS") == nullptr;
+    return enabled;
+}
+
+std::uint64_t Driver::fetchTableWords(const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo) {
+    std::uint64_t words = 0;
+    for (const auto reg : {static_cast<std::uint32_t>(vertexInfo.fetchAttribReg), static_cast<std::uint32_t>(vertexInfo.fetchBufferReg)}) words |= reg + 1u < 64u ? std::uint64_t{3} << reg : ~std::uint64_t{0};
+    return words;
+}
+
+std::uint64_t Driver::forwardedOnlyWords(const DispatchVariant& variant, std::uint64_t fetchWords) {
+    const auto forwarded = variant.compiled->userDataRegisterReads;
+    if (forwarded == ~std::uint64_t{0} || variant.valueWords == ~std::uint64_t{0}) return 0;
+    return forwarded & ~(variant.baseWords | variant.valueWords) & ~fetchWords;
+}
+
+DrawRefusedWord Driver::refusedWordRole(const DispatchVariant& variant, std::uint32_t index, std::uint64_t fetchWords, std::uint32_t hiddenWords) {
+    if (index >= 64u) return DrawRefusedWord::Beyond;
+    const auto bit = std::uint64_t{1} << index;
+    if ((fetchWords & bit) != 0) return DrawRefusedWord::Fetch;
+    const bool base = (variant.baseWords & bit) != 0, value = variant.valueWords != ~std::uint64_t{0} && (variant.valueWords & bit) != 0;
+    if (base && value) return DrawRefusedWord::BaseAndValue;
+    if (value) return DrawRefusedWord::Value;
+    if (base) return DrawRefusedWord::BaseDropped;
+    if ((variant.compiled->userDataRegisterReads & bit) != 0 || hiddenWords != 0) return DrawRefusedWord::Forwarded;
+    return DrawRefusedWord::Unwalked;
+}
+
 bool Driver::candidateDataWords() {
     static const bool enabled = drawStageDataHits() && std::getenv("APS5_NO_DRAW_CANDIDATE_DATA_WORDS") == nullptr;
     return enabled;
@@ -301,6 +330,8 @@ std::shared_ptr<DispatchVariant> Driver::copyVariant(const DispatchVariant& vari
     copy->rebaseWords = variant.rebaseWords;
     copy->shaderDataPatches = variant.shaderDataPatches;
     copy->userDataMask = variant.userDataMask;
+    copy->baseWords = variant.baseWords;
+    copy->valueWords = variant.valueWords;
     copy->vertexInfo = variant.vertexInfo;
     return copy;
 }
@@ -312,6 +343,10 @@ void Driver::rebaseVariantWord(DispatchVariant& copy, std::uint32_t index, std::
         copy.runs[run].first += delta;
         copy.runs[run].second += delta;
     }
+    forwardVariantWord(copy, index, to);
+}
+
+void Driver::forwardVariantWord(DispatchVariant& copy, std::uint32_t index, std::uint32_t to) {
     const auto& forwarded = copy.compiled->shaderDataUserWords;
     for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
         if (forwarded[slot] == index) copy.shaderDataPatches.emplace_back(slot, to);

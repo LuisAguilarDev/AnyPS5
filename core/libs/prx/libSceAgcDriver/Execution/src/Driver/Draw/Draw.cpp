@@ -300,7 +300,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (matched[i]->vertexInfo != nullptr) vertexInfos[i] = *matched[i]->vertexInfo;
                 continue;
             }
-            if (!dataCandidates[i].empty() && !verifyDrawDataHits()) {
+            if (!dataCandidates[i].empty() && !verifyDataCandidates()) {
                 const auto& info = dataCandidates[i].front().first->vertexInfo;
                 if (info != nullptr) vertexInfos[i] = *info;
                 continue;
@@ -534,16 +534,28 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::memcpy(words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
         }
     };
+    const auto sameBindings = [](const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
+        return a.bindings.size() == b.bindings.size() && std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), [](const auto& x, const auto& y) { return x.kind == y.kind && x.role == y.role && x.binding == y.binding && x.count == y.count && x.guestDescriptor == y.guestDescriptor; });
+    };
+    const auto flatten = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& spans, const std::vector<std::uint32_t>& values) {
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
+        std::size_t word = 0;
+        for (const auto& [begin, end] : spans) {
+            for (auto address = begin; address < end && word < values.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, values[word++]);
+        }
+        std::sort(flat.begin(), flat.end());
+        return flat;
+    };
     const auto verifyDataStage = [&](std::size_t i, const DispatchVariant& kept) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
-        const char* what = runs != kept.runs ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
+        const char* what = flatten(runs, words) != flatten(kept.runs, kept.words) ? "runs or words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : !sameBindings(compiled, *kept.compiled) ? "bindings" : nullptr;
         ++dataVerified;
         if (what == nullptr) return;
-        char message[320];
-        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
+        char message[352];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS/APS5_VERIFY_DRAW_REBASE: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey));
         throw std::runtime_error(message);
     };
     const auto verifyStageData = [&](std::size_t i) {
@@ -554,8 +566,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         freshRuns(i, runs, words);
         const auto& fresh = *stageCaptures[i].compiled;
         const auto& patched = *hit.compiled;
-        const bool sameBindings = fresh.bindings.size() == patched.bindings.size() && std::equal(fresh.bindings.begin(), fresh.bindings.end(), patched.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
-        const char* what = runs != kept.runs ? "runs" : words != hit.words ? "words" : fresh.variantId != patched.variantId ? "variant" : fresh.pushConstants != patched.pushConstants ? "push constants" : !sameBindings ? "bindings" : nullptr;
+        const char* what = flatten(runs, words) != flatten(kept.runs, hit.words) ? "runs or words" : fresh.variantId != patched.variantId ? "variant" : fresh.pushConstants != patched.pushConstants ? "push constants" : !sameBindings(fresh, patched) ? "bindings" : nullptr;
         ++stageDataVerified;
         if (what == nullptr) return;
         char message[256];
@@ -576,14 +587,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes; });
-            if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
+            if (candidate != dataCandidates[i].end() && !verifyDataCandidates()) {
                 matched[i] = candidate->first;
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
-                if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
+                if (!dataCandidates[i].empty() && !verifyDataCandidates()) decodeVertexInfo(i);
                 if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
                     for (auto previous = i; previous-- > 0;) {
                         if (programResults[previous] == nullptr) continue;
@@ -595,7 +606,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
-                if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                if (stageData[i].compiled != nullptr && matched[i] != nullptr && verifyDrawDataHits()) verifyStageData(i);
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
@@ -620,6 +631,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
+        if (dataStagesReused != 0 && dataStagesCompiled == 0) ++drawEntryCounters.dataDrawsReused;
         drawEntryCounters.dataVerified += dataVerified;
     }
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);

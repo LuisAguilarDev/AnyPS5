@@ -9,8 +9,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <list>
 #include <memory>
+#include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
@@ -83,6 +85,16 @@ struct StageDataHit {
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
+struct DrawCandidateCounters {
+    std::uint64_t tried = 0, equal = 0, equalData = 0, rebased = 0, rebasedData = 0, rebasedFetch = 0;
+    std::uint64_t refusedUntagged = 0, refusedPointer = 0, refusedTail = 0, refusedOff = 0, differingEqual = 0, differingRebased = 0;
+
+    DrawCandidateCounters& operator+=(const DrawCandidateCounters& other) {
+        for (auto [total, part] : {std::pair{&tried, other.tried}, {&equal, other.equal}, {&equalData, other.equalData}, {&rebased, other.rebased}, {&rebasedData, other.rebasedData}, {&rebasedFetch, other.rebasedFetch}, {&refusedUntagged, other.refusedUntagged}, {&refusedPointer, other.refusedPointer}, {&refusedTail, other.refusedTail}, {&refusedOff, other.refusedOff}, {&differingEqual, other.differingEqual}, {&differingRebased, other.differingRebased}}) *total += part;
+        return *this;
+    }
+};
+
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawMiss::Count)> misses{};
@@ -94,7 +106,8 @@ struct DrawEntryCounters {
     std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
     std::array<std::uint64_t, 6> registerKeyMissChanges{};
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
-    std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
+    std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0, dataDrawsReused = 0;
+    DrawCandidateCounters candidates;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

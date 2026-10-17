@@ -2,8 +2,70 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <bit>
 
 namespace AgcDriver::DriverDetail {
+
+std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters) {
+    std::uint64_t moved = 0;
+    bool movedBeyond = false;
+    for (std::size_t w = 0; w < now.userData.size(); ++w) {
+        if (now.userData[w] == was.userData[w]) continue;
+        if (w >= 64u) movedBeyond = true;
+        else if (((variant->userDataMask >> w) & 1u) != 0) moved |= std::uint64_t {1} << w;
+    }
+    ++counters.tried;
+    auto candidate = variant;
+    const bool rebased = moved != 0 || movedBeyond;
+    if (rebased) {
+        if (!drawRebaseEnabled()) {
+            ++counters.refusedOff;
+            return nullptr;
+        }
+        if (movedBeyond || (moved & ~variant->rebaseWords) != 0) {
+            ++counters.refusedUntagged;
+            return nullptr;
+        }
+        if (now.tailContinuation != was.tailContinuation) {
+            ++counters.refusedTail;
+            return nullptr;
+        }
+        auto copy = copyVariant(*variant);
+        for (auto bits = moved; bits != 0; bits &= bits - 1) {
+            const auto index = static_cast<std::uint32_t>(std::countr_zero(bits));
+            const auto from = was.userData[index], to = now.userData[index];
+            if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) {
+                ++counters.refusedPointer;
+                return nullptr;
+            }
+            rebaseVariantWord(*copy, index, from, to);
+        }
+        applyShaderDataPatches(*copy);
+        candidate = std::move(copy);
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+    auto* live = candidateDataWords() ? &liveData : nullptr;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    appendEntryRegions(*candidate, regions);
+    auto result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live);
+    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live);
+    if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
+        ++(rebased ? counters.differingRebased : counters.differingEqual);
+        return nullptr;
+    }
+    const bool data = result == EntryOutcome::EqualData;
+    if (data) {
+        if (!rebased) candidate = copyVariant(*variant);
+        for (const auto& [position, value] : liveData) candidate->words[position] = value;
+        candidate->compiled = patchDataWords(*candidate, candidate->words);
+    }
+    if (!rebased) ++(data ? counters.equalData : counters.equal);
+    else ++(data ? counters.rebasedData : counters.rebased);
+    const auto movedWord = [&](std::uint32_t index) { return index < 64u && ((moved >> index) & 1u) != 0; };
+    const auto& info = variant->vertexInfo;
+    if (rebased && info != nullptr && info->fetchEmbedded && (movedWord(info->fetchAttribReg) || movedWord(info->fetchBufferReg))) ++counters.rebasedFetch;
+    return candidate;
+}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::shared_ptr<DrawEntry>& dataEntry, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -207,27 +269,26 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
-            const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
-            std::optional<SampledReadScope> sampling;
-            for (std::size_t i = 0; i < programs.size(); ++i) {
-                if (roles[i] == Role::GeometryBack || programs[i].userData.size() != dataEntry->decode->programs[i].userData.size()) continue;
-                const auto& now = programs[i].userData;
-                const auto& was = dataEntry->decode->programs[i].userData;
-                auto& candidates = dataCandidates[i];
-                for (const auto& variant : dataEntry->stages[i]) {
-                    bool usedEqual = true;
-                    for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
-                        if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
+            DrawCandidateCounters tally;
+            {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+                std::optional<SampledReadScope> sampling;
+                for (std::size_t i = 0; i < programs.size(); ++i) {
+                    const auto& was = dataEntry->decode->programs[i];
+                    if (roles[i] == Role::GeometryBack || programs[i].userData.size() != was.userData.size()) continue;
+                    auto& candidates = dataCandidates[i];
+                    for (const auto& variant : dataEntry->stages[i]) {
+                        if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                        auto candidate = dataCandidate(variant, programs[i], was, submission.queue, imagesFlushed, runsSynced, sampling, tally);
+                        if (candidate == nullptr) continue;
+                        std::vector<ShaderRecompiler::MemoryRegion> regions;
+                        appendEntryRegions(*candidate, regions);
+                        candidates.emplace_back(std::move(candidate), std::move(regions));
                     }
-                    if (!usedEqual) continue;
-                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
-                    std::vector<ShaderRecompiler::MemoryRegion> regions;
-                    appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
                 }
             }
+            std::lock_guard cacheLock(drawCacheMutex);
+            drawEntryCounters.candidates += tally;
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -59,6 +60,9 @@ int CommitBufferGroup(const std::string& function, VideoOutConfig& cfg, int setI
         AgcDriverCheckGuestMemory_nid_postfix(buffers[i].data, AgcDriverDisplayBufferSize_nid_postfix(display), display.alignment);
     }
     cfg.groups[setIndex] = group;
+    static std::atomic<std::uint64_t> loggedSize{0};
+    const std::uint64_t size = (static_cast<std::uint64_t>(group.attribute.width) << 32) | group.attribute.height;
+    if (loggedSize.exchange(size) != size) std::fprintf(stderr, "[videoout] display buffers registered at %ux%u\n", group.attribute.width, group.attribute.height);
     cfg.width = group.attribute.width;
     cfg.height = group.attribute.height;
     for (int i = 0; i < bufferNum; i++) {

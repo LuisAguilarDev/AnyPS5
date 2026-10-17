@@ -12,6 +12,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardMouse.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostHdrProbe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Xv2Force1080p.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libkernel/Time/TimedWait.cpp
 )
 
@@ -59,6 +60,17 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(video_out_output_mode_policy PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(video_out_xv2_force_1080p_tests tests/Xv2Force1080p.cpp src/Xv2Force1080p.cpp)
+    target_include_directories(video_out_xv2_force_1080p_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(video_out_xv2_force_1080p_tests PRIVATE libkernel libc)
+    configure_windows_unwind(video_out_xv2_force_1080p_tests)
+    add_test(NAME video_out_xv2_force_1080p COMMAND video_out_xv2_force_1080p_tests)
+    set_tests_properties(video_out_xv2_force_1080p PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(video_out_xv2_force_1080p PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
 
     add_test_executable(guest_video_out_high_frame_rate_tests ${LIBS_INCLUDE_DIR}/tests/GuestVideoOutHighFrameRate.cpp)

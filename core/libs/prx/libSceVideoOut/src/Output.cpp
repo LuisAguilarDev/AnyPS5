@@ -11,6 +11,7 @@
 #include "prx/libSceVideoOut/include/Output.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/Xv2Force1080p.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
@@ -80,6 +81,7 @@ static void validateOpenParam(const void* param) {
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
+    Xv2Force1080p::ApplyToRunningTitleOnce();
     validateOpenParam(param);
     if (userId != 255 && userId != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");

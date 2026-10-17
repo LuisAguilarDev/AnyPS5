@@ -203,6 +203,22 @@ A class range covers a command together with its own barriers. In `VulkanDevice:
 - `shadow-publish`: copies of unit shadow slabs into the import, with their barriers (`recordCopies` in `UnitShadow.cpp`, reached from `PublishShadow`). Copied bytes.
 - `template-refresh`: the `vkCmdUpdateBuffer` updates of a cached dispatch's changed data words, as one range from the first update to the last (`ShaderResources::refreshData`, called from `recordDispatch`). Refreshed bytes.
 
+A `[gpu-time]` line follows the `[gputime]` line. It splits the batch time per frame (per present) by what produced it:
+
+```
+[gpu-time] 10 s, 91 presents; per frame: batches 45.5 ms ~ passes 30.1 (x117.0, 1366 draws) + pass barriers/setup 2.0 + dispatches 5.0 (x40.0) + dispatch barriers 0.5 + uploads 1.0 + write-back 2.0 + copies/fills 1.5 + label runs 0.3 + shadow 0.1 + untimed 3.0; present blit 0.8; top passes over 10 s (WxH color+more depth, passes, draws, ms): 3840x2160 rgba16f+2 d32s8 x2100 52000d 1500.0ms ...
+```
+
+- `batches`: the whole-batch ranges (the `[present]` line's GPU busy time).
+- `passes`: render pass bodies, timed from the pass's begin to its end (`Recorder::BeginPassTiming` before `Pipeline::Begin`, ended in `Recorder::endOpenRenderPass` before the trailing barrier), with passes and draws per frame. The draws of the synchronous `Draw` path, which records its own pass, are not in it.
+- `pass barriers/setup`: the `draw` class minus the pass bodies: each pass's leading and trailing barriers, attachment proxy loads and stores and indirect argument records.
+- `dispatches`: program-keyed ranges outside every class range, which are the dispatches (a copy's transfer range lies inside its `copy` class range and is left out), with dispatches per frame.
+- `dispatch barriers`: `dispatch-lead`, `dispatch-trail` and `indirect-args`. `uploads`: `storage-upload`, `staging-in` and `template-refresh`. `write-back`: `storage-writeback` and `staging-out`. `copies/fills`: `copy`, `fill`, `fill-clear`, `dcc-clear` and `dcc-keys`. `label runs`: `label-run`. `shadow`: `shadow-publish`.
+- `untimed`: batch time outside every range. `present blit`: the `present-blit` class, outside the batches.
+- `top passes`: the 5 render pass targets with the most pass body time over the 10 s, as `<width>x<height> <first color format>[+<more color targets>] <depth format>[ <samples>x][ L<layers>] x<passes> <draws>d <ms>ms` (`-` when there is no target of that kind; formats are short names such as `rgba8`, `rgba16f`, `r11g11b10f`, `d32s8`, or `f<VkFormat>`). A `[gpu-passes]` line lists the next 15 targets when there are more than 5.
+
+The terms are the GPU time each kind of work adds after everything before it, since every stamp waits for all earlier work. The cost of a barrier is mostly the overlap it prevents between the work before and after it, which shows up in the ranges around it rather than in its own. Timed ranges that do not fit the 512-range cap of their batch are left out of every term.
+
 ## Draw record split
 
 With `APS5_PROFILE_DRAW=1`, a `[draws] record split` line follows the `[draws]` line when a draw went through `recordDraw` in the window. It splits the `record` phase of those draws into consecutive parts, each as `<total ms>/<average us per draw>`: `prologue` (the `RecordedDraw` assembly, the render pass key, queued key and label store flushes), `bindings` (`ShaderResources::PrepareDrawBindings`: `snapshot` for the loop over moved and directly read buffers, `allocate` for the per-draw descriptor sets, `write` for `vkUpdateDescriptorSets`, `other` for the rest), `pass` (the pass access and `Recorder::StartDrawPass`), `barriers` (proxy loads, the pass's leading barrier, indirect argument records), `begin` (`Pipeline::Begin` of a new pass: the render pass begin, the pipeline bind and dynamic state), `continue` (`Pipeline::Continue` of a continued pass: the pipeline bind and dynamic state), `bind` (the descriptor set binds), `push` (push constants), `commands` (the draw commands, stencil replay and face splits) and `leave` (`Recorder::LeaveRenderPassOpen`). It then gives the per-draw descriptor sets taken from the descriptor cache by draw kind and how many were newly allocated rather than recycled (only those reach the cumulative `sets` count of the `[descriptors]` line), the `vkUpdateDescriptorSets` calls with their writes and descriptors, and the buffer snapshots with the moved ones, the ones copied from guest memory and the bytes copied and bound. The counters reset with the `[draws]` line.

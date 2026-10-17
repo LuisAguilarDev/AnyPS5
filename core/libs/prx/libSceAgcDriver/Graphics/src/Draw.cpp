@@ -1814,6 +1814,19 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+// The pass's targets as the [gpu-passes] line reports them (APS5_PROFILE_GPU).
+Recorder::PassTarget passTarget(const State& state) {
+    Recorder::PassTarget target;
+    target.width = state.renderExtent.width;
+    target.height = state.renderExtent.height;
+    target.layers = state.renderLayers;
+    target.samples = state.samples;
+    target.colors = static_cast<std::uint32_t>(state.colors.size());
+    if (!state.colors.empty()) target.color = state.colors.front().format;
+    if (state.depth.has_value()) target.depth = state.depth->format;
+    return target;
+}
+
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -1920,6 +1933,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         timer.part(RecordBarriers);
+        if (Recorder::GpuTimingEnabled()) recorder->BeginPassTiming(passTarget(state));
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
         timer.part(RecordBegin);
     }
@@ -1965,6 +1979,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    recorder->CountPassDraw();
     timer.part(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);

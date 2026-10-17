@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -68,6 +69,30 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    // APS5_PROFILE_GPU=1: the render pass a draw is about to begin (after its leading barriers),
+    // timed from its begin to its end (before the trailing barrier) and reported by target on the
+    // [gpu-passes] line with the draws it held (CountPassDraw, once per draw, continued or not).
+    // The draw class range around it adds the pass's barriers and setup. No-ops when timing is off.
+    struct PassTarget {
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint32_t layers = 1;
+        std::uint32_t samples = 1;
+        std::uint32_t colors = 0;
+        VkFormat color = VK_FORMAT_UNDEFINED;
+        VkFormat depth = VK_FORMAT_UNDEFINED;
+        auto operator<=>(const PassTarget&) const = default;
+    };
+    void BeginPassTiming(const PassTarget& target);
+    void CountPassDraw();
+    // The [gpu-passes] totals since the last 10 s report (or since start), by target: passes,
+    // draws and GPU milliseconds of the pass bodies. For tests.
+    struct PassTotals {
+        std::uint64_t passes = 0;
+        std::uint64_t draws = 0;
+        double ms = 0;
+    };
+    static std::vector<std::pair<PassTarget, PassTotals>> PassTimingTotals();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -465,6 +490,9 @@ public:
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
+    // The key of a render pass body (BeginPassTiming): reported on the [gpu-passes] and [gpu-time]
+    // lines only, inside its draw class range.
+    static constexpr std::uint64_t PassBodyTimingKey = ~std::uint64_t{0} - 1;
     // The driver's own command classes: their [gputime] ranges take the reserved keys 0x10 + class
     // (printed by name, with counts and bytes, per 10 s and per present) and their barriers are
     // counted on the [barriers] line (CountBarriers, printed every 10 s under APS5_PROFILE_DRAW
@@ -579,6 +607,17 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Per timed range: begun inside an open class range (a copy's transfer), so the [gpu-time]
+        // dispatch total keeps only the program ranges no class covers.
+        std::vector<bool> timedNested;
+        std::uint32_t openClassRanges = 0;
+        // The pass bodies timed in this batch (BeginPassTiming): range index, target, draws.
+        struct TimedPass {
+            std::uint32_t timing;
+            PassTarget target;
+            std::uint32_t draws;
+        };
+        std::vector<TimedPass> timedPasses;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -647,6 +686,9 @@ private:
             bool fenced = false;
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
+            // The pass body's range and its entry in timedPasses (BeginPassTiming).
+            std::uint32_t bodyTiming = NoTiming;
+            std::uint32_t timedPass = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;

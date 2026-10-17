@@ -1225,8 +1225,27 @@ configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder_kept_bytes COMMAND agc_recorder_kept_bytes_tests)
+    # The mock device has no timestamp queries: the batch stamps APS5_PROFILE_DRAW turns on are
+    # skipped instead of failing every batch.
+    add_test(NAME agc_recorder_kept_bytes_profiled COMMAND agc_recorder_kept_bytes_tests)
+    set_tests_properties(agc_recorder_kept_bytes_profiled PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1")
     if(WIN32)
-        set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_kept_bytes agc_recorder_kept_bytes_profiled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_recorder_gpu_timing_tests EXCLUDE_FROM_ALL tests/RecorderGpuTiming.cpp)
+target_include_directories(agc_recorder_gpu_timing_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_recorder_gpu_timing_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_recorder_gpu_timing_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_recorder_gpu_timing_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_recorder_gpu_timing_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_recorder_gpu_timing COMMAND agc_recorder_gpu_timing_tests)
+    set_tests_properties(agc_recorder_gpu_timing PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_PROFILE_GPU=1")
+    if(WIN32)
+        set_tests_properties(agc_recorder_gpu_timing PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

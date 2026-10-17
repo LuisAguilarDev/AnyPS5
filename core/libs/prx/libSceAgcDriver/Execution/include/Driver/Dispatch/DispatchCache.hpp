@@ -46,6 +46,8 @@ struct DispatchVariant {
     std::uint64_t rebaseWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::uint64_t baseWords = 0;
+    std::uint64_t valueWords = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;
@@ -88,6 +90,24 @@ struct DataMask {
 };
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
+
+struct ValidateSteps {
+    std::uint64_t calls = 0, runs = 0, bytes = 0, pipelineNs = 0, syncNs = 0, gatesNs = 0, compareNs = 0;
+
+    ValidateSteps Since(const ValidateSteps& before) const {
+        return {calls - before.calls, runs - before.runs, bytes - before.bytes, pipelineNs - before.pipelineNs, syncNs - before.syncNs, gatesNs - before.gatesNs, compareNs - before.compareNs};
+    }
+    ValidateSteps& operator+=(const ValidateSteps& other) {
+        calls += other.calls;
+        runs += other.runs;
+        bytes += other.bytes;
+        pipelineNs += other.pipelineNs;
+        syncNs += other.syncNs;
+        gatesNs += other.gatesNs;
+        compareNs += other.compareNs;
+        return *this;
+    }
+};
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 

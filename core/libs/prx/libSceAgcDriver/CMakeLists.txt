@@ -314,6 +314,21 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_program_trace PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+
+    add_test_executable(agc_driver_draw_prep_pool_bounds_tests
+            tests/DrawPrepPoolBounds.cpp
+            Execution/src/Driver/Draw/DrawPrepPool.cpp
+    )
+    target_include_directories(agc_driver_draw_prep_pool_bounds_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_driver_draw_prep_pool_bounds_tests PRIVATE libc)
+    set_target_properties(agc_driver_draw_prep_pool_bounds_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_driver_draw_prep_pool_bounds_tests)
+    add_test(NAME agc_driver_draw_prep_pool_bounds COMMAND agc_driver_draw_prep_pool_bounds_tests)
+    set_tests_properties(agc_driver_draw_prep_pool_bounds PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_DRAW_PREP_THREADS=3" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_prep_pool_bounds PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
@@ -1800,8 +1815,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_data_hit_user_words_rebase_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_REBASE=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_data_hit_user_words_rebase_verify COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_rebase_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_REBASE=1" SKIP_RETURN_CODE 77)
+    add_test(NAME agc_driver_draw_data_hit_user_words_forwarded_off COMMAND agc_driver_draw_data_hit_user_words_tests)
+    set_tests_properties(agc_driver_draw_data_hit_user_words_forwarded_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_FORWARDED_WORDS=1" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_rebase_off agc_driver_draw_data_hit_user_words_rebase_verify PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_cache_reuse_off agc_driver_draw_cache_reuse_verify agc_driver_draw_cache_reuse_inline agc_driver_draw_data_hit_user_words_verify agc_driver_draw_data_hit_user_words_rebase_off agc_driver_draw_data_hit_user_words_rebase_verify agc_driver_draw_data_hit_user_words_forwarded_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

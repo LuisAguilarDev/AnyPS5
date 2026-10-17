@@ -23,8 +23,15 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
             ++counters.refusedOff;
             return nullptr;
         }
-        if (movedBeyond || (moved & ~variant->rebaseWords) != 0) {
+        const auto fetchWords = variant->vertexInfo == nullptr ? std::uint64_t{0} : fetchTableWords(*variant->vertexInfo);
+        const auto forwarded = drawForwardedWords() && now.hiddenUserWords == 0 ? forwardedOnlyWords(*variant, fetchWords) : 0;
+        const auto untagged = moved & ~variant->rebaseWords & ~forwarded;
+        if (movedBeyond || untagged != 0) {
             ++counters.refusedUntagged;
+            const auto index = movedBeyond ? 64u : static_cast<std::uint32_t>(std::countr_zero(untagged));
+            ++counters.refusedBy[static_cast<std::size_t>(refusedWordRole(*variant, index, fetchWords, now.hiddenUserWords))];
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (profile) counters.refusedWords.push_back((now.binary.codeAddress << 8u) | std::min(index, 255u));
             return nullptr;
         }
         if (now.tailContinuation != was.tailContinuation) {
@@ -35,6 +42,10 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
         for (auto bits = moved; bits != 0; bits &= bits - 1) {
             const auto index = static_cast<std::uint32_t>(std::countr_zero(bits));
             const auto from = was.userData[index], to = now.userData[index];
+            if (((variant->rebaseWords >> index) & 1u) == 0) {
+                forwardVariantWord(*copy, index, to);
+                continue;
+            }
             if (from == 0 || to == 0 || ((from ^ to) & 3u) != 0) {
                 ++counters.refusedPointer;
                 return nullptr;
@@ -61,6 +72,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
         candidate->compiled = patchDataWords(*candidate, candidate->words);
     }
     if (!rebased) ++(data ? counters.equalData : counters.equal);
+    else if ((moved & ~variant->rebaseWords) != 0) ++counters.forwarded;
     else ++(data ? counters.rebasedData : counters.rebased);
     const auto movedWord = [&](std::uint32_t index) { return index < 64u && ((moved >> index) & 1u) != 0; };
     const auto& info = variant->vertexInfo;
@@ -150,6 +162,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             const auto poolWaitedBeforeValidate = profile ? DrawPrepPool::ThreadWaitedMs() : 0.0;
+            const auto stepsBefore = validateSteps();
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
@@ -214,6 +227,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             counters.stageValidations += stageValidations;
             counters.stageEqual += stageEqual;
             counters.variantsCompared += compared;
+            counters.validateSteps += validateSteps().Since(stepsBefore);
             if (drawHit) {
                 ++counters.hits;
                 counters.stageDataHits += dataStages;
@@ -275,6 +289,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             DrawCandidateCounters tally;
+            const auto stepsBefore = validateSteps();
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
                 std::optional<SampledReadScope> sampling;
@@ -294,6 +309,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.candidates += tally;
+            for (const auto word : tally.refusedWords) ++drawEntryCounters.refusedByProgramWord[word];
+            drawEntryCounters.validateSteps += validateSteps().Since(stepsBefore);
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

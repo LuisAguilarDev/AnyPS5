@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <list>
+#include <map>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -85,12 +86,17 @@ struct StageDataHit {
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
+enum class DrawRefusedWord : std::size_t { Beyond, Value, BaseAndValue, BaseDropped, Fetch, Forwarded, Unwalked, Count };
+
 struct DrawCandidateCounters {
-    std::uint64_t tried = 0, equal = 0, equalData = 0, rebased = 0, rebasedData = 0, rebasedFetch = 0;
+    std::uint64_t tried = 0, equal = 0, equalData = 0, rebased = 0, rebasedData = 0, rebasedFetch = 0, forwarded = 0;
     std::uint64_t refusedUntagged = 0, refusedPointer = 0, refusedTail = 0, refusedOff = 0, differingEqual = 0, differingRebased = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawRefusedWord::Count)> refusedBy{};
+    std::vector<std::uint64_t> refusedWords;
 
     DrawCandidateCounters& operator+=(const DrawCandidateCounters& other) {
-        for (auto [total, part] : {std::pair{&tried, other.tried}, {&equal, other.equal}, {&equalData, other.equalData}, {&rebased, other.rebased}, {&rebasedData, other.rebasedData}, {&rebasedFetch, other.rebasedFetch}, {&refusedUntagged, other.refusedUntagged}, {&refusedPointer, other.refusedPointer}, {&refusedTail, other.refusedTail}, {&refusedOff, other.refusedOff}, {&differingEqual, other.differingEqual}, {&differingRebased, other.differingRebased}}) *total += part;
+        for (auto [total, part] : {std::pair{&tried, other.tried}, {&equal, other.equal}, {&equalData, other.equalData}, {&rebased, other.rebased}, {&rebasedData, other.rebasedData}, {&rebasedFetch, other.rebasedFetch}, {&forwarded, other.forwarded}, {&refusedUntagged, other.refusedUntagged}, {&refusedPointer, other.refusedPointer}, {&refusedTail, other.refusedTail}, {&refusedOff, other.refusedOff}, {&differingEqual, other.differingEqual}, {&differingRebased, other.differingRebased}}) *total += part;
+        for (std::size_t i = 0; i < refusedBy.size(); ++i) refusedBy[i] += other.refusedBy[i];
         return *this;
     }
 };
@@ -108,6 +114,8 @@ struct DrawEntryCounters {
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0, dataDrawsReused = 0;
     DrawCandidateCounters candidates;
+    ValidateSteps validateSteps;
+    std::map<std::uint64_t, std::uint64_t> refusedByProgramWord;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

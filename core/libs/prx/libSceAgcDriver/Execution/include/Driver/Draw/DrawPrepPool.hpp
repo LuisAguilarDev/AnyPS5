@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <thread>
 #include <utility>
@@ -25,10 +26,14 @@ public:
     static std::size_t Threads();
     static bool InPoolThread();
     static void ExemptThisThread();
+    static double ThreadWaitedMs();
+    static bool WriteBounds();
+    static bool VerifyWriteBounds();
 
     bool Pending() const { return submitted.load(std::memory_order_acquire) != turn.load(std::memory_order_acquire); }
     std::uint64_t Enqueued() const { return turn.load(std::memory_order_acquire); }
-    void Submit(Job job);
+    void Submit(Job job, std::optional<std::vector<Range>> bound = std::nullopt);
+    bool MayWrite(std::uint64_t address, std::size_t bytes);
     void WaitTurn(std::uint64_t seq);
     void FinishTurn(std::uint64_t seq, std::span<const Range> writes);
     bool WrittenBetween(std::uint64_t from, std::uint64_t to, std::span<const Range> reads);
@@ -51,6 +56,9 @@ private:
     std::condition_variable progress;
     std::deque<Task> tasks;
     std::deque<std::pair<std::uint64_t, std::vector<Range>>> history;
+    std::deque<std::pair<std::uint64_t, std::optional<std::vector<Range>>>> bounds;
+    std::atomic<std::uint64_t> boundedChecks{0};
+    std::atomic<std::uint64_t> waitsAvoided{0};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> turn{0};
     std::vector<std::thread> threads;

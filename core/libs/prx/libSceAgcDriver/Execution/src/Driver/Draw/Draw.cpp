@@ -352,6 +352,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             bool patchedStages;
             std::shared_ptr<DrawEntry> dataEntry;
         };
+        std::optional<std::vector<DrawPrepPool::Range>> writeBound;
+        if (drawHit && DrawPrepPool::WriteBounds()) {
+            std::vector<Graphics::CompiledShader> boundStages;
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (roles[i] == Role::GeometryBack) continue;
+                boundStages.push_back({programs[i].binary.stage, stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get(), 0});
+            }
+            const auto ranges = drawWriteRanges(graphics, boundStages);
+            writeBound.emplace(ranges.begin(), ranges.end());
+        }
         auto pooledDraw = std::make_shared<Pooled>(Pooled{localDevice, decode, pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, stageData, patchedStages, dataEntry});
         const Submission* pooledSubmission = &submission;
         DrawPrepPool::Get().Submit([this, pooledDraw, pooledSubmission](std::uint64_t seq) {
@@ -514,7 +524,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
             DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
             pool.FinishTurn(seq, written);
-        });
+        }, std::move(writeBound));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_prepared_on_pool");
         return drawn();

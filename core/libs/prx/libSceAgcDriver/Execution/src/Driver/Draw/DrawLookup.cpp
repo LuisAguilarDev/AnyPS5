@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <bit>
@@ -148,6 +149,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         }
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+            const auto poolWaitedBeforeValidate = profile ? DrawPrepPool::ThreadWaitedMs() : 0.0;
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
@@ -265,6 +267,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
                 phaseMs[DrawRowKeyLookupValidate] -= waited;
                 phaseMs[DrawRowValidateWait] += waited;
+                const auto poolWaited = std::min(DrawPrepPool::ThreadWaitedMs() - poolWaitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
+                phaseMs[DrawRowKeyLookupValidate] -= poolWaited;
+                phaseMs[DrawRowValidatePoolWait] += poolWaited;
                 counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
             }
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {

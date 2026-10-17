@@ -4354,6 +4354,13 @@ void drawSnapshotArenaTests() {
         }
         Require(profile.copiedSnapshots >= 64, "the draws reused their snapshots instead of copying them");
         Require(mock.bufferSizes.size() <= created + 1, "draw snapshots made a buffer per snapshot");
+        // A small range is copied again rather than proven unchanged: a store the tracker saw is in
+        // the next draw's slice.
+        const auto saved = guestFirst[2];
+        guestFirst[2] = 0x5a5a5a5au;
+        AgcDriver::GuestMemory::MarkWritten(address(guestFirst) + 8, 4);
+        check(resources.PrepareDrawBindings(recorder, moved));
+        guestFirst[2] = saved;
         recorder.Sync();
     }
     Require(mock.live == 0, "draw snapshot arenas leaked Vulkan objects");

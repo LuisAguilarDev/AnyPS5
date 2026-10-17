@@ -2607,7 +2607,8 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         return;
     }
     const auto element = address + 4096;
-    constexpr std::size_t elementBytes = 1024;
+    // Past an arena slice: a smaller range is copied again instead of proven (PrepareDrawBindings).
+    constexpr std::size_t elementBytes = 2 * Recorder::DrawSnapshotSliceBytes;
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
     binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
@@ -2663,7 +2664,8 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
 
 // Draw bindings of a template hit whose seven read-only ranges moved to fresh constant-ring bytes
 // on every draw (the Xenoverse 2 pattern: ~775 draws a frame), timed per draw with the bindings
-// profile. --benchmark-draw-snapshots; APS5_NO_DRAW_SNAPSHOT_ARENA=1 times the earlier path.
+// profile. --benchmark-draw-snapshots; APS5_NO_DRAW_SNAPSHOT_ARENA=1 and
+// APS5_NO_DRAW_SNAPSHOT_COPY_ONLY=1 time the earlier paths.
 void drawSnapshotBenchmark(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = std::size_t{4} << 20u;
@@ -8413,6 +8415,13 @@ int main(int argc, char** argv) {
             drawSnapshotCapTests(device, recorder);
             unwrittenSnapshotTests(device);
             std::cout << "Draw snapshot cap tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-reuse-only") {
+            drawSnapshotReuseTests(device, recorder);
+            drawDescriptorWriteTests(device, recorder);
+            drawSnapshotEvictionTests(device);
+            std::cout << "Draw snapshot reuse tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {

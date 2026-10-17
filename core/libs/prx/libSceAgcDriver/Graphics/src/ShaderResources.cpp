@@ -4609,13 +4609,20 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         if (buffer == nullptr) {
-            const auto generation = GuestMemory::CollectWrites(begin, bytes);
-            buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
+            // A range of an arena slice or less is copied again rather than proven unchanged: the
+            // proof (CollectWrites over its pages, the reuse lookup and the kept entry) costs more
+            // than the copy, and a moved range (a constant ring) is seldom reusable anyway. The copy
+            // is what a failed proof makes; the unwritten stamp above still reuses it within the
+            // collect epoch. APS5_NO_DRAW_SNAPSHOT_COPY_ONLY=1 proves every range, as before.
+            static const bool proveSmall = std::getenv("APS5_NO_DRAW_SNAPSHOT_COPY_ONLY") != nullptr;
+            const bool proven = proveSmall || bytes > Recorder::DrawSnapshotSliceBytes;
+            const auto generation = proven ? GuestMemory::CollectWrites(begin, bytes) : 0;
+            if (proven) buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
             if (buffer == nullptr) {
                 buffer = recorder.DrawSnapshotBuffer(bytes);
                 std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 copied = true;
-                recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
+                if (proven) recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
             }
             if (GuestMemory::TrackerGeneration() == stamp[0]) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer);
             else stamped = false;

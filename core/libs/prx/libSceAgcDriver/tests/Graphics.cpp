@@ -4308,6 +4308,10 @@ void descriptorSnapshotTests() {
     }
 }
 
+// A Buffer keeps only its device of the context (BufferDevice): every snapshot and upload allocates
+// one, and a whole Context copy made that allocation cost ~0.8 us.
+static_assert(sizeof(AgcDriver::Graphics::Buffer) <= 256, "a Buffer object copies its whole Context again");
+
 void resourceTests() {
     mock = MockVulkan{};
     const auto context = mockContext();

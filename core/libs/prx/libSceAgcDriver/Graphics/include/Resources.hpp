@@ -6,6 +6,17 @@
 
 namespace AgcDriver::Graphics {
 
+// What a Buffer keeps of its context once made: the device its handles are released on. A copy of
+// the whole Context (about 1.8 KB) made allocating the Buffer object cost as much as filling it.
+struct BufferDevice {
+    VkDevice device = VK_NULL_HANDLE;
+    PFN_vkGetDeviceProcAddr deviceProc = nullptr;
+    template<typename TFunction>
+    TFunction Function(const char* name) const {
+        return DeviceFunction<TFunction>(deviceProc, device, name);
+    }
+};
+
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -23,7 +34,7 @@ public:
 private:
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
-    Context context;
+    BufferDevice context;
     VkDeviceAddress deviceAddress = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;

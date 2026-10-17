@@ -130,6 +130,16 @@ inline std::uint64_t& DeviceProcLookups() {
     return count;
 }
 
+// A device entry point by name through `deviceProc` (Context::Function, BufferDevice::Function).
+template<typename TFunction>
+TFunction DeviceFunction(PFN_vkGetDeviceProcAddr deviceProc, VkDevice device, const char* name) {
+    Require(deviceProc != nullptr, "missing Vulkan device function resolver");
+    ++DeviceProcLookups();
+    const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+    if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
+    return function;
+}
+
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
 struct Context {
@@ -242,11 +252,7 @@ struct Context {
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
-        Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
-        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+        return DeviceFunction<TFunction>(deviceProc, device, name);
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.

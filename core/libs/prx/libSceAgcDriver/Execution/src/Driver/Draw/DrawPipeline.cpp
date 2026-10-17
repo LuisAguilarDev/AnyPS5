@@ -16,6 +16,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> CommitKindNames{"draw", "label", "dma", "dispatch", "fill", "pass", "completion", "open work", "other"};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
@@ -68,7 +69,7 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
     if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::unique_lock lock(mutex);
@@ -84,7 +85,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), kind});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
@@ -114,8 +115,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
-    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
+    std::string kindText;
+    for (std::size_t i = 0; i < kindCommits.size(); ++i) {
+        if (kindCommits[i] == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu (%.1f ms, %.1f us each)", CommitKindNames[i], static_cast<unsigned long long>(kindCommits[i]), static_cast<double>(kindNs[i]) / 1e6, static_cast<double>(kindNs[i]) / 1e3 / static_cast<double>(kindCommits[i]));
+        kindText += item;
+    }
+    const auto perRelease = commits == 0 ? 0.0 : static_cast<double>(releaseNs) / 1e3 / static_cast<double>(commits);
+    std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s; commits by kind:%s; closures released on the committer %.1f ms (%.2f us per commit)\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str(), kindText.c_str(), static_cast<double>(releaseNs) / 1e6, perRelease);
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = releaseNs = 0;
+    kindCommits = {};
+    kindNs = {};
     drains = {};
     drainWaitNs = {};
 }
@@ -125,6 +136,7 @@ void DrawPipeline::run() {
     PinWorkerThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
+        CommitKind kind = CommitKind::Other;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -132,6 +144,7 @@ void DrawPipeline::run() {
             wake.wait(lock, [&] { return !items.empty(); });
             committerWaiting = false;
             commit = stopped ? nullptr : &items.front().commit;
+            kind = items.front().kind;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -153,10 +166,18 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
+        // The closure dies here, outside the mutex (only this thread touches the front item's
+        // commit; the enqueuers read its write ranges under the mutex), timed apart from the commit.
+        const auto releaseStart = std::chrono::steady_clock::now();
+        if (commit != nullptr) *commit = nullptr;
+        const auto released = elapsedNs(releaseStart);
         std::lock_guard lock(mutex);
         items.pop_front();
         ++commits;
         commitNs += spent;
+        releaseNs += released;
+        ++kindCommits[static_cast<std::size_t>(kind)];
+        kindNs[static_cast<std::size_t>(kind)] += spent;
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);

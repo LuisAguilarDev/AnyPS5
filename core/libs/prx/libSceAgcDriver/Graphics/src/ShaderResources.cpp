@@ -4560,6 +4560,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
+            const auto wordStart = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             constexpr std::size_t MovedWordBufferSlots = 8;
             const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
             std::shared_ptr<Buffer> buffer;
@@ -4575,6 +4576,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 MovedWordBuffer entry{index, override->words, override->size, buffer};
                 if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                 else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
+            }
+            if (profile != nullptr) {
+                ++profile->wordSnapshots;
+                profile->wordUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - wordStart).count();
             }
             selected.push_back(index);
             result->snapshots.push_back({0, std::move(buffer)});

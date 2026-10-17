@@ -11,9 +11,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -282,7 +287,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
         const auto fillAddress = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
         const auto fillBytes = packet[6] & 0x3ffffffu;
         const auto pattern = packet[2];
-        DrawPipeline::Queue0().Enqueue([this, queue, address, bytes = std::move(bytes), metadataFill, fillAddress, fillBytes, pattern] {
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dma, [this, queue, address, bytes = std::move(bytes), metadataFill, fillAddress, fillBytes, pattern] {
             GuestMemory::SetCurrentPacket(0x50, queue);
             if (metadataFill) {
                 Graphics::NoteDepthMetadataFill(fillAddress, fillBytes, pattern);
@@ -295,7 +300,7 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
     const auto copy = Pm4::DecodeMemoryCopy(packet);
     if (!copy.has_value() || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
-    DrawPipeline::Queue0().Enqueue([this, queue, copy = *copy] {
+    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dma, [this, queue, copy = *copy] {
         GuestMemory::SetCurrentPacket(0x50, queue);
         constexpr std::size_t gpuStoreLimit = 65536;
         if (copy.bytes > gpuStoreLimit) {
@@ -366,19 +371,69 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     }
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
     auto stored = bytes;
-    DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
+    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Label, [this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
         GuestMemory::SetCurrentPacket(opcode, queue);
         commitLabel(queue, address, bytes, endOfPipeInterrupt);
     }, std::move(writes), address, std::move(stored));
     return true;
 }
 
+namespace {
+// APS5_PROFILE_DRAW: the parts of a pipelined label commit (commitLabel) in microseconds, printed
+// every 10 s as the [labels] commit line; only the committer (or a draining packet thread) runs them.
+enum LabelCommitPart : std::size_t { LabelPartLock, LabelPartDeferred, LabelPartStore, LabelPartNote, LabelPartInterrupt, LabelPartSubmit, LabelPartCount };
+constexpr std::array<const char*, LabelPartCount> LabelPartNames{"lock", "deferred", "store", "note", "interrupt", "submit"};
+struct LabelCommitProfile {
+    std::mutex mutex;
+    std::array<double, LabelPartCount> us{};
+    std::uint64_t commits = 0;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+bool LabelCommitsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+struct LabelCommitLaps {
+    bool profile = LabelCommitsProfiled();
+    std::array<double, LabelPartCount> us{};
+    std::chrono::steady_clock::time_point last = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void lap(LabelCommitPart part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        us[part] += std::chrono::duration<double, std::micro>(now - last).count();
+        last = now;
+    }
+    ~LabelCommitLaps() {
+        if (!profile) return;
+        static LabelCommitProfile totals;
+        std::lock_guard lock(totals.mutex);
+        for (std::size_t i = 0; i < LabelPartCount; ++i) totals.us[i] += us[i];
+        ++totals.commits;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - totals.lastReport < std::chrono::seconds(10)) return;
+        totals.lastReport = now;
+        std::string parts;
+        for (std::size_t i = 0; i < LabelPartCount; ++i) {
+            char item[64];
+            std::snprintf(item, sizeof(item), " %s %.2f", LabelPartNames[i], totals.us[i] / static_cast<double>(totals.commits));
+            parts += item;
+        }
+        std::fprintf(stderr, "[labels] commit split (10 s): %llu label commits, us per commit:%s\n", static_cast<unsigned long long>(totals.commits), parts.c_str());
+        totals.us = {};
+        totals.commits = 0;
+    }
+};
+}
+
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, bool endOfPipeInterrupt) {
+    LabelCommitLaps laps;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    laps.lap(LabelPartLock);
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
     const bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    laps.lap(LabelPartDeferred);
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
@@ -387,6 +442,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
+        laps.lap(LabelPartStore);
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
         countLabelOutcome(reason);
@@ -394,6 +450,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     } else {
         ++noOpLabels;
     }
+    laps.lap(LabelPartNote);
     if (endOfPipeInterrupt) {
         bool deferred = false;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
@@ -402,7 +459,9 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         }
         if (!deferred) AgcDriverDeliverEopInterrupt(queue);
     }
+    laps.lap(LabelPartInterrupt);
     submitDueAfterCommit(localDevice.get());
+    laps.lap(LabelPartSubmit);
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {

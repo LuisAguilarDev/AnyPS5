@@ -26,7 +26,7 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             auto writes = drawWriteRanges(targets, {});
             const auto queueId = submission.queue;
             const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-            DrawPipeline::Queue0().Enqueue([this, pass = *pass, queueId, opcode, epoch] {
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Pass, [this, pass = *pass, queueId, opcode, epoch] {
                 DrawPipeline::FollowEpoch(epoch);
                 GuestMemory::SetCurrentPacket(opcode, queueId);
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);

@@ -2052,6 +2052,11 @@ std::uint64_t ThreadCollectedBytes() {
     return CounterFor(CounterCollect).bytes.load(std::memory_order_relaxed);
 }
 
+std::uint64_t ThreadCollectNanoseconds() {
+    if (!MemoryProfiled()) return 0;
+    return CounterFor(CounterCollect).nanoseconds.load(std::memory_order_relaxed);
+}
+
 std::uint32_t GpuLockThreadTag() {
     return LockStats().tag;
 }

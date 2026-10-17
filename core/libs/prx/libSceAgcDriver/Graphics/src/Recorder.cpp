@@ -1409,18 +1409,21 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     open->passHazards.Add(access);
 }
 
-void Recorder::BeginPassTiming(const PassTarget& target) {
+void Recorder::BeginPassTiming(const PassTarget& target, const PassSample& sample) {
     if (!GpuTimingEnabled() || open == nullptr || open->renderPass.open) return;
     const auto index = beginTiming(PassBodyTimingKey);
     if (index == NoTiming) return;
     open->renderPass.bodyTiming = index;
     open->renderPass.timedPass = static_cast<std::uint32_t>(open->timedPasses.size());
-    open->timedPasses.push_back({index, target, 0});
+    open->timedPasses.push_back({index, target, 0, sample});
 }
 
-void Recorder::CountPassDraw() {
+void Recorder::CountPassDraw(std::uint8_t fragmentFlags) {
     if (open == nullptr || !open->renderPass.open || open->renderPass.timedPass >= open->timedPasses.size()) return;
-    ++open->timedPasses[open->renderPass.timedPass].draws;
+    auto& pass = open->timedPasses[open->renderPass.timedPass];
+    ++pass.draws;
+    if (LateFragmentTests(fragmentFlags)) ++pass.lateDraws;
+    if (LateForFaults(fragmentFlags)) ++pass.faultLateDraws;
 }
 
 void Recorder::endOpenRenderPass(bool barrier) {
@@ -1906,6 +1909,20 @@ void reportGpuTimeBreakdown(std::uint64_t presents) {
     std::string top;
     for (std::size_t i = 0; i < passes.size() && i < 5; ++i) top += entry(passes[i]);
     AgcDriver::ProfilePrint_nid_no_patch("[gpu-time] 10 s, %llu presents; per frame: batches %.1f ms ~ passes %.1f (x%.1f, %.0f draws) + pass barriers/setup %.1f + dispatches %.1f (x%.1f) + dispatch barriers %.1f + uploads %.1f + write-back %.1f + copies/fills %.1f + label runs %.1f + shadow %.1f + untimed %.1f; present blit %.1f; top passes over 10 s (WxH color+more depth, passes, draws, ms):%s\n", static_cast<unsigned long long>(presents), timingBatchMs * perFrame, all.ms * perFrame, static_cast<double>(all.passes) * perFrame, static_cast<double>(all.draws) * perFrame, std::max(0.0, classMs({Class::Draw}) - all.ms) * perFrame, timingDispatchMs * perFrame, static_cast<double>(timingDispatches) * perFrame, classMs({Class::DispatchLeading, Class::DispatchTrailing, Class::IndirectArguments}) * perFrame, classMs({Class::StorageUpload, Class::StagingIn, Class::TemplateDataRefresh}) * perFrame, classMs({Class::StorageWriteBack, Class::StagingOut}) * perFrame, classMs({Class::Copy, Class::Fill, Class::FillClear, Class::DccClear, Class::DccKeyStore}) * perFrame, classMs({Class::LabelRun}) * perFrame, classMs({Class::ShadowPublish}) * perFrame, (timingBatchMs - timingUnionMs) * perFrame, classMs({Class::PresentBlit}) * perFrame, top.c_str());
+    std::string slowest;
+    for (std::size_t i = 0; i < passes.size() && i < 5; ++i) {
+        const auto& [target, totals] = passes[i];
+        const auto flags = totals.slowest.fragmentFlags;
+        std::string letters;
+        if ((flags & Recorder::EarlyFragments) != 0) letters += 'e';
+        if ((flags & Recorder::FaultStores) != 0) letters += 'f';
+        if ((flags & Recorder::GuestStores) != 0) letters += 'w';
+        if ((flags & Recorder::Discards) != 0) letters += 'k';
+        char text[320];
+        std::snprintf(text, sizeof(text), " %s %.2fms color=%llx ps=%016llx/%zuw/%s late %llu/%llud (faults %llu)", PassTargetName(target).c_str(), totals.slowestMs, static_cast<unsigned long long>(totals.slowest.colorAddress), static_cast<unsigned long long>(totals.slowest.fragmentHash), totals.slowest.fragmentWords, letters.empty() ? "-" : letters.c_str(), static_cast<unsigned long long>(totals.lateDraws), static_cast<unsigned long long>(totals.draws), static_cast<unsigned long long>(totals.faultLateDraws));
+        slowest += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gpu-passes] slowest pass of the top targets (its first draw: color target address, fragment module hash/words/flags; the target's draws with late fragment tests, and those late only for the fault buffer):%s\n", slowest.c_str());
     if (passes.size() <= 5) return;
     std::string rest;
     for (std::size_t i = 5; i < passes.size() && i < 20; ++i) rest += entry(passes[i]);
@@ -2551,7 +2568,14 @@ void Recorder::readGpuTiming(Batch& batch) {
         auto& totals = passTotals[pass.target];
         ++totals.passes;
         totals.draws += pass.draws;
-        totals.ms += static_cast<double>(stamps[pass.timing * 2 + 1] - stamps[pass.timing * 2]) * period / 1e6;
+        totals.lateDraws += pass.lateDraws;
+        totals.faultLateDraws += pass.faultLateDraws;
+        const auto ms = static_cast<double>(stamps[pass.timing * 2 + 1] - stamps[pass.timing * 2]) * period / 1e6;
+        totals.ms += ms;
+        if (ms > totals.slowestMs) {
+            totals.slowestMs = ms;
+            totals.slowest = pass.sample;
+        }
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;
@@ -2720,12 +2744,14 @@ std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
     return std::make_shared<Buffer>(snapshotArena, static_cast<VkDeviceSize>(offset), bytes);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* stale) {
+    if (stale != nullptr) *stale = false;
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (!sameRegistry || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+            if (stale != nullptr) *stale = true;
             eraseDrawSnapshot(found);
             return {};
         }
@@ -2735,6 +2761,30 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
     return found->second.buffer;
+}
+
+void Recorder::NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome) {
+    if (outcome == DrawInputOutcome::Absent) return;
+    const auto found = streamedInputs.find(address);
+    if (outcome == DrawInputOutcome::Reused) {
+        if (found != streamedInputs.end()) found->second.misses = 0;
+        return;
+    }
+    if (found == streamedInputs.end() && streamedInputs.size() >= StreamedInputEntries) streamedInputs.clear();
+    auto& entry = streamedInputs[address];
+    entry.misses += outcome == DrawInputOutcome::Untracked ? StreamedInputMisses : 1u;
+    entry.inPlaceUses = 0;
+}
+
+bool Recorder::StreamedDrawInput(std::uint64_t address) {
+    static const bool copyAll = std::getenv("APS5_NO_STREAMED_DRAW_INPUTS") != nullptr;
+    if (copyAll) return false;
+    const auto found = streamedInputs.find(address);
+    if (found == streamedInputs.end() || found->second.misses < StreamedInputMisses) return false;
+    if (++found->second.inPlaceUses < StreamedInputRetryUses) return true;
+    found->second.misses = StreamedInputMisses - 1;
+    found->second.inPlaceUses = 0;
+    return false;
 }
 
 bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {

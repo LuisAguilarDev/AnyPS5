@@ -83,14 +83,38 @@ public:
         VkFormat depth = VK_FORMAT_UNDEFINED;
         auto operator<=>(const PassTarget&) const = default;
     };
-    void BeginPassTiming(const PassTarget& target);
-    void CountPassDraw();
+    // How a draw's fragment module can keep the device from testing depth before shading it
+    // (PassSample::fragmentFlags, CountPassDraw): EarlyFragments when it declares EarlyFragmentTests;
+    // FaultStores when it has the fault buffer (emulator stores, made only on a guest fault);
+    // GuestStores when it writes guest buffers or storage images; Discards when it can kill or
+    // demote. Without EarlyFragments, any of the others makes the tests run after the shader.
+    enum FragmentFlag : std::uint8_t { EarlyFragments = 1, FaultStores = 2, GuestStores = 4, Discards = 8 };
+    static constexpr bool LateFragmentTests(std::uint8_t flags) { return (flags & EarlyFragments) == 0 && (flags & (FaultStores | GuestStores | Discards)) != 0; }
+    // Late only because of the fault buffer: no guest stores (a discard may be the fault stop).
+    static constexpr bool LateForFaults(std::uint8_t flags) { return LateFragmentTests(flags) && (flags & FaultStores) != 0 && (flags & GuestStores) == 0; }
+    // What names a timed pass's first draw, for finding its shaders: the first color target's guest
+    // address (APS5_DUMP_DRAW_SHADERS takes it), the fragment module's content hash and words, and
+    // its FragmentFlag bits.
+    struct PassSample {
+        std::uint64_t colorAddress = 0;
+        std::uint64_t fragmentHash = 0;
+        std::size_t fragmentWords = 0;
+        std::uint8_t fragmentFlags = 0;
+    };
+    void BeginPassTiming(const PassTarget& target, const PassSample& sample = {});
+    void CountPassDraw(std::uint8_t fragmentFlags = 0);
     // The [gpu-passes] totals since the last 10 s report (or since start), by target: passes,
     // draws and GPU milliseconds of the pass bodies. For tests.
     struct PassTotals {
         std::uint64_t passes = 0;
         std::uint64_t draws = 0;
         double ms = 0;
+        // Draws whose fragment tests ran late (LateFragmentTests), and those late only for faults.
+        std::uint64_t lateDraws = 0;
+        std::uint64_t faultLateDraws = 0;
+        // The slowest pass of the target and its first draw.
+        double slowestMs = 0;
+        PassSample slowest;
     };
     static std::vector<std::pair<PassTarget, PassTotals>> PassTimingTotals();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
@@ -127,9 +151,25 @@ public:
     static constexpr std::size_t UnwrittenSnapshotEntries = 4096;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
+    // APS5_DEVICE_LOCAL_DRAW_BUFFERS: a draw input whose device-local copies are not reused (its
+    // guest bytes change between draws, or its range is not write-watched, so no copy is kept) is
+    // bound in place from its host import again, sparing the CPU a copy per draw of bytes the GPU
+    // reads about once per copy anyway. NoteDrawInputCopy records each copy's outcome by the
+    // input's address: StreamedInputMisses stale copies in a row (an untracked one counts as that
+    // many) make StreamedDrawInput answer true, binding the input in place for
+    // StreamedInputRetryUses draws, after which it is copied again (one more stale copy binds it in
+    // place again). A reused copy clears the count. APS5_NO_STREAMED_DRAW_INPUTS=1 copies every
+    // input.
+    enum class DrawInputOutcome : std::uint8_t { Reused, Stale, Absent, Untracked };
+    void NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome);
+    bool StreamedDrawInput(std::uint64_t address);
+    static constexpr std::uint32_t StreamedInputMisses = 2;
+    static constexpr std::uint32_t StreamedInputRetryUses = 256;
+    static constexpr std::size_t StreamedInputEntries = 65536;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
+    // `stale`, when given, says whether a miss found an entry whose guest bytes changed since.
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, bool* stale = nullptr);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     // The buffer a draw snapshot of guest memory is copied into: a slice of the snapshot arena, one
     // host-visible buffer of DrawSnapshotArenaBytes the slices share (made or taken from the buffer
@@ -618,6 +658,9 @@ private:
             std::uint32_t timing;
             PassTarget target;
             std::uint32_t draws;
+            PassSample sample;
+            std::uint32_t lateDraws = 0;
+            std::uint32_t faultLateDraws = 0;
         };
         std::vector<TimedPass> timedPasses;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
@@ -897,6 +940,11 @@ private:
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::shared_ptr<Buffer> snapshotArena;
     std::size_t snapshotArenaUsed = 0;
+    struct StreamedInput {
+        std::uint32_t misses = 0;
+        std::uint32_t inPlaceUses = 0;
+    };
+    std::unordered_map<std::uint64_t, StreamedInput> streamedInputs;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;

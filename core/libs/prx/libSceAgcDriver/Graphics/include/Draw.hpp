@@ -35,11 +35,14 @@ struct DrawInputCopy {
 // device-local memory (resizable BAR) instead of being read by the GPU in place from host imports
 // in system memory, over PCIe; the copies are reused across draws while their guest bytes are
 // unchanged (Recorder::ReusableDrawSnapshot). An input behind a pending recorded GPU write stays in
-// place, since its copy would wait for that write. The draw snapshot arena (small storage-buffer
+// place, since its copy would wait for that write, and so does one whose copies are not reused
+// (Recorder::StreamedDrawInput). The draw snapshot arena (small storage-buffer
 // snapshots, Recorder::DrawSnapshotBuffer) and the moved constant words of a template hit
 // (ShaderResources) move to that memory too. The CPU only writes those buffers. Off, or without
 // such a memory type, everything is bound as before.
 bool DeviceLocalDrawBuffers(const Context& context);
+// The [draw-inputs] line (see Draw.cpp's DrawInputCounters), every 10 s with the [draws] line.
+void ReportDrawInputs();
 // A host-visible buffer for a draw input: device-local when DeviceLocalDrawBuffers, else (or when
 // that memory cannot be had) the default host memory. `hostReadable` says which.
 std::shared_ptr<Buffer> DrawInputBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, bool* hostReadable = nullptr);

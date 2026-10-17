@@ -152,17 +152,17 @@ Recorder::PassTarget FourK() {
 }
 
 // One draw beginning a pass and `continued` more continuing it, as Draw.cpp records them.
-void RecordPass(Recorder& recorder, std::uint64_t key, const Recorder::PassTarget& target, std::uint32_t continued) {
+void RecordPass(Recorder& recorder, std::uint64_t key, const Recorder::PassTarget& target, std::uint32_t continued, const Recorder::PassSample& sample = {}, std::uint8_t fragmentFlags = 0) {
     const auto start = recorder.StartDrawPass(key, false, false, PassAccess{});
     Expect(!start.continued, "the first draw continued a pass");
     const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::Draw);
-    recorder.BeginPassTiming(target);
+    recorder.BeginPassTiming(target, sample);
     recorder.LeaveRenderPassOpen(key, timing, false, PassAccess{});
-    recorder.CountPassDraw();
+    recorder.CountPassDraw(fragmentFlags);
     for (std::uint32_t draw = 0; draw < continued; ++draw) {
         Expect(recorder.StartDrawPass(key, false, false, PassAccess{}).continued, "a draw of the same pass did not continue it");
         recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, false, PassAccess{});
-        recorder.CountPassDraw();
+        recorder.CountPassDraw(fragmentFlags);
     }
 }
 
@@ -172,6 +172,9 @@ const Recorder::PassTotals* TotalsFor(const std::vector<std::pair<Recorder::Pass
     }
     return nullptr;
 }
+
+static_assert(!Recorder::LateFragmentTests(0) && !Recorder::LateFragmentTests(Recorder::EarlyFragments | Recorder::FaultStores | Recorder::Discards));
+static_assert(Recorder::LateForFaults(Recorder::FaultStores | Recorder::Discards) && !Recorder::LateForFaults(Recorder::FaultStores | Recorder::GuestStores) && Recorder::LateFragmentTests(Recorder::GuestStores));
 
 void NoTimestampQueries() {
     mock = MockDevice{};
@@ -192,28 +195,33 @@ void PassBodiesByTarget() {
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     Recorder recorder(mockContext());
     const auto target = FourK();
-    RecordPass(recorder, FullKey, target, 2);
+    RecordPass(recorder, FullKey, target, 2, {0x4000, 0xabcd, 900, Recorder::FaultStores}, Recorder::FaultStores | Recorder::Discards);
     auto half = target;
     half.width /= 2;
     half.height /= 2;
     // A different target ends the first pass: its body ends at the pass's end, before the
     // trailing barrier and the draw class range's end.
-    RecordPass(recorder, HalfKey, half, 0);
+    RecordPass(recorder, HalfKey, half, 0, {}, Recorder::EarlyFragments | Recorder::FaultStores);
     recorder.Sync();
     const auto totals = Recorder::PassTimingTotals();
     const auto* full = TotalsFor(totals, target);
     const auto* small = TotalsFor(totals, half);
     Expect(full != nullptr && full->passes == 1 && full->draws == 3, "the 4K pass was not counted once with its three draws");
     Expect(small != nullptr && small->passes == 1 && small->draws == 1, "the half-size pass was not counted once with its draw");
+    if (full != nullptr) Expect(full->slowest.colorAddress == 0x4000 && full->slowest.fragmentHash == 0xabcd && full->slowest.fragmentWords == 900 && full->slowestMs == full->ms, "the 4K pass was not kept as its target's slowest with its first draw");
+    if (full != nullptr) Expect(full->slowest.fragmentFlags == Recorder::FaultStores && full->lateDraws == 3 && full->faultLateDraws == 3, "the 4K pass's draws were not counted as late for the fault buffer");
+    if (small != nullptr) Expect(small->lateDraws == 0 && small->faultLateDraws == 0, "a draw with early fragment tests was counted as late");
     // Body begin and end are consecutive stamps: one tick.
     if (full != nullptr) Expect(std::abs(full->ms - TickNs / 1e6) < 1e-9, "the 4K pass body took " + std::to_string(full->ms) + " ms, not one tick");
     Expect(mock.createdPools == 1, "one batch created " + std::to_string(mock.createdPools) + " query pools");
     // A second batch reuses the released pool.
-    RecordPass(recorder, FullKey, target, 0);
+    RecordPass(recorder, FullKey, target, 0, {0x8000, 0x1234, 10}, Recorder::FaultStores | Recorder::GuestStores);
     recorder.Sync();
     Expect(mock.createdPools == 1, "the second batch created a query pool instead of reusing the released one");
     const auto* again = TotalsFor(Recorder::PassTimingTotals(), target);
     Expect(again != nullptr && again->passes == 2 && again->draws == 4, "the second batch's 4K pass was not added to the totals");
+    if (again != nullptr) Expect(again->slowest.colorAddress == 0x4000, "a pass no slower than the slowest replaced it");
+    if (again != nullptr) Expect(again->lateDraws == 4 && again->faultLateDraws == 3, "a draw late for its guest stores was counted as late only for faults");
 }
 
 }

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
@@ -16,7 +17,28 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
-        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        const auto opcode = (packet[0] >> 8u) & 0xffu;
+        static const bool pipelinedPasses = std::getenv("APS5_NO_PIPELINED_METADATA_PASS") == nullptr;
+        const bool targetsOnly = pass->mode == Graphics::ColorMetadataPass::Mode::EliminateFastClear || pass->mode == Graphics::ColorMetadataPass::Mode::DccDecompress;
+        if (pipelinedPasses && targetsOnly && DrawPipeline::Active() && deferredLabels().labels.empty()) {
+            Graphics::State targets{};
+            targets.colors = pass->targets;
+            auto writes = drawWriteRanges(targets, {});
+            const auto queueId = submission.queue;
+            const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+            DrawPipeline::Queue0().Enqueue([this, pass = *pass, queueId, opcode, epoch] {
+                DrawPipeline::FollowEpoch(epoch);
+                GuestMemory::SetCurrentPacket(opcode, queueId);
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (device == nullptr) device = std::make_shared<VulkanDevice>();
+                const std::shared_ptr<VulkanDevice> localDevice = device;
+                recordLabelsForPacket(localDevice.get(), queueId);
+                localDevice->ColorMetadataPass(pass);
+            }, std::move(writes));
+            return DrawVerdict::Drawn;
+        }
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();

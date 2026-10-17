@@ -310,6 +310,7 @@ struct ResultMemoEntry {
     std::uint64_t variantId;
     std::uint64_t hash;
     std::shared_ptr<const RecompileResult> result;
+    std::uint64_t shape = 0;
 };
 
 struct EmissionFailure {
@@ -336,6 +337,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoShapes;
 };
 
 namespace {
@@ -1139,8 +1141,23 @@ bool ResultMemo() {
 
 constexpr std::size_t ResultMemoEntries = 256;
 
+bool MemoUserWordPatch() {
+    static const bool patch = std::getenv("APS5_NO_MEMO_USER_WORD_PATCH") == nullptr;
+    return patch;
+}
+
+bool VerifyMemoUserWordPatch() {
+    static const bool verify = std::getenv("APS5_VERIFY_MEMO_USER_WORD_PATCH") != nullptr;
+    return verify;
+}
+
+std::atomic<std::uint64_t>& memoUserWordPatches() {
+    static std::atomic<std::uint64_t> patches{0};
+    return patches;
+}
+
 struct ResultMemoCounters {
-    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0};
+    std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0}, patched{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1164,13 +1181,14 @@ void reportResultMemo() {
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
-    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    const auto patched = counters.patched.exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; %llu misses patched from a result that differs only in forwarded user words\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patched));
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
+std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, std::uint64_t* shape) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         hash ^= value;
@@ -1192,7 +1210,6 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mixDescriptors(snapshot.images);
     mixDescriptors(snapshot.samplers);
     mixWords(snapshot.flattenedSrt);
-    mixWords(snapshot.userData);
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
@@ -1242,7 +1259,34 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     } else {
         mix(1ull << 32u);
     }
+    mix(snapshot.srtPoison.size());
+    mix(snapshot.nullRootReads);
+    if (shape != nullptr) *shape = hash;
+    mixWords(snapshot.userData);
     return hash;
+}
+
+std::shared_ptr<RecompileResult> patchForwardedUserWords(const RecompileResult& donor, const CompiledVariant& variant, const ResourceSnapshot& snapshot) {
+    const auto& registers = variant.bindings.layout.userDataRegisters;
+    const auto base = variant.info.userDataBase;
+    if (donor.shaderDataUserWords.size() != registers.size()) return nullptr;
+    auto result = std::make_shared<RecompileResult>(donor);
+    const auto shaderData = std::ranges::find_if(result->bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
+    auto* data = shaderData != result->bindings.end() ? &shaderData->guestDescriptor : nullptr;
+    const bool pushData = variant.bindings.layout.UsesPushData();
+    for (std::size_t i = 0; i < registers.size(); ++i) {
+        if (registers[i] < base || registers[i] - base >= snapshot.userData.size()) return nullptr;
+        const auto word = snapshot.userData[registers[i] - base];
+        if (pushData && (i + 1) * sizeof(std::uint32_t) <= result->pushConstants.size()) std::memcpy(result->pushConstants.data() + i * sizeof(std::uint32_t), &word, sizeof(word));
+        if (data != nullptr && i < data->size()) (*data)[i] = word;
+    }
+    return result;
+}
+
+void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& full) {
+    bool same = patched.pushConstants == full.pushConstants && patched.bindings.size() == full.bindings.size() && patched.variantId == full.variantId && patched.specializationId == full.specializationId;
+    for (std::size_t b = 0; same && b < full.bindings.size(); ++b) same = patched.bindings[b].role == full.bindings[b].role && patched.bindings[b].guestDescriptor == full.bindings[b].guestDescriptor;
+    if (!same) throw std::runtime_error("APS5_VERIFY_MEMO_USER_WORD_PATCH: a result patched with the forwarded user words differs from its full materialization");
 }
 
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
@@ -1250,8 +1294,12 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
 // as good). `memoHit` reports the hit.
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto hash = snapshotHash(request, snapshot);
+    std::uint64_t shape = 0;
+    const auto hash = snapshotHash(request, snapshot, &shape);
+    const bool patching = MemoUserWordPatch() && !variant->bindings.layout.userDataRegisters.empty();
     std::uint64_t index = 0;
+    std::uint64_t shapeIndex = 0;
+    std::shared_ptr<const RecompileResult> donor;
     auto& counters = resultMemoCounters();
     {
         std::lock_guard lock(source.mutex);
@@ -1264,9 +1312,21 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             reportResultMemo();
             return found->second->result;
         }
+        if (patching) {
+            shapeIndex = (variant->artifact.variantId * 0xc2b2ae3d27d4eb4full) ^ shape;
+            const auto similar = source.memoShapes.find(shapeIndex);
+            if (similar != source.memoShapes.end() && similar->second->variantId == variant->artifact.variantId && similar->second->shape == shape) donor = similar->second->result;
+        }
     }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    std::shared_ptr<RecompileResult> result = donor != nullptr ? patchForwardedUserWords(*donor, *variant, snapshot) : nullptr;
+    if (result != nullptr) {
+        memoUserWordPatches().fetch_add(1, std::memory_order_relaxed);
+        counters.patched.fetch_add(1, std::memory_order_relaxed);
+        if (VerifyMemoUserWordPatch()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot));
+    } else {
+        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+    }
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
@@ -1279,16 +1339,21 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 source.memo.splice(source.memo.begin(), source.memo, found->second);
                 shared = found->second->result;
             } else {
+                const auto staleShape = source.memoShapes.find((found->second->variantId * 0xc2b2ae3d27d4eb4full) ^ found->second->shape);
+                if (staleShape != source.memoShapes.end() && staleShape->second == found->second) source.memoShapes.erase(staleShape);
                 source.memo.erase(found->second);
                 source.memoIndex.erase(found);
             }
         }
         if (source.memoIndex.find(index) == source.memoIndex.end()) {
-            source.memo.push_front({variant->artifact.variantId, hash, shared});
+            source.memo.push_front({variant->artifact.variantId, hash, shared, shape});
             source.memoIndex.emplace(index, source.memo.begin());
+            if (patching) source.memoShapes[shapeIndex] = source.memo.begin();
             while (source.memo.size() > ResultMemoEntries) {
                 const auto& last = source.memo.back();
                 source.memoIndex.erase((last.variantId * 0x9e3779b97f4a7c15ull) ^ last.hash);
+                const auto lastShape = source.memoShapes.find((last.variantId * 0xc2b2ae3d27d4eb4full) ^ last.shape);
+                if (lastShape != source.memoShapes.end() && lastShape->second == std::prev(source.memo.end())) source.memoShapes.erase(lastShape);
                 source.memo.pop_back();
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1517,6 +1582,10 @@ RecompileResult Recompile(const RecompileRequest& request) {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+std::uint64_t ResultMemoUserWordPatches() {
+    return memoUserWordPatches().load(std::memory_order_relaxed);
 }
 
 }

@@ -29,11 +29,14 @@ public:
     static double ThreadWaitedMs();
     static bool WriteBounds();
     static bool VerifyWriteBounds();
+    static bool RefinedBounds();
 
     bool Pending() const { return submitted.load(std::memory_order_acquire) != turn.load(std::memory_order_acquire); }
     std::uint64_t Enqueued() const { return turn.load(std::memory_order_acquire); }
     void Submit(Job job, std::optional<std::vector<Range>> bound = std::nullopt);
     bool MayWrite(std::uint64_t address, std::size_t bytes);
+    bool Refine(std::uint64_t seq, std::uint64_t from, std::span<const Range> reads, std::span<const Range> writes);
+    void WaitForWriters(std::uint64_t address, std::size_t bytes);
     void WaitTurn(std::uint64_t seq);
     void FinishTurn(std::uint64_t seq, std::span<const Range> writes);
     bool WrittenBetween(std::uint64_t from, std::uint64_t to, std::span<const Range> reads);
@@ -46,6 +49,7 @@ private:
     DrawPrepPool();
     void run();
     void report();
+    bool mayWriteLocked(std::uint64_t address, std::size_t bytes) const;
 
     struct Task {
         std::uint64_t seq;
@@ -59,6 +63,10 @@ private:
     std::deque<std::pair<std::uint64_t, std::optional<std::vector<Range>>>> bounds;
     std::atomic<std::uint64_t> boundedChecks{0};
     std::atomic<std::uint64_t> waitsAvoided{0};
+    std::uint64_t refinedEarly = 0;
+    std::uint64_t refinedAtTurn = 0;
+    std::uint64_t writerWaits = 0;
+    std::uint64_t writerWaitNs = 0;
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> turn{0};
     std::vector<std::thread> threads;

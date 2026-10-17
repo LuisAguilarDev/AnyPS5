@@ -453,6 +453,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             };
             const auto startMark = pool.Enqueued();
             bool ok = tryAttempt();
+            const bool refine = !P.drawHit && DrawPrepPool::RefinedBounds();
+            const auto refineBound = [&](std::uint64_t from, std::span<const DrawPrepPool::Range> reads) {
+                const auto ranges = drawWriteRanges(graphics, work->stages);
+                const std::vector<DrawPrepPool::Range> bound(ranges.begin(), ranges.end());
+                pool.Refine(seq, from, reads, bound);
+            };
+            if (refine && ok && startMark < seq) {
+                std::vector<DrawPrepPool::Range> reads;
+                for (const auto& region : work->memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                refineBound(startMark, reads);
+            }
             pool.WaitTurn(seq);
             if (startMark < seq) {
                 std::vector<DrawPrepPool::Range> reads;
@@ -467,6 +478,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
                 if (!frontReads.empty() && pool.WrittenBetween(startMark, seq, frontReads)) pool.NoteFrontReadConflict();
             }
+            if (refine && ok) refineBound(seq, {});
             const auto skip = [&](const std::string& reason) {
                 pool.NoteSkip();
                 static std::atomic<std::uint64_t> reported{0};

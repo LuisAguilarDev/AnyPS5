@@ -203,7 +203,11 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
-    if (DrawPrepPool::Threads() != 0 && DrawPrepPool::Get().Pending() && (!DrawPrepPool::WriteBounds() || DrawPrepPool::Get().MayWrite(address, bytes))) DrawPrepPool::Get().WaitAll();
+    if (DrawPrepPool::Threads() != 0 && DrawPrepPool::Get().Pending()) {
+        auto& pool = DrawPrepPool::Get();
+        if (DrawPrepPool::RefinedBounds()) pool.WaitForWriters(address, bytes);
+        else if (!DrawPrepPool::WriteBounds() || pool.MayWrite(address, bytes)) pool.WaitAll();
+    }
     return OverlapsQueued(address, bytes);
 }
 

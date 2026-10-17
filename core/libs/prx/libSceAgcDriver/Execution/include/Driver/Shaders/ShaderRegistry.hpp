@@ -77,6 +77,17 @@ struct RegisteredShaderState {
     Registers userConfig;
 };
 
+struct OffsetProgramUse {
+    std::size_t codeOffset = 0;
+    std::uint8_t workgroup = 0, positionVector = 0;
+};
+
+struct OffsetProgramUses {
+    static constexpr std::size_t Capacity = 16;
+    std::mutex mutex;
+    std::vector<OffsetProgramUse> entries;
+};
+
 struct ShaderSnapshot {
     std::uint64_t codeAddress;
     std::uint64_t headerAddress;
@@ -87,6 +98,7 @@ struct ShaderSnapshot {
     std::shared_ptr<const RegisteredShaderState> registeredState;
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    std::shared_ptr<OffsetProgramUses> offsetUses = std::make_shared<OffsetProgramUses>();
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
 };
@@ -99,6 +111,7 @@ void NoteRawGraphicsDraw(const ShaderSnapshot& snapshot);
 bool RawGraphicsDrawn();
 bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end);
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset);
+std::uint64_t ProgramUseDecodes();
 // The PA_CL_VS_OUT_CNTL position export bits a vertex program is compiled with: none for a program
 // without pos1..pos3 exports, so its artifact does not depend on them.
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation = nullptr);

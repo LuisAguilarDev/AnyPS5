@@ -144,6 +144,8 @@ A draw whose register key misses but whose shape has an entry (a data-only hit) 
 
 With `APS5_DRAW_PREP_THREADS=<n>`, draws are prepared on a pool of threads while the packet thread parses on. A draw-cache hit is submitted with the exact ranges it will write (its targets and the buffers and images its matched stages write); a draw that still needs capture or recompilation has no such bound. Before the packet thread validates memory against the draw pipeline, it waits for the pending pool jobs only when one of them has no bound or its bound overlaps the memory, so a validation no longer waits for unrelated hits (`APS5_NO_PREP_POOL_WRITE_BOUNDS=1` always waits; `APS5_VERIFY_PREP_POOL_WRITE_BOUNDS=1` aborts when a job writes outside its bound). `APS5_PROFILE_DRAW=1` reports the waits that remain as the `validate prep-pool wait` driver phase, and the `[prep-pool]` line counts the waits avoided.
 
+Whether a program exports pos1 to pos3 (`PositionExportLayout`) or uses LDS or barriers (`ProgramUsesWorkgroup`) is decoded once per shader snapshot and code offset, for programs that start inside a snapshot as well as at its start (`APS5_NO_OFFSET_PROGRAM_USE_CACHE=1` decodes a program at a nonzero offset on every draw).
+
 The disk cache (`FormatVersion` 33) stores the table and table operation of each image and sampler, the image shapes of the table binding, the invocation's table poison list, read ranges and fault count, and the table column of each descriptor source in the front-end plan, with its key domains.
 
 ### Untracked storage image comparisons

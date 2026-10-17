@@ -37,6 +37,7 @@ public:
     bool MayWrite(std::uint64_t address, std::size_t bytes);
     bool Refine(std::uint64_t seq, std::uint64_t from, std::span<const Range> reads, std::span<const Range> writes);
     void WaitForWriters(std::uint64_t address, std::size_t bytes);
+    void WaitForWriters(std::span<const Range> ranges);
     void WaitTurn(std::uint64_t seq);
     void FinishTurn(std::uint64_t seq, std::span<const Range> writes);
     bool WrittenBetween(std::uint64_t from, std::uint64_t to, std::span<const Range> reads);
@@ -50,6 +51,7 @@ private:
     void run();
     void report();
     bool mayWriteLocked(std::uint64_t address, std::size_t bytes) const;
+    bool mayWriteAnyLocked(std::span<const Range> ranges) const;
 
     struct Task {
         std::uint64_t seq;

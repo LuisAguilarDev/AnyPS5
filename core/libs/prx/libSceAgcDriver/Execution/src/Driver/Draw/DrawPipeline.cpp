@@ -211,6 +211,29 @@ bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     return OverlapsQueued(address, bytes);
 }
 
+bool DrawPipeline::BatchedOverlaps() {
+    static const bool batched = std::getenv("APS5_NO_BATCHED_PIPELINE_OVERLAP") == nullptr;
+    return batched;
+}
+
+bool DrawPipeline::OverlapsAny(std::span<const Range> ranges) {
+    if (DrawPrepPool::Threads() != 0 && DrawPrepPool::Get().Pending()) {
+        auto& pool = DrawPrepPool::Get();
+        if (DrawPrepPool::RefinedBounds()) {
+            pool.WaitForWriters(ranges);
+        } else if (std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return !DrawPrepPool::WriteBounds() || pool.MayWrite(range.first, static_cast<std::size_t>(range.second - range.first)); })) {
+            pool.WaitAll();
+        }
+    }
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        for (const auto& [begin, limit] : item.writes) {
+            if (std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.first < limit && begin < range.second; })) return true;
+        }
+    }
+    return false;
+}
+
 bool DrawPipeline::OverlapsQueued(std::uint64_t address, std::size_t bytes) {
     const auto end = address + bytes;
     std::lock_guard lock(mutex);

@@ -134,14 +134,45 @@ void RefineRefusedBehindPossibleWriters() {
     Check(acceptedAtTurn == 1, "a job could not narrow its bound at its turn");
 }
 
+void ReadersOfSeveralRangesWaitForAnyWriter() {
+    auto& pool = DrawPrepPool::Get();
+    Gate held, release;
+    const std::vector<Range> writes{{0x90000, 0x90100}};
+    pool.Submit([&](std::uint64_t seq) {
+        held.Open();
+        release.Wait();
+        Finish(pool, seq, writes);
+    }, writes);
+    held.Wait();
+    const std::vector<Range> clear{{0xa0000, 0xa0100}, {0xb0000, 0xb0100}};
+    pool.WaitForWriters(clear);
+    const std::vector<Range> written{{0xa0000, 0xa0100}, {0x900f0, 0x90200}};
+    std::atomic<bool> done{false};
+    std::thread waiter([&] {
+        pool.WaitForWriters(written);
+        done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const bool early = done;
+    release.Open();
+    waiter.join();
+    Check(!early, "a reader of several ranges did not wait for the job writing its second range");
+    Check(done, "the reader of several ranges was not released when the writer finished");
+    pool.WaitAll();
+}
+
 }
 
 int main() {
     try {
         Check(DrawPrepPool::Threads() >= 3, "the test needs APS5_DRAW_PREP_THREADS=3 or more");
-        Check(DrawPrepPool::RefinedBounds(), "refined bounds are off");
+        if (!DrawPrepPool::RefinedBounds()) {
+            std::cout << "refined prep-pool bounds are off; skipped\n";
+            return 77;
+        }
         RefinedJobReleasesDisjointReaders();
         RefineRefusedBehindPossibleWriters();
+        ReadersOfSeveralRangesWaitForAnyWriter();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

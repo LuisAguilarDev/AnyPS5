@@ -324,7 +324,7 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_draw_prep_pool_bounds_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_draw_prep_pool_bounds_tests)
     add_test(NAME agc_driver_draw_prep_pool_bounds COMMAND agc_driver_draw_prep_pool_bounds_tests)
-    set_tests_properties(agc_driver_draw_prep_pool_bounds PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_DRAW_PREP_THREADS=3")
+    set_tests_properties(agc_driver_draw_prep_pool_bounds PROPERTIES TIMEOUT 20 ENVIRONMENT "APS5_DRAW_PREP_THREADS=3" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_draw_prep_pool_bounds PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

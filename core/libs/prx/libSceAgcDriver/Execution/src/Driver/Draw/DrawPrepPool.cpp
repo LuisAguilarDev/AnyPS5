@@ -203,16 +203,25 @@ bool DrawPrepPool::Refine(std::uint64_t seq, std::uint64_t from, std::span<const
     return true;
 }
 
+bool DrawPrepPool::mayWriteAnyLocked(std::span<const Range> ranges) const {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return range.second > range.first && mayWriteLocked(range.first, static_cast<std::size_t>(range.second - range.first)); });
+}
+
 void DrawPrepPool::WaitForWriters(std::uint64_t address, std::size_t bytes) {
+    const Range range{address, address + bytes};
+    WaitForWriters(std::span(&range, 1));
+}
+
+void DrawPrepPool::WaitForWriters(std::span<const Range> ranges) {
     if (poolThread || exemptThread || !Pending()) return;
     boundedChecks.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock lock(mutex);
-    if (!mayWriteLocked(address, bytes)) {
+    if (!mayWriteAnyLocked(ranges)) {
         if (!bounds.empty()) waitsAvoided.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const auto start = std::chrono::steady_clock::now();
-    progress.wait(lock, [&] { return !mayWriteLocked(address, bytes); });
+    progress.wait(lock, [&] { return !mayWriteAnyLocked(ranges); });
     const auto waited = elapsedNs(start);
     ++writerWaits;
     writerWaitNs += waited;

@@ -575,7 +575,9 @@ struct VulkanDevice::State {
     // the range on the CPU; under GpuMutex.
     bool CopiedWriterOverlaps(std::uint64_t address, std::size_t bytes) const {
         const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
-        return std::any_of(copiedWriters->begin(), copiedWriters->end(), overlaps) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), overlaps);
+        if (std::any_of(copiedWriters->begin(), copiedWriters->end(), overlaps)) return true;
+        const auto drawWriters = Graphics::DrawCopiedWriters();
+        return std::any_of(drawWriters->begin(), drawWriters->end(), overlaps);
     }
 
     void DestroyRetiredSwapchains() {

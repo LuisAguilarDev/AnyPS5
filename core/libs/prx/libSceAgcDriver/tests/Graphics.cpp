@@ -4522,6 +4522,38 @@ void sharedTemplateScratchTests() {
     std::cout << "shared template scratch survives concurrent recorders\n";
 }
 
+// The registry of draws with copied write-backs (DrawCopiedWriters) listed and delisted on several
+// threads at once while others read it, as recorder threads list their draws and completion
+// actions delist them: a snapshot must never change under its reader, and every writer must be in
+// a snapshot taken after its listing and in none taken after its delisting.
+void drawCopiedWriterTests() {
+    using AgcDriver::Graphics::ShaderResources;
+    constexpr std::uint32_t threads = 4;
+    constexpr std::uint32_t rounds = 20000;
+    std::atomic<std::uint32_t> wrong{0};
+    std::vector<std::thread> users;
+    for (std::uint32_t thread = 0; thread < threads; ++thread) {
+        users.emplace_back([&, thread] {
+            for (std::uint32_t round = 0; round < rounds; ++round) {
+                // Never dereferenced: the registry only compares and holds writers.
+                const std::shared_ptr<ShaderResources> writer(std::shared_ptr<void>(), reinterpret_cast<ShaderResources*>(static_cast<std::uintptr_t>(thread + 1) << 4u));
+                AgcDriver::Graphics::ListDrawCopiedWriter(writer);
+                const auto listed = AgcDriver::Graphics::DrawCopiedWriters();
+                const auto size = listed->size();
+                if (std::find(listed->begin(), listed->end(), writer) == listed->end()) wrong.fetch_add(1);
+                AgcDriver::Graphics::DelistDrawCopiedWriter(writer);
+                if (listed->size() != size || std::find(listed->begin(), listed->end(), writer) == listed->end()) wrong.fetch_add(1);
+                const auto delisted = AgcDriver::Graphics::DrawCopiedWriters();
+                if (std::find(delisted->begin(), delisted->end(), writer) != delisted->end()) wrong.fetch_add(1);
+            }
+        });
+    }
+    for (auto& user : users) user.join();
+    Require(wrong.load() == 0, "a draw copied writer snapshot changed under its reader or missed a listing");
+    Require(AgcDriver::Graphics::DrawCopiedWriters()->empty(), "a delisted draw copied writer stayed listed");
+    std::cout << "draw copied writers survive concurrent listing\n";
+}
+
 // The resource caches keep their use order with LruStamp (a hit stamps its entry, an eviction
 // orders the list first) or, with APS5_NO_LRU_STAMPS=1, by splicing on every hit: either way the
 // order an eviction sees is exactly the order of the last uses. This mode sets a ResourceCache bound
@@ -5796,8 +5828,8 @@ void copiedWriterIndirectOverlapTests() {
         Require(!writer->CopiedWritesOverlap(directAddress, 16), "ShaderResources must NOT report CopiedWritesOverlap for direct region");
         Require(writer->CopiedWritesOverlap(copiedAddress, 16), "ShaderResources must report CopiedWritesOverlap for copied region");
 
-        auto copiedWriters = DrawCopiedWriters();
-        copiedWriters->push_back(writer);
+        ListDrawCopiedWriter(writer);
+        const auto copiedWriters = DrawCopiedWriters();
 
         const auto overlapsMain = [&](const auto& w) { return w->WritesOverlap(directAddress, 16); };
         const auto overlapsPR = [&](const auto& w) { return w->CopiedWritesOverlap(directAddress, 16); };
@@ -5811,7 +5843,7 @@ void copiedWriterIndirectOverlapTests() {
         const auto copiedOverlapsPR = [&](const auto& w) { return w->CopiedWritesOverlap(copiedAddress, 16); };
         Require(std::any_of(copiedWriters->begin(), copiedWriters->end(), copiedOverlapsPR), "PR's check must flag an overlap over copied arguments");
 
-        copiedWriters->erase(std::remove(copiedWriters->begin(), copiedWriters->end(), writer), copiedWriters->end());
+        DelistDrawCopiedWriter(writer);
         writer->WriteBack();
     }
 
@@ -8203,6 +8235,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--shared-template-scratch") {
             sharedTemplateScratchTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-copied-writers") {
+            drawCopiedWriterTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--address-space-teardown") {

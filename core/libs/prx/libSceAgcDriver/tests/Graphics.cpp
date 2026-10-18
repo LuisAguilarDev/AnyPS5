@@ -4297,8 +4297,8 @@ void descriptorSnapshotTests() {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.buffer->ViewOffset() && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    Require(sameBytes(bufferBytes(descriptor.buffer).subspan(static_cast<std::size_t>(descriptor.offset)), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }
@@ -4364,6 +4364,56 @@ void drawSnapshotArenaTests() {
         recorder.Sync();
     }
     Require(mock.live == 0, "draw snapshot arenas leaked Vulkan objects");
+}
+
+// The data words of a template hit (MovedBuffer::words) are a slice of the snapshot arena like a
+// moved guest range when they fit one, not a buffer of their own (fails with
+// APS5_NO_WORD_SNAPSHOT_ARENA=1).
+void wordSnapshotArenaTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto guest = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestSecond.data(), 32));
+        guest.bufferWritten = {false};
+        vertex.bindings.push_back(guest);
+        // A compact ShaderData block (the words up to the user data the program reads).
+        constexpr std::size_t compact = ShaderRecompiler::RuntimeAbi::UserDataDword + 4u;
+        const auto compactWords = [](std::uint32_t last) {
+            auto words = ShaderDataWords({7, 8, last});
+            words.resize(compact);
+            return words;
+        };
+        const auto initial = compactWords(9);
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, initial));
+        vertex.shaderDataDwords = compact;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        ShaderResources::DrawBindingsProfile profile;
+        for (std::uint32_t draw = 0; draw < 16; ++draw) {
+            const auto words = compactWords(100 + draw);
+            const std::array<ShaderResources::MovedBuffer, 2> moved{{{0, reinterpret_cast<std::uint64_t>(guestSecond.data()), 32, {}}, {1, 0, initial.size() * 4u, words}}};
+            mock.writes.clear();
+            const auto bindings = resources.PrepareDrawBindings(recorder, moved, &profile);
+            Require(bindings != nullptr && bindings->snapshots.size() == 2, "moved data words were not snapshotted");
+            const auto& guestWrite = findWrite(0);
+            const auto& wordWrite = findWrite(5);
+            Require(wordWrite.buffers.size() == 1 && wordWrite.buffers[0].range == words.size() * 4u, "the data word descriptor lost its range");
+            Require(wordWrite.buffers[0].buffer == guestWrite.buffers[0].buffer, "moved data words got a buffer of their own instead of an arena slice");
+            Require(sameBytes(bufferBytes(wordWrite.buffers[0].buffer).subspan(static_cast<std::size_t>(wordWrite.buffers[0].offset)), words.data(), words.size() * 4u), "an arena slice does not hold the draw's data words");
+        }
+        Require(profile.wordSnapshots == 16, "the data word snapshots were not counted");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "data word snapshots leaked Vulkan objects");
 }
 
 // A Buffer keeps only its device of the context (BufferDevice): every snapshot and upload allocates
@@ -8052,6 +8102,7 @@ int main(int argc, char** argv) {
         oversizedDescriptorTests();
         descriptorSnapshotTests();
         drawSnapshotArenaTests();
+        wordSnapshotArenaTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();
         imageTableAllocationTests();

@@ -183,6 +183,8 @@ void NoteLockedGpuWait(double ms);
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();
+// The time those walks took, in nanoseconds, under the tracker lock (its wait not included).
+std::uint64_t ThreadCollectNanoseconds();
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);

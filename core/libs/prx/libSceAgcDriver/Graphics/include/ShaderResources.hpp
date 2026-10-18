@@ -182,6 +182,9 @@ public:
         std::uint64_t snapshotBytes = 0;
         std::uint64_t copiedSnapshots = 0;
         std::uint64_t copiedBytes = 0;
+        // Of the snapshots, the data words of a template hit (MovedBuffer::words) and their time.
+        std::uint64_t wordSnapshots = 0;
+        double wordUs = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;

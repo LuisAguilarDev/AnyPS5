@@ -1528,6 +1528,60 @@ static void RequireResidentMapping(const void* address) {
 }
 #endif
 
+// A resident run with every page collected reports only its written pages, at the requested start
+// within the first one (the sparse resident collect; APS5_NO_SPARSE_RESIDENT_COLLECT visits every page).
+static void CheckCollectedResidentRunReportsWrittenPages() {
+#ifdef _WIN32
+    constexpr std::size_t chunk = 0x200000;
+    constexpr std::size_t small = 4096;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, chunk, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, chunk, 3, 0, phys, 0) == 0);
+    RequireResidentMapping(mapped);
+    const auto base = reinterpret_cast<std::uintptr_t>(mapped);
+    std::vector<void*> pages(chunk / small);
+    const auto collect = [&](std::uintptr_t address, std::size_t bytes, bool clear) {
+        std::size_t count = pages.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(address, bytes, pages.data(), &count, clear));
+        return count;
+    };
+    Require(collect(base, chunk, true) == chunk / small);
+    Require(collect(base, chunk, true) == 0);
+    auto* bytes = static_cast<volatile unsigned char*>(mapped);
+    bytes[small * 3 + 8] = 1;
+    bytes[small * 400] = 2;
+    Require(collect(base + small * 3 + 100, small * 500, false) == 2);
+    Require(pages[0] == reinterpret_cast<void*>(base + small * 3 + 100) && pages[1] == reinterpret_cast<void*>(base + small * 400));
+    Require(collect(base + small * 4, small * 300, false) == 0);
+    Require(collect(base, chunk, true) == 2);
+    Require(pages[0] == reinterpret_cast<void*>(base + small * 3) && pages[1] == reinterpret_cast<void*>(base + small * 400));
+    Require(collect(base, chunk, true) == 0);
+    Require(sceKernelMunmap(mapped, chunk) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, chunk) == 0);
+    // APS5_BENCHMARK_RESIDENT_COLLECT=1 times a clean collection over a 4K render target's worth of
+    // resident runs (32 MiB, 8192 pages), the walk a resident target's refresh makes per epoch.
+    if (std::getenv("APS5_BENCHMARK_RESIDENT_COLLECT") == nullptr) return;
+    constexpr std::size_t target = chunk * 16;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, target, 0, 0, &phys) == 0);
+    Require(sceKernelMapDirectMemory(&mapped, target, 3, 0, phys, 0) == 0);
+    std::vector<void*> all(target / small);
+    const auto collectAll = [&] {
+        std::size_t count = all.size();
+        Require(GuestArena::GuestArenaCollectWrites_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped), target, all.data(), &count, true));
+        return count;
+    };
+    Require(collectAll() == target / small);
+    constexpr int rounds = 200;
+    const auto start = std::chrono::steady_clock::now();
+    for (int round = 0; round < rounds; ++round) Require(collectAll() == 0);
+    const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / rounds;
+    std::printf("resident collect benchmark: %.1f us per clean 32 MiB collection\n", us);
+    Require(sceKernelMunmap(mapped, target) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, target) == 0);
+#endif
+}
+
 static void CheckBreakingAResidentRunKeepsConcurrentAccesses() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -2704,6 +2758,7 @@ int main(int argc, char** argv) {
     CheckSingleDirectMappingTracksWritesWithoutFaults();
     CheckSecondDirectMappingWaitsForLeases();
     CheckBreakingAResidentRunKeepsConcurrentAccesses();
+    CheckCollectedResidentRunReportsWrittenPages();
     CheckRemappedDirectMemoryIsChargedOnce();
 #if defined(__linux__)
     CheckWriteWatch();

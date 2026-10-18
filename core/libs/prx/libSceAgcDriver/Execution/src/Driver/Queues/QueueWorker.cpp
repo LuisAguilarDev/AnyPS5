@@ -70,7 +70,7 @@ void Driver::deferCompletion(const Submission& submission) {
         queue0Uncommitted.push_back(received);
     }
     completionDeferred() = true;
-    DrawPipeline::Queue0().Enqueue([this, serial = submission.serial, received, labelWrites = submission.labelWrites] {
+    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Completion, [this, serial = submission.serial, received, labelWrites = submission.labelWrites] {
         completeSubmission(serial, received, labelWrites);
     }, {});
 }

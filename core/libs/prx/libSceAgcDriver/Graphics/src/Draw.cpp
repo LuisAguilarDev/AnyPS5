@@ -337,11 +337,16 @@ enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseRead
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
 enum RecordPart : std::size_t { RecordPrologue, RecordBindings, RecordPass, RecordBarriers, RecordBegin, RecordContinue, RecordBind, RecordPush, RecordCommands, RecordLeave, RecordPartCount };
 constexpr std::array<const char*, RecordPartCount> RecordPartNames{"prologue", "bindings", "pass", "barriers", "begin", "continue", "bind", "push", "commands", "leave"};
+// The lookup phase of a cacheable draw (resolveDrawResources): the content key, the cache find,
+// the template's Revalidate, its moved read-only buffers and the alias checks of a hit.
+enum LookupPart : std::size_t { LookupKey, LookupFind, LookupRevalidate, LookupMoved, LookupAliases, LookupPartCount };
+constexpr std::array<const char*, LookupPartCount> LookupPartNames{"key", "find", "revalidate", "moved", "aliases"};
 
 struct RecordSplit {
     bool used = false;
     std::array<double, RecordPartCount> us{};
     ShaderResources::DrawBindingsProfile bindings;
+    std::array<double, LookupPartCount> lookup{};
 };
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
@@ -383,6 +388,7 @@ struct DrawOutcome {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    double walkUs = 0;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -407,7 +413,9 @@ struct DrawProfile {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    double walkUs = 0;
     std::array<double, PhaseCount> totalsUs{};
+    std::array<double, LookupPartCount> lookupPartsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
     std::array<double, PhaseCount> maxUs{};
@@ -496,6 +504,8 @@ void addBindingsProfile(ShaderResources::DrawBindingsProfile& total, const Shade
     total.snapshotBytes += draw.snapshotBytes;
     total.copiedSnapshots += draw.copiedSnapshots;
     total.copiedBytes += draw.copiedBytes;
+    total.wordSnapshots += draw.wordSnapshots;
+    total.wordUs += draw.wordUs;
 }
 
 void addRecordSplit(DrawProfile& profile, const RecordSplit& split, double recordUs, std::size_t kind) {
@@ -530,7 +540,7 @@ void printRecordSplit(const DrawProfile& profile) {
         const auto average = draws != 0 ? static_cast<double>(profile.splitKindSets[kind]) / static_cast<double>(draws) : 0.0;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f (%llu draws, %llu fresh)", DrawKindNames[kind], average, static_cast<unsigned long long>(draws), static_cast<unsigned long long>(profile.splitKindFreshSets[kind]));
     }
-    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; vkUpdateDescriptorSets per draw %.2f (%.2f writes, %.2f descriptors); snapshots per draw %.2f (%.2f moved, %.2f copied, %.0f bytes copied, %.0f bytes bound)", perDraw(static_cast<double>(bindings.updateCalls)), perDraw(static_cast<double>(bindings.writes)), perDraw(static_cast<double>(bindings.descriptors)), perDraw(static_cast<double>(bindings.snapshots)), perDraw(static_cast<double>(bindings.movedSnapshots)), perDraw(static_cast<double>(bindings.copiedSnapshots)), perDraw(static_cast<double>(bindings.copiedBytes)), perDraw(static_cast<double>(bindings.snapshotBytes)));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; vkUpdateDescriptorSets per draw %.2f (%.2f writes, %.2f descriptors); snapshots per draw %.2f (%.2f moved, %.2f copied, %.0f bytes copied, %.0f bytes bound; %.2f data word sets in %.2f us)", perDraw(static_cast<double>(bindings.updateCalls)), perDraw(static_cast<double>(bindings.writes)), perDraw(static_cast<double>(bindings.descriptors)), perDraw(static_cast<double>(bindings.snapshots)), perDraw(static_cast<double>(bindings.movedSnapshots)), perDraw(static_cast<double>(bindings.copiedSnapshots)), perDraw(static_cast<double>(bindings.copiedBytes)), perDraw(static_cast<double>(bindings.snapshotBytes)), perDraw(static_cast<double>(bindings.wordSnapshots)), perDraw(bindings.wordUs));
     std::fprintf(stderr, "%s\n", line);
 }
 
@@ -548,6 +558,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
     if (split.used) addRecordSplit(profile, split, us[PhaseRecord], outcome.kind);
+    for (std::size_t i = 0; i < LookupPartCount; ++i) profile.lookupPartsUs[i] += split.lookup[i];
     double drawUs = 0;
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         profile.totalsUs[i] += us[i];
@@ -583,6 +594,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.partialLookups += outcome.partialLookups;
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
+    profile.walkUs += outcome.walkUs;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -605,7 +617,12 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
-        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
+        if (i == PhaseLookup && room()) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
+            for (std::size_t part = 0; part < LookupPartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", part == 0 ? "" : ", ", LookupPartNames[part], profile.lookupPartsUs[part] / 1000.0);
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
+        }
+        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, %.0f us of it in the write-watch walks)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.walkUs);
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -640,6 +657,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     if (profile.splitDraws != 0) printRecordSplit(profile);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
+    profile.lookupPartsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
@@ -651,7 +669,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.targetLookups = profile.slowLookups = 0;
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
-    profile.lookupUs = 0;
+    profile.lookupUs = profile.walkUs = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -962,6 +980,15 @@ struct DrawTimer {
         us[PhaseRecord] += elapsed;
         split.us[which] += elapsed;
         split.used = true;
+        phaseStart = now;
+    }
+    // A slice of the lookup phase (the phase total stays what phase(PhaseLookup) adds up).
+    void lookup(LookupPart which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
+        us[PhaseLookup] += elapsed;
+        split.lookup[which] += elapsed;
         phaseStart = now;
     }
     ShaderResources::DrawBindingsProfile* bindingsProfile() { return profile ? &split.bindings : nullptr; }
@@ -1446,6 +1473,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    const auto walkNsBefore = profile ? GuestMemory::ThreadCollectNanoseconds() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
@@ -1466,6 +1494,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         }
         outcome.lookupUs += lookupUs;
         outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
+        outcome.walkUs += static_cast<double>(GuestMemory::ThreadCollectNanoseconds() - walkNsBefore) / 1000.0;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
@@ -1499,13 +1528,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        timer.lookup(LookupKey);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        timer.lookup(LookupFind);
+        if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
+            timer.lookup(LookupRevalidate);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            timer.lookup(LookupMoved);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                timer.lookup(LookupAliases);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;

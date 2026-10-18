@@ -534,7 +534,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 commitDraw(pooledDraw->localDevice, pooledDraw->queueId, pooledDraw->decode->state, work->drawParameters, work->stages, snapshots, recipe, recipeStages, pooledDraw->drawKey);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
-            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes));
             pool.FinishTurn(seq, written);
         }, std::move(writeBound));
         phaseTiming.Phase(DrawRowLockWait);
@@ -824,7 +824,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();

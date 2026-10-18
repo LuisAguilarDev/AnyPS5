@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -549,14 +550,27 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
-        std::vector<std::uintptr_t> written;
+        // GetWriteWatch's output goes into one scratch array per thread instead of a zero-filled
+        // vector with a slot per page on every call.
+        static const bool sparse = std::getenv("APS5_NO_SPARSE_RESIDENT_COLLECT") == nullptr;
+        thread_local std::vector<void*> found;
+        ULONG_PTR reported = 0;
         if (collection != Collection::Fresh) {
-            std::vector<void*> found((stop - first + 4095) / 4096);
-            ULONG_PTR reported = found.size();
+            const auto slots = static_cast<std::size_t>((stop - first + 4095) / 4096);
+            if (found.size() < slots) found.resize(slots);
+            reported = slots;
             DWORD granularity = 0;
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
-            for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
+        // A run with every page collected settles nothing and reports exactly its written pages, so
+        // those are copied out without visiting each page of the range (a 4K render target's walk
+        // visited 8100). APS5_NO_SPARSE_RESIDENT_COLLECT=1 visits every page.
+        if (sparse && run.fresh == 0 && collection != Collection::Fresh) {
+            for (ULONG_PTR index = 0; index < reported; ++index) pages[(*count)++] = reinterpret_cast<void*>(std::max(reinterpret_cast<std::uintptr_t>(found[index]), from));
+            return;
+        }
+        std::vector<std::uintptr_t> written(reported);
+        for (ULONG_PTR index = 0; index < reported; ++index) written[index] = reinterpret_cast<std::uintptr_t>(found[index]);
         auto next = written.begin();
         std::uintptr_t resetFrom = 0;
         const auto flushReset = [&](std::uintptr_t to) {

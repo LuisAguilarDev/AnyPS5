@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -409,6 +410,8 @@ struct DrawOutcome {
     double ownSyncUs = 0;
     // How recordDraw recorded it (SpinePath), and the record half's time of a split one.
     SpinePath spine = SpineNone;
+    // A split one whose record half went to a recorder thread (recordChunked).
+    bool spineChunked = false;
     double spineRecordUs = 0;
 };
 
@@ -495,6 +498,7 @@ struct DrawProfile {
     // The [spine] line: lean draws by how recordDraw recorded them (SpinePath), and the split
     // ones' time on the spine (the whole draw less its record half) and in the record half.
     std::array<std::uint64_t, SpinePathCount> spinePaths{};
+    std::uint64_t spineChunked = 0;
     double spineResolveUs = 0;
     double spineRecordUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
@@ -579,8 +583,10 @@ void printSpine(const DrawProfile& profile) {
     if (lean == 0) return;
     const auto split = profile.spinePaths[SpineSplit];
     const auto perSplit = [&](double total) { return split != 0 ? total / static_cast<double>(split) : 0.0; };
+    // The record halves timed: those recorded on the spine (a chunked one is queued, not recorded).
+    const auto onSpine = split - profile.spineChunked;
     char line[1024];
-    int n = std::snprintf(line, sizeof(line), "[spine] %llu lean draws over 10 s: %llu split (%.1f%%; resolve avg %.2f us, record avg %.2f us), serial by reason:", static_cast<unsigned long long>(lean), static_cast<unsigned long long>(split), 100.0 * static_cast<double>(split) / static_cast<double>(lean), perSplit(profile.spineResolveUs), perSplit(profile.spineRecordUs));
+    int n = std::snprintf(line, sizeof(line), "[spine] %llu lean draws over 10 s: %llu split (%.1f%%, %llu of them recorded in chunks; resolve avg %.2f us, record avg %.2f us), serial by reason:", static_cast<unsigned long long>(lean), static_cast<unsigned long long>(split), 100.0 * static_cast<double>(split) / static_cast<double>(lean), static_cast<unsigned long long>(profile.spineChunked), perSplit(profile.spineResolveUs), onSpine != 0 ? profile.spineRecordUs / static_cast<double>(onSpine) : 0.0);
     for (std::size_t i = SpineSplit + 1; i < SpinePathCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
         if (profile.spinePaths[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SpinePathNames[i], static_cast<unsigned long long>(profile.spinePaths[i]));
     }
@@ -604,6 +610,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.ownSyncUs += outcome.ownSyncUs;
     if (outcome.spine < SpinePathCount) {
         ++profile.spinePaths[outcome.spine];
+        if (outcome.spineChunked) ++profile.spineChunked;
         if (outcome.spine == SpineSplit) {
             profile.spineRecordUs += outcome.spineRecordUs;
             profile.spineResolveUs += std::max(0.0, drawUs - outcome.spineRecordUs);
@@ -725,6 +732,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     resetRecordSplit(profile);
     profile.spinePaths.fill(0);
     profile.spineResolveUs = profile.spineRecordUs = 0;
+    profile.spineChunked = 0;
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -2081,6 +2089,38 @@ SpinePath spinePath(const State& state, const RecordedDraw& record, const Shader
     return SpineSplit;
 }
 
+// What a lean draw's render pass is checked against (PassHazards): the device-side reads (the
+// indirect records included), the writes, the storage images and the attachments. Taken on the
+// spine with the draw's resolve: a chunked draw's record half runs while a later draw may
+// revalidate the same resources.
+struct DrawPassInputs {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+    std::vector<std::pair<VkImage, bool>> images;
+    std::vector<std::pair<VkImage, bool>> attachments;
+    bool unknownMemory = false;
+    PassAccess Access() const { return {reads, writes, images, attachments, unknownMemory, unknownMemory}; }
+};
+
+void drawPassInputs(const RecordedDraw& record, DrawPassInputs& pass) {
+    const auto& resources = *record.resources;
+    const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
+    const bool addressBased = resources.HoldsLease();
+    pass.reads.clear();
+    if (!addressBased) resources.DeviceReads(pass.reads);
+    if (args != nullptr && record.indirect->path == IndirectDrawPath::Gpu) {
+        pass.reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
+        if (args->countIndirect) pass.reads.emplace_back(args->countAddress, args->countAddress + 4);
+    }
+    pass.writes = resources.GpuWrites();
+    pass.images = resources.StorageImages();
+    pass.attachments.clear();
+    for (const auto& target : record.targets) {
+        if (target != nullptr) pass.attachments.emplace_back(target->Image(), true);
+    }
+    pass.unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
+}
+
 // What the record half of a lean draw leaves to its keep: an indirect draw's scratch copies and
 // its record check.
 struct RecordedCommands {
@@ -2093,7 +2133,7 @@ struct RecordedCommands {
 // `recording`. `pendingWrites` (a split draw's, see recordDraw) stands for the recorder's pending
 // writes before the draw's keep. Only a serial draw (SpinePath) uses `record.recorder` here: the
 // input capture and the indirect and mesh argument records.
-RecordedCommands recordDrawHalf(const Context& context, RecordingContext& recording, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs, const RecordedDraw& record, std::uint64_t passKey, bool readsTarget, bool capture, const std::vector<std::uint8_t>* pendingWrites, DrawOutcome& outcome, DrawTimer& timer) {
+RecordedCommands recordDrawHalf(const Context& context, RecordingContext& recording, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs, const RecordedDraw& record, std::uint64_t passKey, bool readsTarget, bool capture, const std::vector<std::uint8_t>* pendingWrites, const DrawPassInputs& pass, DrawOutcome& outcome, DrawTimer& timer) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
@@ -2103,23 +2143,7 @@ RecordedCommands recordDrawHalf(const Context& context, RecordingContext& record
     const auto drawBindings = resources.PrepareDrawBindings(recording, record.moved, timer.bindingsProfile(), pendingWrites);
     timer.part(RecordBindings);
     const bool meshIndirect = state.stages.mesh && args != nullptr;
-    const bool addressBased = resources.HoldsLease();
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
-    auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
-    passReads.clear();
-    if (!addressBased) resources.DeviceReads(passReads);
-    if (gpuIndirect) {
-        passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
-        if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
-    }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
-    passAttachments.reserve(record.targets.size());
-    for (const auto& target : record.targets) {
-        if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
-    }
-    const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
-    const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
+    const auto passAccess = pass.Access();
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     const auto start = recording.StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
@@ -2230,6 +2254,69 @@ RecordedCommands recordDrawHalf(const Context& context, RecordingContext& record
     return recorded;
 }
 
+// A split draw whose record half goes to a recorder thread (Recorder::JoinChunk): the half owns
+// copies of everything it reads (the state, the draw, the inputs' bindings, the moved buffers,
+// the push constant block, the pending writes and the pass inputs) and shares the objects it
+// binds; the keep runs here in the chunk's keep scope, then the half is queued behind the chunk's
+// earlier draws. Its context reaches no recorder (Context::recorder is null there).
+void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& recorders, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, std::uint64_t passKey, bool readsTarget, const std::vector<std::uint8_t>& pendingWrites, const DrawPassInputs& pass, DrawOutcome& outcome, DrawTimer& timer) {
+    struct Half {
+        Context context;
+        State state;
+        Pm4::DrawParameters draw;
+        DrawInputs inputs;
+        RecordedDraw record;
+        std::vector<ShaderResources::MovedBuffer> moved;
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        std::uint64_t passKey = 0;
+        bool readsTarget = false;
+        std::vector<std::uint8_t> pendingWrites;
+        DrawPassInputs pass;
+    };
+    auto half = std::make_shared<Half>(Half{context, state, draw});
+    half->context.recorder = nullptr;
+    half->inputs.indexHandle = inputs.indexHandle;
+    half->inputs.indexOffset = inputs.indexOffset;
+    half->inputs.vertexHandles = inputs.vertexHandles;
+    half->inputs.vertexOffsets = inputs.vertexOffsets;
+    half->inputs.vertexInputBehindGpuWrite = inputs.vertexInputBehindGpuWrite;
+    half->inputs.shaderStages = inputs.shaderStages;
+    half->inputs.meshGroups = inputs.meshGroups;
+    half->record.resources = record.resources;
+    half->record.pipeline = record.pipeline;
+    half->record.framebuffer = record.framebuffer;
+    half->moved.assign(record.moved.begin(), record.moved.end());
+    half->record.moved = half->moved;
+    if (record.pushBytes != nullptr) {
+        half->push = *record.pushBytes;
+        half->record.pushStages = record.pushStages;
+    } else {
+        half->push = AssemblePushConstants(shaders);
+        record.resources->PatchPushConstants(half->push);
+        half->record.pushStages = PushConstantStages(shaders);
+    }
+    half->record.pushBytes = &half->push;
+    half->passKey = passKey;
+    half->readsTarget = readsTarget;
+    half->pendingWrites = pendingWrites;
+    half->pass = pass;
+    {
+        const Recorder::ChunkKeepScope scope(recorder);
+        const auto join = recorder.JoinChunk();
+        const auto requests = recorder.CommandRequests();
+        keepRecordedDraw(recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), nullptr, {}, record.listed, record.completion, outcome);
+        timer.phase(PhaseKeep);
+        recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording) {
+            DrawTimer unprofiled(false);
+            DrawOutcome unreported;
+            static_cast<void>(recordDrawHalf(half->context, recording, half->state, half->draw, {}, half->inputs, half->record, half->passKey, half->readsTarget, false, &half->pendingWrites, half->pass, unreported, unprofiled));
+        });
+        if (recorder.CommandRequests() != requests) recorder.SealChunk();
+    }
+    outcome.spineChunked = true;
+    timer.phase(PhaseRecord);
+}
+
 // A lean draw into the device's open batch: the prologue (queued stores the draw must follow),
 // then either serially its record half (recordDrawHalf) and its keep (keepRecordedDraw), or,
 // split (SpinePath), the keep first and the record half after it, with the recorder's pending
@@ -2266,19 +2353,27 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     timer.part(RecordPrologue);
     const bool capture = CaptureInputsEnabled();
     outcome.spine = spinePath(state, record, resources, capture);
+    thread_local DrawPassInputs* passSlot = nullptr;
+    auto& pass = ShaderRecompiler::ThreadOwned(passSlot);
+    drawPassInputs(record, pass);
     if (outcome.spine == SpineSplit) {
         thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
         auto& pendingWrites = ShaderRecompiler::ThreadOwned(pendingSlot);
         resources.PendingSnapshotWrites(*recorder, record.moved, pendingWrites);
+        // A restart table's mesh arguments are made per draw (directMeshArguments): on the spine.
+        if (auto* recorders = inputs.restartTable.empty() ? recorder->Recorders() : nullptr; recorders != nullptr) {
+            recordChunked(context, *recorder, *recorders, state, draw, shaders, inputs, record, passKey, readsTarget, pendingWrites, pass, outcome, timer);
+            return;
+        }
         keepRecordedDraw(*recorder, record.resources, record.pipeline, record.framebuffer, inputs, record.targets, record.targetSlices, nullptr, {}, record.listed, record.completion, outcome, true);
         timer.phase(PhaseKeep);
         const auto recordStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        static_cast<void>(recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, &pendingWrites, outcome, timer));
+        static_cast<void>(recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, &pendingWrites, pass, outcome, timer));
         if (timer.profile) outcome.spineRecordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         timer.phase(PhaseRecord);
         return;
     }
-    auto recorded = recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, nullptr, outcome, timer);
+    auto recorded = recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, nullptr, pass, outcome, timer);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(recorded.scratch), std::move(recorded.checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);

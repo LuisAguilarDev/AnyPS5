@@ -27,6 +27,8 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class RecordingContext;
+struct RecordedChunk;
+class DrawRecorders;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -172,6 +174,57 @@ public:
     // RecordingContext; these forward to the recorder's own (Main), the one every draw records
     // through on the thread that holds GuestMemory::GpuMutex.
     RecordingContext& Main() { return *mainContext; }
+    // Chunked recording (APS5_DRAW_RECORD_THREADS; see DrawRecorders and recordDraw): the record
+    // halves of consecutive split draws go to a recorder thread as one chunk, which the open batch
+    // holds in program order between the spine's own command buffers. JoinChunk gives the chunk the
+    // next draw joins: the open one while nothing else was recorded into the batch since its last
+    // draw and it holds fewer than ChunkDraws draws, else a new one (the spine's command buffer so
+    // far ends behind its open pass, and a fresh one takes what the spine records after the
+    // chunk). Anything else that records into the batch (ensureOpen, outside a ChunkKeepScope)
+    // seals the open chunk; Submit seals it, waits for every chunk of the batch, adds their kept
+    // objects and submits all command buffers in order. A recorder thread's failure is rethrown by
+    // the next JoinChunk (the spine's draw commit fails, which stops the committer); Submit leaves a
+    // failed chunk's commands out. Null threads: APS5_DRAW_RECORD_THREADS unset or 0, GPU timing,
+    // batch stamps or sample counting on.
+    struct ChunkJoin {
+        std::shared_ptr<RecordedChunk> chunk;
+        std::size_t thread = 0;
+        bool fresh = false;
+    };
+    DrawRecorders* Recorders();
+    ChunkJoin JoinChunk();
+    void SealChunk();
+    // A chunked draw's keep (Keep, notes, completion actions): ensureOpen leaves the chunk open.
+    class ChunkKeepScope {
+    public:
+        explicit ChunkKeepScope(Recorder& recorder) : recorder(recorder), previous(recorder.keepingChunk) { recorder.keepingChunk = true; }
+        ~ChunkKeepScope() { recorder.keepingChunk = previous; }
+        ChunkKeepScope(const ChunkKeepScope&) = delete;
+        ChunkKeepScope& operator=(const ChunkKeepScope&) = delete;
+
+    private:
+        Recorder& recorder;
+        bool previous;
+    };
+    // APS5_DRAW_RECORD_THREADS (0 when unset: every draw records on the spine) and
+    // APS5_DRAW_CHUNK_DRAWS (32): the most draws one chunk holds.
+    static std::size_t DrawRecordThreads();
+    static std::size_t ChunkDraws();
+    // The most chunks of the open batch the recorder threads have not finished; JoinChunk waits for
+    // the oldest before it opens one more.
+    static constexpr std::size_t MaxChunksInFlight = 16;
+    // Set on a recorder thread: Active() refuses it (record halves must not reach the recorder).
+    static bool& RecordingOffLock();
+    struct ChunkCounters {
+        std::uint64_t chunks = 0;
+        std::uint64_t draws = 0;
+        std::uint64_t maxInFlight = 0;
+        std::uint64_t failedChunks = 0;
+    };
+    ChunkCounters ChunkTotals() const { return chunkTotals; }
+    // How often Commands() handed out the spine's command buffer: a chunked draw whose keep recorded
+    // commands (a depth store-back, say) seals its chunk, so no later draw runs before them.
+    std::uint64_t CommandRequests() const { return commandRequests; }
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     // `stale`, when given, says whether a miss found an entry whose guest bytes changed since.
@@ -755,6 +808,13 @@ private:
             std::uint64_t end;
         };
         std::vector<KeyStore> keyStores;
+        // The batch's command buffers before its last (`commands`), in order: the spine's own ended
+        // ones and the chunks (see JoinChunk), each chunk with its recorder thread.
+        struct Part {
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            std::shared_ptr<RecordedChunk> chunk;
+        };
+        std::vector<Part> parts;
     };
     struct LabelEntry {
         std::uint32_t value;
@@ -924,6 +984,19 @@ private:
     std::chrono::steady_clock::time_point newestSubmittedAt{};
     // The draw snapshot caches, the arena and the record calls of draws recorded on the mutex holder.
     std::unique_ptr<RecordingContext> mainContext;
+    // Chunked recording (see JoinChunk): the recorder threads, the chunk draws join and its thread,
+    // the keep scope's flag, a recorder thread's latched failure, the spine command buffers of
+    // finished batches' parts, and the counters.
+    std::unique_ptr<DrawRecorders> recorders;
+    bool recordersMade = false;
+    std::shared_ptr<RecordedChunk> joinable;
+    std::size_t joinableThread = 0;
+    bool keepingChunk = false;
+    std::exception_ptr chunkFailure;
+    std::vector<VkCommandBuffer> spareParts;
+    ChunkCounters chunkTotals;
+    std::uint64_t commandRequests = 0;
+    void waitChunks(Batch& batch) noexcept;
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;
 };
@@ -939,6 +1012,17 @@ public:
     RecordingContext(const Context& context, Recorder& owner);
     RecordingContext(const RecordingContext&) = delete;
     RecordingContext& operator=(const RecordingContext&) = delete;
+    // A recorder thread's context (DrawRecorders, `chunked`): the record calls go into the chunk
+    // between BeginChunk and LeaveChunk instead of the owner's open batch, with a render pass state
+    // of their own (a chunk starts with no pass open, behind a full barrier, and ends its last pass
+    // behind one); the keeps go to the chunk, and the timing and sample calls do nothing (chunks are
+    // only recorded without GPU timing, sample counting and barrier validation).
+    RecordingContext(const Context& context, Recorder& owner, bool chunked);
+    void BeginChunk(RecordedChunk& chunk, VkCommandBuffer commands);
+    // Ends the chunk's open pass (its trailing barrier); LeaveChunk then forgets the chunk.
+    void EndChunk();
+    void LeaveChunk();
+    bool Chunked() const { return chunked; }
     using SnapshotUse = Recorder::SnapshotUse;
     using DrawInputOutcome = Recorder::DrawInputOutcome;
 
@@ -999,6 +1083,15 @@ private:
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    void endChunkPass();
+    bool chunked = false;
+    RecordedChunk* chunk = nullptr;
+    VkCommandBuffer chunkCommands = VK_NULL_HANDLE;
+    struct ChunkPass {
+        bool open = false;
+        std::uint64_t key = 0;
+    } chunkPass;
+    PassHazards chunkHazards;
 
     Context context;
     Recorder& owner;

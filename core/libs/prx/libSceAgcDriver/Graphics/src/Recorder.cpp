@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -1121,6 +1122,9 @@ Recorder::~Recorder() {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     holdKept.clear();
+    // Every chunk was submitted and completed with its batch: the recorder threads stop (their
+    // command pools go with them).
+    recorders.reset();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
@@ -1175,6 +1179,8 @@ Recorder::~Recorder() {
         context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     }
     spare.clear();
+    for (auto commands : spareParts) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
+    spareParts.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
     sparePools.clear();
     // Sync() above waited for every batch, so no submission still signals the timeline.
@@ -1213,6 +1219,8 @@ void Recorder::CountRecordedWork() {
 }
 
 Recorder* Recorder::Active() {
+    // A record half reaches no recorder: what it needs of the batch went through the spine.
+    Require(!RecordingOffLock(), "Recorder::Active on a draw recorder thread");
     return activeRecorder;
 }
 
@@ -1362,6 +1370,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    ++commandRequests;
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1513,6 +1522,8 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    // Whatever the spine records next follows the open chunk's draws: no later draw joins it.
+    if (joinable != nullptr && !keepingChunk) SealChunk();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -2891,20 +2902,241 @@ void RecordingContext::KeepHighestIndex(std::uint64_t address, std::size_t bytes
     }
 }
 
-RecordingContext::RecordingContext(const Context& context, Recorder& owner) : context(context), owner(owner) {}
+RecordingContext::RecordingContext(const Context& context, Recorder& owner) : RecordingContext(context, owner, false) {}
 
-Recorder::DrawPassStart RecordingContext::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) { return owner.StartDrawPass(key, forced, fenced, access); }
-void RecordingContext::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) { owner.LeaveRenderPassOpen(key, timing, fenced, access, std::move(afterPass)); }
-void RecordingContext::Keep(std::shared_ptr<void> object, std::size_t bytes) { owner.Keep(std::move(object), bytes); }
-void RecordingContext::KeepBytes(const void* keeper, std::size_t bytes) { owner.KeepBytes(keeper, bytes); }
-void RecordingContext::PrepareSampleSlot() { owner.PrepareSampleSlot(); }
-std::uint32_t RecordingContext::BeginGpuTiming(Recorder::CommandClass which) { return owner.BeginGpuTiming(which); }
-void RecordingContext::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) { owner.EndGpuTiming(index, bytes); }
-void RecordingContext::BeginPassTiming(const Recorder::PassTarget& target, const Recorder::PassSample& sample) { owner.BeginPassTiming(target, sample); }
-void RecordingContext::CountPassDraw(std::uint8_t fragmentFlags) { owner.CountPassDraw(fragmentFlags); }
-void RecordingContext::NoteAccess(Recorder::CommandClass which, const Recorder::Access& access) { owner.NoteAccess(which, access); }
-std::uint64_t RecordingContext::OpenSerial() const { return owner.OpenSerial(); }
-bool RecordingContext::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const { return owner.PendingWriteOverlaps(address, bytes); }
+RecordingContext::RecordingContext(const Context& context, Recorder& owner, bool chunked) : context(context), owner(owner), chunked(chunked) {}
+
+void RecordingContext::BeginChunk(RecordedChunk& next, VkCommandBuffer commands) {
+    Require(chunked && chunk == nullptr, "a chunk begins on a recorder thread's idle context");
+    chunk = &next;
+    chunkCommands = commands;
+    chunkPass = {};
+    chunkHazards.Clear();
+}
+
+void RecordingContext::endChunkPass() {
+    EndRenderPass(context, chunkCommands);
+    // As Recorder::endOpenRenderPass: the pass's writes are visible to what follows (the next
+    // pass of the chunk, or the spine's commands after it).
+    const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(chunkCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    Recorder::CountBarriers(Recorder::CommandClass::Draw);
+    chunkPass = {};
+}
+
+void RecordingContext::EndChunk() {
+    Require(chunk != nullptr, "no chunk is being recorded");
+    if (chunkPass.open) endChunkPass();
+}
+
+void RecordingContext::LeaveChunk() {
+    chunk = nullptr;
+    chunkCommands = VK_NULL_HANDLE;
+    chunkPass = {};
+}
+
+Recorder::DrawPassStart RecordingContext::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) {
+    if (!chunked) return owner.StartDrawPass(key, forced, fenced, access);
+    Require(chunk != nullptr, "no chunk is being recorded");
+    // The spine's rule (Recorder::StartDrawPass) without barrier merging: a draw continues the
+    // chunk's pass of the same attachments when nothing it does conflicts with the pass's draws.
+    if (chunkPass.open && !forced && chunkPass.key == key && chunkHazards.Check(access, true) == PassHazard::None) return {chunkCommands, true, false};
+    if (chunkPass.open) endChunkPass();
+    chunkHazards.Clear();
+    chunkHazards.BeginPass();
+    return {chunkCommands, false, true};
+}
+
+void RecordingContext::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
+    if (!chunked) {
+        owner.LeaveRenderPassOpen(key, timing, fenced, access, std::move(afterPass));
+        return;
+    }
+    Require(chunk != nullptr && !afterPass, "a chunked draw leaves no work after its pass");
+    chunkPass.open = true;
+    chunkPass.key = key;
+    chunkHazards.Add(access);
+}
+
+void RecordingContext::Keep(std::shared_ptr<void> object, std::size_t bytes) {
+    if (!chunked) {
+        owner.Keep(std::move(object), bytes);
+        return;
+    }
+    chunk->kept.push_back(std::move(object));
+    chunk->bytes += bytes;
+}
+
+void RecordingContext::KeepBytes(const void* keeper, std::size_t bytes) {
+    if (!chunked) {
+        owner.KeepBytes(keeper, bytes);
+        return;
+    }
+    if (keeper != nullptr && bytes != 0) chunk->keptBytes.emplace_back(keeper, bytes);
+}
+
+void RecordingContext::PrepareSampleSlot() {
+    if (!chunked) owner.PrepareSampleSlot();
+}
+
+std::uint32_t RecordingContext::BeginGpuTiming(Recorder::CommandClass which) { return chunked ? Recorder::NoTiming : owner.BeginGpuTiming(which); }
+
+void RecordingContext::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
+    if (!chunked) owner.EndGpuTiming(index, bytes);
+}
+
+void RecordingContext::BeginPassTiming(const Recorder::PassTarget& target, const Recorder::PassSample& sample) {
+    if (!chunked) owner.BeginPassTiming(target, sample);
+}
+
+void RecordingContext::CountPassDraw(std::uint8_t fragmentFlags) {
+    if (!chunked) owner.CountPassDraw(fragmentFlags);
+}
+
+void RecordingContext::NoteAccess(Recorder::CommandClass which, const Recorder::Access& access) {
+    if (!chunked) owner.NoteAccess(which, access);
+}
+
+std::uint64_t RecordingContext::OpenSerial() const { return chunked ? 0 : owner.OpenSerial(); }
+
+bool RecordingContext::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
+    // A chunked draw's are taken on the spine (ShaderResources::PendingSnapshotWrites).
+    Require(!chunked, "a recorder thread cannot ask the recorder's pending writes");
+    return owner.PendingWriteOverlaps(address, bytes);
+}
+
+bool& Recorder::RecordingOffLock() {
+    thread_local bool offLock = false;
+    return offLock;
+}
+
+std::size_t Recorder::DrawRecordThreads() {
+    static const std::size_t threads = [] {
+        const char* text = std::getenv("APS5_DRAW_RECORD_THREADS");
+        if (text == nullptr) return std::size_t{0};
+        // One recorder thread at most for now: several need the recorder's shared scratch made
+        // per draw (DrawBindings) first.
+        return std::min<std::size_t>(std::strtoull(text, nullptr, 10), 1);
+    }();
+    return threads;
+}
+
+std::size_t Recorder::ChunkDraws() {
+    static const std::size_t draws = [] {
+        const char* text = std::getenv("APS5_DRAW_CHUNK_DRAWS");
+        constexpr std::size_t defaultDraws = 32;
+        return text != nullptr ? std::max<std::size_t>(std::strtoull(text, nullptr, 10), 1) : defaultDraws;
+    }();
+    return draws;
+}
+
+DrawRecorders* Recorder::Recorders() {
+    if (!recordersMade) {
+        recordersMade = true;
+        // Chunks hold no timing or sample queries: the batch-wide ranges and sample slots stay on
+        // the spine's command buffers, so either profile records every draw there.
+        if (DrawRecordThreads() != 0 && !GpuTimingEnabled() && !BatchStampsEnabled()) recorders = std::make_unique<DrawRecorders>(context, *this, DrawRecordThreads());
+    }
+    // Sample counting starts on demand (the sample dump's first query): every draw from then on
+    // records on the spine.
+    return countingSamples ? nullptr : recorders.get();
+}
+
+void Recorder::SealChunk() {
+    if (joinable == nullptr) return;
+    auto chunk = std::move(joinable);
+    joinable.reset();
+    chunk->sealed = true;
+    recorders->Seal(joinableThread, chunk);
+}
+
+Recorder::ChunkJoin Recorder::JoinChunk() {
+    if (chunkFailure != nullptr) std::rethrow_exception(chunkFailure);
+    if (open != nullptr) {
+        for (const auto& part : open->parts) {
+            if (part.chunk == nullptr || !part.chunk->done.load(std::memory_order_acquire) || part.chunk->failure == nullptr) continue;
+            // Latched: every later chunked draw fails too, until the device is replaced.
+            chunkFailure = part.chunk->failure;
+            ++chunkTotals.failedChunks;
+            std::rethrow_exception(chunkFailure);
+        }
+    }
+    const ChunkKeepScope scope(*this);
+    ensureOpen();
+    if (joinable != nullptr && joinable->draws < ChunkDraws()) {
+        ++joinable->draws;
+        ++chunkTotals.draws;
+        return {joinable, joinableThread, false};
+    }
+    SealChunk();
+    // At most MaxChunksInFlight unfinished chunks per batch: the oldest is waited for first.
+    std::size_t unfinished = 0;
+    for (const auto& part : open->parts) {
+        if (part.chunk != nullptr && !part.chunk->done.load(std::memory_order_acquire)) ++unfinished;
+    }
+    if (unfinished >= MaxChunksInFlight) {
+        for (const auto& part : open->parts) {
+            if (part.chunk != nullptr && !part.chunk->done.load(std::memory_order_acquire)) {
+                DrawRecorders::Wait(*part.chunk);
+                --unfinished;
+                break;
+            }
+        }
+    }
+    chunkTotals.maxInFlight = std::max<std::uint64_t>(chunkTotals.maxInFlight, unfinished + 1);
+    // The spine's commands so far end here, behind the trailing barrier of their open pass (the
+    // chunk's leading barrier covers the rest); what the spine records later goes into a fresh
+    // command buffer after the chunk.
+    if (open->renderPass.open) endOpenRenderPass();
+    if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    VkCommandBuffer next = VK_NULL_HANDLE;
+    if (!spareParts.empty()) {
+        next = spareParts.back();
+        spareParts.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.commandPool = context.pool;
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &next), "vkAllocateCommandBuffers recorder part");
+    }
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    const auto ended = function(endCommandBuffer, "vkEndCommandBuffer")(open->commands);
+    if (ended != VK_SUCCESS) {
+        spareParts.push_back(next);
+        Check(ended, "vkEndCommandBuffer recorder part");
+    }
+    open->parts.push_back({open->commands, nullptr});
+    open->commands = next;
+    Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(open->commands, &begin), "vkBeginCommandBuffer recorder part");
+    auto chunk = std::make_shared<RecordedChunk>();
+    chunk->draws = 1;
+    open->parts.push_back({VK_NULL_HANDLE, chunk});
+    // The chunk's passes end behind a full barrier, and the host read barrier is owed for them.
+    open->coveredAccess = 0;
+    open->hostReadOwed = true;
+    open->passHazards.Clear();
+    joinable = chunk;
+    joinableThread = recorders->Assign();
+    ++chunkTotals.chunks;
+    ++chunkTotals.draws;
+    return {chunk, joinableThread, true};
+}
+
+void Recorder::waitChunks(Batch& batch) noexcept {
+    if (joinable != nullptr && std::any_of(batch.parts.begin(), batch.parts.end(), [&](const Batch::Part& part) { return part.chunk == joinable; })) {
+        try {
+            SealChunk();
+        } catch (...) {
+            // The recorder thread's queue refused the seal (out of memory): it can never finish.
+            std::terminate();
+        }
+    }
+    for (const auto& part : batch.parts) {
+        if (part.chunk != nullptr) DrawRecorders::Wait(*part.chunk);
+    }
+}
 
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) { return mainContext->UnwrittenDrawSnapshot(address, bytes, stamp); }
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) { mainContext->NoteUnwrittenDrawSnapshot(address, bytes, stamp, std::move(buffer)); }
@@ -3522,6 +3754,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    SealChunk();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -3554,9 +3787,38 @@ void Recorder::Submit() {
         }
     } discardUnsubmitted{*this, batch};
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    // The batch's earlier command buffers (JoinChunk), in order: the spine's, and each chunk once
+    // its recorder thread finished it, with its kept objects; a failed chunk's commands are left
+    // out (its failure is latched for the next JoinChunk, which fails the draw commit).
+    std::vector<VkCommandBuffer> submitted;
+    if (!batch->parts.empty()) {
+        waitChunks(*batch);
+        for (const auto& part : batch->parts) {
+            if (part.chunk == nullptr) {
+                submitted.push_back(part.commands);
+                continue;
+            }
+            auto& chunk = *part.chunk;
+            batch->kept.insert(batch->kept.end(), std::make_move_iterator(chunk.kept.begin()), std::make_move_iterator(chunk.kept.end()));
+            chunk.kept.clear();
+            batch->keptBytes += chunk.bytes;
+            for (const auto& [keeper, bytes] : chunk.keptBytes) {
+                if (batch->keptOwners.insert(keeper).second) batch->keptBytes += bytes;
+            }
+            if (chunk.failure != nullptr) {
+                if (chunkFailure == nullptr) {
+                    chunkFailure = chunk.failure;
+                    ++chunkTotals.failedChunks;
+                }
+                continue;
+            }
+            if (chunk.commands != VK_NULL_HANDLE) submitted.push_back(chunk.commands);
+        }
+    }
+    if (!submitted.empty()) submitted.push_back(batch->commands);
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    submission.commandBufferCount = submitted.empty() ? 1 : static_cast<std::uint32_t>(submitted.size());
+    submission.pCommandBuffers = submitted.empty() ? &batch->commands : submitted.data();
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     CaptureTrace::Log("submit batch=%llu reads=%zu writes=%zu", static_cast<unsigned long long>(serial), batch->reads.size(), batch->writes.size());
@@ -4108,6 +4370,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    waitChunks(*batch);
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
@@ -4134,6 +4397,24 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    // The batch's earlier command buffers (JoinChunk): the spine's back to the spare parts, each
+    // chunk's (finished: Submit or discard waited for it) back to its recorder thread.
+    for (auto& part : batch.parts) {
+        if (part.chunk == nullptr) {
+            if (spareParts.size() < 64) {
+                try {
+                    spareParts.push_back(part.commands);
+                    continue;
+                } catch (...) {
+                }
+            }
+            context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &part.commands);
+            continue;
+        }
+        if (part.chunk->commands != VK_NULL_HANDLE && part.chunk->recycle) part.chunk->recycle(part.chunk->commands);
+        part.chunk->commands = VK_NULL_HANDLE;
+    }
+    batch.parts.clear();
     if (batch.queries != VK_NULL_HANDLE) {
         if (sparePools.size() < 64) {
             try {

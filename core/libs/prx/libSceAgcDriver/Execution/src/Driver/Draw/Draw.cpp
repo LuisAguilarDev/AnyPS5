@@ -384,7 +384,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto ranges = drawWriteRanges(graphics, boundStages);
             writeBound.emplace(ranges.begin(), ranges.end());
         }
-        auto pooledDraw = std::make_shared<Pooled>(Pooled{localDevice, decode, pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, stageData, patchedStages, dataEntry, poolLookup, stageEntries, entry, relocatedDecode, poolLookup ? std::move(userPatches) : std::vector<DrawUserPatch>{}, drawIdentity, vsOutControl});
+        auto pooledDraw = std::make_shared<Pooled>(Pooled{std::move(localDevice), std::move(decode), pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, std::move(stageData), patchedStages, std::move(dataEntry), poolLookup, stageEntries, std::move(entry), relocatedDecode, poolLookup ? std::move(userPatches) : std::vector<DrawUserPatch>{}, drawIdentity, vsOutControl});
         const Submission* pooledSubmission = &submission;
         DrawPrepPool::Get().Submit([this, pooledDraw, pooledSubmission](std::uint64_t seq) {
             auto& pool = DrawPrepPool::Get();

@@ -27,6 +27,15 @@ std::size_t DrawPrepPool::Threads() {
     return threads;
 }
 
+std::size_t DrawPrepPool::Depth() {
+    static const std::size_t depth = [] {
+        const char* text = std::getenv("APS5_DRAW_PREP_DEPTH");
+        const auto value = text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{0};
+        return value != 0 ? value : Threads() * 3;
+    }();
+    return depth;
+}
+
 bool DrawPrepPool::InPoolThread() {
     return poolThread;
 }
@@ -66,7 +75,7 @@ DrawPrepPool& DrawPrepPool::Get() {
 
 DrawPrepPool::DrawPrepPool() {
     const auto count = Threads();
-    maxInFlight = count * 3;
+    maxInFlight = Depth();
     for (std::size_t i = 0; i < count; ++i) threads.emplace_back([this] { run(); });
     for (auto& thread : threads) thread.detach();
 }
@@ -248,7 +257,7 @@ void DrawPrepPool::report() {
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
-    std::fprintf(stderr, "[prep-pool] 10 s: %llu jobs on %zu threads, avg %.1f in flight; front waited for all %llu times (%.0f ms), for room %.0f ms; turn waits %.0f ms; redos %llu, front-read conflicts %llu, skipped %llu; write-bound checks %llu, waits avoided %llu; bounds refined %llu once compiled / %llu at their turn, waits for writers %llu (%.0f ms); draw-cache lookups %llu (%.0f ms)\n", static_cast<unsigned long long>(jobs), threads.size(), jobs != 0 ? static_cast<double>(inFlightSum) / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(waitAlls), waitAllNs / 1e6, submitWaitNs / 1e6, turnWaitNs / 1e6, static_cast<unsigned long long>(redos.exchange(0)), static_cast<unsigned long long>(frontReadConflicts.exchange(0)), static_cast<unsigned long long>(skips.exchange(0)), static_cast<unsigned long long>(boundedChecks.exchange(0)), static_cast<unsigned long long>(waitsAvoided.exchange(0)), static_cast<unsigned long long>(refinedEarly), static_cast<unsigned long long>(refinedAtTurn), static_cast<unsigned long long>(writerWaits), writerWaitNs / 1e6, static_cast<unsigned long long>(lookups.exchange(0)), static_cast<double>(lookupNs.exchange(0)) / 1e6);
+    std::fprintf(stderr, "[prep-pool] 10 s: %llu jobs on %zu threads (depth %zu), avg %.1f in flight; front waited for all %llu times (%.0f ms), for room %.0f ms; turn waits %.0f ms; redos %llu, front-read conflicts %llu, skipped %llu; write-bound checks %llu, waits avoided %llu; bounds refined %llu once compiled / %llu at their turn, waits for writers %llu (%.0f ms); draw-cache lookups %llu (%.0f ms)\n", static_cast<unsigned long long>(jobs), threads.size(), maxInFlight, jobs != 0 ? static_cast<double>(inFlightSum) / static_cast<double>(jobs) : 0.0, static_cast<unsigned long long>(waitAlls), waitAllNs / 1e6, submitWaitNs / 1e6, turnWaitNs / 1e6, static_cast<unsigned long long>(redos.exchange(0)), static_cast<unsigned long long>(frontReadConflicts.exchange(0)), static_cast<unsigned long long>(skips.exchange(0)), static_cast<unsigned long long>(boundedChecks.exchange(0)), static_cast<unsigned long long>(waitsAvoided.exchange(0)), static_cast<unsigned long long>(refinedEarly), static_cast<unsigned long long>(refinedAtTurn), static_cast<unsigned long long>(writerWaits), writerWaitNs / 1e6, static_cast<unsigned long long>(lookups.exchange(0)), static_cast<double>(lookupNs.exchange(0)) / 1e6);
     jobs = 0;
     refinedEarly = 0;
     refinedAtTurn = 0;

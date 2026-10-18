@@ -24,6 +24,8 @@ public:
 
     static DrawPrepPool& Get();
     static std::size_t Threads();
+    // Jobs submitted but not yet published before Submit waits for room: APS5_DRAW_PREP_DEPTH, else 3 per thread.
+    static std::size_t Depth();
     static bool InPoolThread();
     static void ExemptThisThread();
     static double ThreadWaitedMs();

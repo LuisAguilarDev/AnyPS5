@@ -70,6 +70,77 @@ bool Driver::drawForwardedWords() {
     return enabled;
 }
 
+bool Driver::drawBufferBaseWords() {
+    static const bool enabled = drawRebaseEnabled() && std::getenv("APS5_NO_DRAW_BUFFER_BASE_WORDS") == nullptr;
+    return enabled;
+}
+
+// A user word the walk read only as the base of inline buffer descriptors (V# dword 0) can move
+// without a capture when every GuestBuffers slot of those buffers holds its value and the value
+// appears nowhere else in the result: the copy then writes the new base into those slots.
+void Driver::tagBufferBaseWords(DispatchVariant& variant, const ShaderRecompiler::SrtUserDataUse& use, std::span<const std::uint32_t> userData, std::uint32_t hiddenWords) {
+    variant.bufferBaseCandidates = use.asBufferBase;
+    variant.bufferBaseWords = 0;
+    variant.bufferBaseSlots.clear();
+    if (!drawBufferBaseWords() || hiddenWords != 0 || use.asBufferBase == 0 || variant.compiled == nullptr) return;
+    const auto& compiled = *variant.compiled;
+    const auto fetchWords = variant.vertexInfo == nullptr ? std::uint64_t{0} : fetchTableWords(*variant.vertexInfo);
+    std::vector<std::array<std::uint32_t, 3>> slots;
+    std::uint64_t kept = 0;
+    for (auto bits = use.asBufferBase & ~fetchWords; bits != 0; bits &= bits - 1) {
+        const auto index = static_cast<std::uint32_t>(std::countr_zero(bits));
+        if (index >= userData.size() || userData[index] == 0) continue;
+        bool exact = true;
+        const auto first = slots.size();
+        for (const auto& [word, buffer] : use.bufferBases) {
+            if (word != index) continue;
+            std::size_t found = 0;
+            for (const auto& slot : compiled.bufferBaseSlots) {
+                if (slot[0] != buffer) continue;
+                ++found;
+                if (slot[1] >= compiled.bindings.size() || compiled.bindings[slot[1]].role != ShaderRecompiler::DescriptorRole::GuestBuffers || slot[2] >= compiled.bindings[slot[1]].guestDescriptor.size() || compiled.bindings[slot[1]].guestDescriptor[slot[2]] != userData[index]) exact = false;
+                else slots.push_back({index, slot[1], slot[2]});
+            }
+            if (found == 0) exact = false;
+        }
+        if (!exact || slots.size() == first) {
+            slots.resize(first);
+            continue;
+        }
+        kept |= std::uint64_t {1} << index;
+    }
+    const auto held = [&](std::uint32_t binding, std::uint32_t at) { return std::any_of(slots.begin(), slots.end(), [&](const std::array<std::uint32_t, 3>& slot) { return slot[1] == binding && slot[2] == at; }); };
+    const auto forwardedAs = [&](std::size_t at, std::uint32_t index) { return at < compiled.shaderDataUserWords.size() && compiled.shaderDataUserWords[at] == index; };
+    for (auto bits = kept; bits != 0; bits &= bits - 1) {
+        const auto index = static_cast<std::uint32_t>(std::countr_zero(bits));
+        const auto value = userData[index];
+        bool unique = std::none_of(compiled.specialization.begin(), compiled.specialization.end(), [&](const ShaderRecompiler::PipelineSpecializationConstant& constant) { return constant.value == value; });
+        for (std::uint32_t binding = 0; unique && binding < compiled.bindings.size(); ++binding) {
+            const auto& words = compiled.bindings[binding].guestDescriptor;
+            const bool shaderData = compiled.bindings[binding].role == ShaderRecompiler::DescriptorRole::ShaderData;
+            for (std::uint32_t at = 0; unique && at < words.size(); ++at) unique = words[at] != value || held(binding, at) || (shaderData && forwardedAs(at, index));
+        }
+        for (std::size_t at = 0; unique && (at + 1) * sizeof(std::uint32_t) <= compiled.pushConstants.size(); ++at) {
+            std::uint32_t word = 0;
+            std::memcpy(&word, compiled.pushConstants.data() + at * sizeof(std::uint32_t), sizeof(word));
+            unique = word != value || forwardedAs(at, index);
+        }
+        if (!unique) kept &= ~(std::uint64_t {1} << index);
+    }
+    variant.bufferBaseWords = kept;
+    for (const auto& slot : slots) {
+        if ((kept >> slot[0] & 1u) != 0) variant.bufferBaseSlots.push_back(slot);
+    }
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchBufferBaseWords(const DispatchVariant& variant, std::uint64_t words, std::span<const std::uint32_t> userData) {
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    for (const auto& [word, binding, at] : variant.bufferBaseSlots) {
+        if ((words >> word & 1u) != 0 && word < userData.size()) patched->bindings[binding].guestDescriptor[at] = userData[word];
+    }
+    return patched;
+}
+
 std::uint64_t Driver::fetchTableWords(const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo) {
     std::uint64_t words = 0;
     for (const auto reg : {static_cast<std::uint32_t>(vertexInfo.fetchAttribReg), static_cast<std::uint32_t>(vertexInfo.fetchBufferReg)}) words |= reg + 1u < 64u ? std::uint64_t{3} << reg : ~std::uint64_t{0};
@@ -88,6 +159,7 @@ DrawRefusedWord Driver::refusedWordRole(const DispatchVariant& variant, std::uin
     if ((fetchWords & bit) != 0) return DrawRefusedWord::Fetch;
     const bool base = (variant.baseWords & bit) != 0, value = variant.valueWords != ~std::uint64_t{0} && (variant.valueWords & bit) != 0;
     if (base && value) return DrawRefusedWord::BaseAndValue;
+    if (value && (variant.bufferBaseCandidates & bit) != 0) return DrawRefusedWord::BufferBase;
     if (value) return DrawRefusedWord::Value;
     if (base) return DrawRefusedWord::BaseDropped;
     if ((variant.compiled->userDataRegisterReads & bit) != 0 || hiddenWords != 0) return DrawRefusedWord::Forwarded;
@@ -332,6 +404,9 @@ std::shared_ptr<DispatchVariant> Driver::copyVariant(const DispatchVariant& vari
     copy->userDataMask = variant.userDataMask;
     copy->baseWords = variant.baseWords;
     copy->valueWords = variant.valueWords;
+    copy->bufferBaseCandidates = variant.bufferBaseCandidates;
+    copy->bufferBaseWords = variant.bufferBaseWords;
+    copy->bufferBaseSlots = variant.bufferBaseSlots;
     copy->vertexInfo = variant.vertexInfo;
     return copy;
 }

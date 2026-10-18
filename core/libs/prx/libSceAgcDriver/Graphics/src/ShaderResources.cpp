@@ -118,10 +118,11 @@ struct CachedTexture {
     // The untrackedKey the snapshot was last read or compared equal at, for a surface outside the
     // write watch; zero when none was taken.
     std::array<std::uint64_t, 4> untracked{};
+    LruStamp recency;
 };
 
-// Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
-// eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
+// Entries in use order (front = most recent, restored by OrderLruBack before an eviction, see LruStamp)
+// with a hash index by key: a lookup is O(1) and the eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
 // still kept), the linear lookup of before.
 struct TextureCache {
     std::mutex mutex;
@@ -224,9 +225,9 @@ void dropUncachedViews(TextureCache& cache) {
     }
 }
 
-// Moves an entry to the front (most recently used).
+// Marks an entry the most recently used.
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
-    cache.entries.splice(cache.entries.begin(), cache.entries, it);
+    TouchLru(cache.entries, it);
     it->present = Recorder::Presents();
 }
 
@@ -244,6 +245,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
     const bool firstUse = incoming != 0 && present != 0 && !cache.firstUses.contains(key);
     const auto ceiling = budget + budget / 4u;
     while (!cache.entries.empty() && cache.bytes + incoming > budget) {
+        OrderLruBack(cache.entries);
         const auto back = std::prev(cache.entries.end());
         if (firstUse && back->present + 1u >= present) {
             cache.firstUses.insert(key);
@@ -253,7 +255,7 @@ bool admitTexture(TextureCache& cache, const TextureKey& key, std::uint64_t inco
         const bool over = cache.bytes + incoming > ceiling;
         const bool keep = back->accounted == 0 || (!over && back->texture.use_count() > 1);
         if (keep && cache.passed < cache.entries.size()) {
-            cache.entries.splice(cache.entries.begin(), cache.entries, back);
+            PromoteLru(cache.entries, back);
             ++cache.passed;
             ++cache.counts.passed;
         } else if (keep && !over) {
@@ -808,6 +810,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     ++cache.counts.inserted;
     logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
     cache.entries.push_front(std::move(entry));
+    PlacedFrontLru(cache.entries);
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
     reportCacheCounts(cache, budget);
@@ -835,6 +838,7 @@ struct CachedStorageTexture {
     std::uint32_t mip;
     std::shared_ptr<StorageTexture> texture;
     std::uint64_t accounted = 0;
+    LruStamp recency;
 };
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
@@ -965,7 +969,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         }
         if (it != cache.entries.end()) {
             it->texture->Refresh();
-            cache.entries.splice(cache.entries.begin(), cache.entries, it);
+            TouchLru(cache.entries, it);
             texture = it->texture;
             counters.storageHits.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
@@ -977,10 +981,14 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
             const auto budget = storageBudget(context);
-            while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+            while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) {
+                OrderLruBack(cache.entries);
+                evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+            }
             cache.bytes += entry.accounted;
             texture = entry.texture;
             cache.entries.push_front(std::move(entry));
+            PlacedFrontLru(cache.entries);
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
             texture->SetCached(true);
@@ -1114,7 +1122,7 @@ bool StorageImageCached(const Context& context, const StorageTexture* image) {
     std::lock_guard lock(cache.mutex);
     const auto it = findStorageByImage(cache, context.device, image);
     if (it == cache.entries.end()) return false;
-    cache.entries.splice(cache.entries.begin(), cache.entries, it);
+    TouchLru(cache.entries, it);
     return true;
 }
 
@@ -1128,7 +1136,7 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
     for (const auto* image : images) {
         const auto it = findStorageByImage(cache, context.device, image);
         if (it == cache.entries.end()) return false;
-        cache.entries.splice(cache.entries.begin(), cache.entries, it);
+        TouchLru(cache.entries, it);
     }
     return true;
 }
@@ -3147,8 +3155,8 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
         noteMiss(key);
         return nullptr;
     }
-    entries.splice(entries.begin(), entries, found->second);
-    return found->second->second;
+    TouchLru(entries, found->second);
+    return found->second->resources;
 }
 
 namespace {
@@ -3272,11 +3280,12 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
     std::lock_guard lock(mutex);
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
-        if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
+        if (evicted != nullptr) evicted->push_back(std::move(found->second->resources));
         entries.erase(found->second);
         index.erase(found);
     }
-    entries.emplace_front(key, std::move(resources));
+    entries.push_front({key, std::move(resources), {}});
+    PlacedFrontLru(entries);
     index.emplace(key, entries.begin());
     static const std::size_t capacity = [] {
         const char* value = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
@@ -3284,22 +3293,24 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
     while (entries.size() > capacity) {
-        if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
-        index.erase(entries.back().first);
+        OrderLruBack(entries);
+        if (evicted != nullptr) evicted->push_back(std::move(entries.back().resources));
+        index.erase(entries.back().key);
         entries.pop_back();
     }
-    if (entries.front().second->TableElements() == 0) return;
+    if (entries.front().resources->TableElements() == 0) return;
     std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
+    for (const auto& entry : entries) tables += entry.resources->TableElements();
+    if (tables > TableElementBudget()) OrderLru(entries);
     for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
-        const auto elements = it->second->TableElements();
+        const auto elements = it->resources->TableElements();
         if (elements == 0) {
             --it;
             continue;
         }
         tables -= elements;
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
+        if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        index.erase(it->key);
         it = std::prev(entries.erase(it));
     }
 }
@@ -3308,7 +3319,7 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
     std::lock_guard lock(mutex);
     if (object != nullptr) {
         const auto found = index.find(key);
-        if (found == index.end() || found->second->second.get() != object) return;
+        if (found == index.end() || found->second->resources.get() != object) return;
     }
     erase(key);
 }
@@ -3316,12 +3327,12 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     std::lock_guard lock(mutex);
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->second->ReadsImage(image)) {
+        if (!it->resources->ReadsImage(image)) {
             ++it;
             continue;
         }
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
+        if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        index.erase(it->key);
         it = entries.erase(it);
     }
 }
@@ -3331,7 +3342,7 @@ bool ResourceCache::Touch(const Key& key) {
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) return false;
-    entries.splice(entries.begin(), entries, found->second);
+    TouchLru(entries, found->second);
     return true;
 }
 
@@ -3366,7 +3377,7 @@ std::uint64_t ResourceCache::TableElementBudget() {
 std::uint64_t ResourceCache::TableElements() const {
     std::lock_guard lock(mutex);
     std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
+    for (const auto& entry : entries) tables += entry.resources->TableElements();
     return tables;
 }
 
@@ -4583,14 +4594,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 fill(*buffer);
             } else {
                 constexpr std::size_t MovedWordBufferSlots = 8;
-                const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
-                copied = held == movedWordBuffers.end();
-                if (!copied) {
-                    buffer = held->buffer;
-                } else {
+                {
+                    std::lock_guard lock(movedWordMutex);
+                    const auto held = std::find_if(movedWordBuffers.begin(), movedWordBuffers.end(), [&](const MovedWordBuffer& entry) { return entry.allocation == index && entry.size == override->size && entry.words == override->words; });
+                    if (held != movedWordBuffers.end()) buffer = held->buffer;
+                }
+                copied = buffer == nullptr;
+                if (copied) {
+                    // Two threads missing the same words both insert them; the ring then holds the
+                    // words twice until one entry is replaced.
                     buffer = DrawInputBuffer(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
                     fill(*buffer);
                     MovedWordBuffer entry{index, override->words, override->size, buffer};
+                    std::lock_guard lock(movedWordMutex);
                     if (movedWordBuffers.size() < MovedWordBufferSlots) movedWordBuffers.push_back(std::move(entry));
                     else movedWordBuffers[movedWordBufferNext++ % MovedWordBufferSlots] = std::move(entry);
                 }

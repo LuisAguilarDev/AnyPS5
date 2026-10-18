@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -75,6 +76,7 @@ void DrawPrepPool::run() {
         return layout.hybrid ? layout.efficient : std::uint64_t{0};
     }();
     if (mask != 0) CpuTopology::PinTraced("draw prep", nullptr, mask);
+    TagLockRole(LockRole::Prep);
     for (;;) {
         Task task;
         {

@@ -189,6 +189,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/LockProfile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -319,6 +320,7 @@ if(BUILD_TESTING)
     add_test_executable(agc_driver_draw_prep_pool_bounds_tests
             tests/DrawPrepPoolBounds.cpp
             Execution/src/Driver/Draw/DrawPrepPool.cpp
+            Execution/src/LockProfile.cpp
     )
     target_include_directories(agc_driver_draw_prep_pool_bounds_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_driver_draw_prep_pool_bounds_tests PRIVATE libc)
@@ -513,6 +515,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockProfile.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -537,6 +540,7 @@ configure_windows_unwind(agc_shared_write_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockProfile.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -1792,6 +1796,9 @@ if(BUILD_TESTING)
     # Several recorder threads sharing one cached template (the multi-threaded draw translation).
     add_test(NAME agc_driver_shared_template_scratch COMMAND agc_driver_graphics_tests --shared-template-scratch)
     set_tests_properties(agc_driver_shared_template_scratch PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    # Chunks recorded on one and on three recorder threads hold the same commands.
+    add_test(NAME agc_driver_chunk_determinism COMMAND agc_driver_graphics_tests --chunk-determinism)
+    set_tests_properties(agc_driver_chunk_determinism PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
     add_test(NAME agc_driver_lru_stamps COMMAND agc_driver_graphics_tests --lru-stamps)
     add_test(NAME agc_driver_lru_stamps_spliced COMMAND agc_driver_graphics_tests --lru-stamps)
     set_tests_properties(agc_driver_lru_stamps PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
@@ -1801,7 +1808,7 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_pm4_failure_inline COMMAND agc_driver_pm4_tests failure)
     set_tests_properties(agc_driver_pm4_failure_inline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_pm4_failure agc_driver_pm4_failure_inline agc_descriptor_pool_reset_failure agc_driver_address_space_teardown agc_driver_shared_template_scratch agc_driver_lru_stamps agc_driver_lru_stamps_spliced agc_driver_draw_copied_writers PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_pm4_failure agc_driver_pm4_failure_inline agc_descriptor_pool_reset_failure agc_driver_address_space_teardown agc_driver_shared_template_scratch agc_driver_chunk_determinism agc_driver_lru_stamps agc_driver_lru_stamps_spliced agc_driver_draw_copied_writers PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(NOT WIN32)

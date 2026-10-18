@@ -40,6 +40,7 @@
 #include <unordered_set>
 #include <utility>
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -3179,9 +3180,23 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
+namespace {
+
+MutexProfile& descriptorCacheProfile() {
+    static MutexProfile profile("descriptor cache");
+    return profile;
+}
+
+MutexProfile& resourceCacheProfile() {
+    static MutexProfile profile("resource cache");
+    return profile;
+}
+
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     const auto found = index.find(key);
     if (found == index.end()) {
         noteMiss(key);
@@ -3309,7 +3324,7 @@ void ResourceCache::noteMiss(const Key& key) {
 }
 
 void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     if (!resources->HasCachedStorageImages()) return;
     if (const auto found = index.find(key); found != index.end()) {
         if (evicted != nullptr) evicted->push_back(std::move(found->second->resources));
@@ -3348,7 +3363,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     if (object != nullptr) {
         const auto found = index.find(key);
         if (found == index.end() || found->second->resources.get() != object) return;
@@ -3357,7 +3372,7 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 }
 
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     for (auto it = entries.begin(); it != entries.end();) {
         if (!it->resources->ReadsImage(image)) {
             ++it;
@@ -3371,7 +3386,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
 
 bool ResourceCache::Touch(const Key& key) {
     resourceCacheTouches.fetch_add(1, std::memory_order_relaxed);
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     const auto found = index.find(key);
     if (found == index.end()) return false;
     TouchLru(entries, found->second);
@@ -3387,13 +3402,13 @@ std::uint64_t ResourceCache::Touches() {
 }
 
 void ResourceCache::Clear() {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     index.clear();
     entries.clear();
 }
 
 std::size_t ResourceCache::Size() const {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     return entries.size();
 }
 
@@ -3407,7 +3422,7 @@ std::uint64_t ResourceCache::TableElementBudget() {
 }
 
 std::uint64_t ResourceCache::TableElements() const {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, resourceCacheProfile());
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.resources->TableElements();
     return tables;
@@ -3441,7 +3456,7 @@ VkDescriptorSetLayout DescriptorCache::Layout(std::span<const std::uint32_t> key
         flags = defaults;
     }
     Require(flags.size() == bindings.size(), "descriptor binding flag count differs from layout");
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, descriptorCacheProfile());
     std::vector<std::uint32_t> keyCopy(key.begin(), key.end());
     keyCopy.push_back(static_cast<std::uint32_t>(flags.size()));
     keyCopy.insert(keyCopy.end(), flags.begin(), flags.end());
@@ -3481,7 +3496,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         const auto capacity = std::find_if(ChainPoolSizes.begin(), ChainPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
         if (capacity == ChainPoolSizes.end() || size.descriptorCount > capacity->descriptorCount) fits = false;
     }
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, descriptorCacheProfile());
     const auto allocate = context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets");
     const std::uint32_t variable = variableCount.value_or(0u);
     VkDescriptorSetVariableDescriptorCountAllocateInfoEXT variableInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO_EXT};
@@ -3540,7 +3555,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount, bool* reused) {
     {
-        std::lock_guard lock(mutex);
+        ProfiledLock lock(mutex, descriptorCacheProfile());
         if (const auto found = recycled.find(layout); found != recycled.end() && !found->second.empty()) {
             const auto allocation = found->second.back();
             found->second.pop_back();
@@ -3555,7 +3570,7 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSe
 void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
     {
-        std::lock_guard lock(mutex);
+        ProfiledLock lock(mutex, descriptorCacheProfile());
         try {
             auto& list = recycled[layout];
             if (list.size() < 4096) {
@@ -3570,7 +3585,7 @@ void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation&
 
 void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
     if (allocation.set == VK_NULL_HANDLE || allocation.pool == VK_NULL_HANDLE) return;
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, descriptorCacheProfile());
     if (const auto found = std::find(dedicated.begin(), dedicated.end(), allocation.pool); found != dedicated.end()) {
         dedicated.erase(found);
         destroyPool(context.device, allocation.pool, nullptr);
@@ -3586,7 +3601,7 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
 }
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
-    std::lock_guard lock(mutex);
+    ProfiledLock lock(mutex, descriptorCacheProfile());
     return stats;
 }
 

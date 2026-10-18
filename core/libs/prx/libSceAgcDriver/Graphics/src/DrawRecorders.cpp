@@ -1,8 +1,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +17,10 @@ namespace {
 std::atomic<std::uint64_t> failAtDraw{0};
 std::atomic<std::uint64_t> recordedDraws{0};
 
+std::int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 }
 
 void DrawRecorders::FailAtDraw(std::uint64_t n) {
@@ -20,7 +28,7 @@ void DrawRecorders::FailAtDraw(std::uint64_t n) {
     failAtDraw.store(n, std::memory_order_relaxed);
 }
 
-DrawRecorders::DrawRecorders(const Context& context, Recorder& owner, std::size_t threads) : context(context), owner(owner) {
+DrawRecorders::DrawRecorders(const Context& context, Recorder& owner, std::size_t threads) : context(context), owner(owner), lastReport(nowNs()) {
     Require(threads != 0, "draw recorders need a thread");
     for (std::size_t index = 0; index < threads; ++index) {
         auto worker = std::make_unique<Worker>();
@@ -141,31 +149,89 @@ void DrawRecorders::finish(Worker& worker, RecordedChunk& chunk) noexcept {
     chunk.done.notify_all();
 }
 
+bool DrawRecorders::Profiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+void DrawRecorders::report() {
+    constexpr std::int64_t window = 10'000'000'000;
+    const auto now = nowNs();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (now - last < window || !lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    // [record] thread N and [record] balance over the window: the busy split into the bindings
+    // (PrepareDrawBindings) and the rest of the record half, and every chunk's first pass begun
+    // because of the chunk boundary.
+    const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    double maxBusy = 0;
+    double sumBusy = 0;
+    for (std::size_t index = 0; index < workers.size(); ++index) {
+        auto& worker = *workers[index];
+        const auto chunks = worker.chunks.exchange(0, std::memory_order_relaxed);
+        const auto draws = worker.draws.exchange(0, std::memory_order_relaxed);
+        const auto busy = ms(worker.busyNs.exchange(0, std::memory_order_relaxed));
+        const auto idle = ms(worker.idleNs.exchange(0, std::memory_order_relaxed));
+        const auto bindings = ms(worker.bindingsNs.exchange(0, std::memory_order_relaxed));
+        const auto commands = ms(worker.commandsNs.exchange(0, std::memory_order_relaxed));
+        const auto fresh = worker.freshSets.exchange(0, std::memory_order_relaxed);
+        const auto passes = worker.passesBegun.exchange(0, std::memory_order_relaxed);
+        maxBusy = std::max(maxBusy, busy);
+        sumBusy += busy;
+        std::fprintf(stderr, "[record] thread %zu over 10 s: %llu chunks, %llu draws (%.1f per chunk), busy %.1f ms (bindings %.1f, commands %.1f), idle %.1f ms, %llu fresh descriptor sets, %llu passes begun (%llu at a chunk boundary)\n", index, static_cast<unsigned long long>(chunks), static_cast<unsigned long long>(draws), chunks != 0 ? static_cast<double>(draws) / static_cast<double>(chunks) : 0.0, busy, bindings, commands, idle, static_cast<unsigned long long>(fresh), static_cast<unsigned long long>(passes), static_cast<unsigned long long>(chunks));
+    }
+    const auto meanBusy = sumBusy / static_cast<double>(workers.size());
+    std::fprintf(stderr, "[record] balance over 10 s: %zu threads, max busy %.1f ms / mean busy %.1f ms = %.2f\n", workers.size(), maxBusy, meanBusy, meanBusy > 0 ? maxBusy / meanBusy : 0.0);
+}
+
 void DrawRecorders::run(Worker& worker) {
-    CpuTopology::PinHelperThread("draw recorder");
+    // The recorder threads take the performance cores of a hybrid CPU unless the mask names others.
+    static const std::uint64_t mask = [] {
+        const auto named = CpuTopology::MaskFromEnvironment("APS5_DRAW_RECORD_AFFINITY_MASK");
+        if (named != 0) return named;
+        const auto& layout = CpuTopology::Get();
+        return layout.hybrid ? layout.performant : std::uint64_t{0};
+    }();
+    if (mask != 0) CpuTopology::PinTraced("draw recorder", nullptr, mask);
     Recorder::RecordingOffLock() = true;
+    TagLockRole(LockRole::Recorder);
+    const bool profiled = Profiled();
     for (;;) {
         Item item;
         {
             std::unique_lock lock(worker.mutex);
+            const auto idleStart = profiled ? nowNs() : 0;
             worker.wake.wait(lock, [&] { return worker.stopping || !worker.items.empty(); });
+            if (profiled) worker.idleNs.fetch_add(static_cast<std::uint64_t>(nowNs() - idleStart), std::memory_order_relaxed);
             if (worker.items.empty()) return;
             item = std::move(worker.items.front());
             worker.items.pop_front();
         }
         worker.room.notify_one();
+        const auto busyStart = profiled ? nowNs() : 0;
         auto& chunk = *item.chunk;
         if (item.seal) {
             finish(worker, chunk);
-            continue;
+            if (profiled) worker.chunks.fetch_add(1, std::memory_order_relaxed);
+        } else if (chunk.failure == nullptr) {
+            DrawStats stats;
+            try {
+                if (chunk.commands == VK_NULL_HANDLE) begin(worker, chunk);
+                if (const auto failAt = failAtDraw.load(std::memory_order_relaxed); failAt != 0 && recordedDraws.fetch_add(1, std::memory_order_relaxed) + 1 == failAt) throw std::runtime_error("draw recorder test failure");
+                item.work(*worker.recording, stats);
+            } catch (...) {
+                chunk.failure = std::current_exception();
+            }
+            if (profiled) {
+                worker.draws.fetch_add(1, std::memory_order_relaxed);
+                worker.bindingsNs.fetch_add(static_cast<std::uint64_t>(stats.bindingsUs * 1000.0), std::memory_order_relaxed);
+                worker.commandsNs.fetch_add(static_cast<std::uint64_t>(stats.commandsUs * 1000.0), std::memory_order_relaxed);
+                worker.freshSets.fetch_add(stats.freshSets, std::memory_order_relaxed);
+                if (stats.passBegun) worker.passesBegun.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        if (chunk.failure != nullptr) continue;
-        try {
-            if (chunk.commands == VK_NULL_HANDLE) begin(worker, chunk);
-            if (const auto failAt = failAtDraw.load(std::memory_order_relaxed); failAt != 0 && recordedDraws.fetch_add(1, std::memory_order_relaxed) + 1 == failAt) throw std::runtime_error("draw recorder test failure");
-            item.work(*worker.recording);
-        } catch (...) {
-            chunk.failure = std::current_exception();
+        if (profiled) {
+            worker.busyNs.fetch_add(static_cast<std::uint64_t>(nowNs() - busyStart), std::memory_order_relaxed);
+            report();
         }
     }
 }

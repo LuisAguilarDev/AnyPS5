@@ -2383,10 +2383,14 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         const auto requests = recorder.CommandRequests();
         keepRecordedDraw(recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), nullptr, {}, record.listed, record.completion, outcome);
         timer.phase(PhaseKeep);
-        recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording) {
-            DrawTimer unprofiled(false);
+        recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording, DrawRecorders::DrawStats& stats) {
+            DrawTimer timer(DrawRecorders::Profiled());
             DrawOutcome unreported;
-            static_cast<void>(recordDrawHalf(half->context, recording, half->state, half->draw, {}, half->inputs, half->record, half->passKey, half->readsTarget, false, &half->pendingWrites, half->pass, unreported, unprofiled));
+            static_cast<void>(recordDrawHalf(half->context, recording, half->state, half->draw, {}, half->inputs, half->record, half->passKey, half->readsTarget, false, &half->pendingWrites, half->pass, unreported, timer));
+            if (!timer.profile) return;
+            for (std::size_t part = 0; part < RecordPartCount; ++part) (part == RecordBindings ? stats.bindingsUs : stats.commandsUs) += timer.split.us[part];
+            stats.freshSets = timer.split.bindings.freshSets;
+            stats.passBegun = unreported.passBegun;
         });
         if (recorder.CommandRequests() != requests) recorder.SealChunk();
     }

@@ -206,10 +206,18 @@ public:
         Recorder& recorder;
         bool previous;
     };
-    // APS5_DRAW_RECORD_THREADS (0 when unset: every draw records on the spine) and
-    // APS5_DRAW_CHUNK_DRAWS (32): the most draws one chunk holds.
+    // APS5_DRAW_RECORD_THREADS (0 when unset: every draw records on the spine; a count up to
+    // MaxDrawRecordThreads, or `auto` for DrawRecordThreadsFor's formula; 1 whenever
+    // OneRecordingStream) and APS5_DRAW_CHUNK_DRAWS (32): the most draws one chunk holds.
     static std::size_t DrawRecordThreads();
     static std::size_t ChunkDraws();
+    static constexpr std::size_t MaxDrawRecordThreads = 16;
+    // The recorder threads for `usable` processors with `reserved` of them left to the guest: the
+    // rest less the packet thread and the spine, 1 to MaxDrawRecordThreads.
+    static std::size_t DrawRecordThreadsFor(unsigned usable, unsigned reserved);
+    // A debug or verify switch that compares or captures draws on one stream is set
+    // (APS5_VERIFY_*, APS5_CAPTURE_*, APS5_DUMP_*, APS5_LOCKED_DRAW_PREPARE): one recorder thread.
+    static bool OneRecordingStream();
     // The most chunks of the open batch the recorder threads have not finished; JoinChunk waits for
     // the oldest before it opens one more.
     static constexpr std::size_t MaxChunksInFlight = 16;

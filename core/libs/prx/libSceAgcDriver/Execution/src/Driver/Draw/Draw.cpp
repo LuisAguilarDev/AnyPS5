@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -14,6 +15,15 @@
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+MutexProfile& drawCacheProfile() {
+    static MutexProfile profile("draw cache");
+    return profile;
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -86,7 +96,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            std::lock_guard cacheLock(drawCacheMutex);
+            ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
             learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
@@ -97,7 +107,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
         }
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
-        std::unique_lock cacheLock(drawCacheMutex);
+        ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
@@ -147,7 +157,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
-        std::lock_guard cacheLock(drawCacheMutex);
+        ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
         eraseDrawEntry(drawKey, entry);
         ++drawEntryCounters.absent;
         entry = nullptr;
@@ -278,7 +288,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     const auto relocatedDecode = decode;
     if (!userPatches.empty()) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             ++drawRelocationTrials[drawIdentity].hits;
@@ -309,7 +319,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (matched[i] != nullptr && verifyDrawRecipe() && (vertexInfos[i].has_value() != (matched[i]->vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *matched[i]->vertexInfo)))) {
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit has a vertex stage info unlike its variant's\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
-                std::lock_guard cacheLock(drawCacheMutex);
+                ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
                 ++drawEntryCounters.verifyDecodeMismatches;
             }
         }
@@ -646,11 +656,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (stageDataVerified != 0) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
         drawEntryCounters.stageDataVerified += stageDataVerified;
     }
     if (dataEntry != nullptr) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        ProfiledLock cacheLock(drawCacheMutex, drawCacheProfile());
         drawEntryCounters.dataStagesReused += dataStagesReused;
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         if (dataStagesReused != 0 && dataStagesCompiled == 0) ++drawEntryCounters.dataDrawsReused;

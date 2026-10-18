@@ -184,8 +184,8 @@ public:
     // seals the open chunk; Submit seals it, waits for every chunk of the batch, adds their kept
     // objects and submits all command buffers in order. A recorder thread's failure is rethrown by
     // the next JoinChunk (the spine's draw commit fails, which stops the committer); Submit leaves a
-    // failed chunk's commands out. Null threads: APS5_DRAW_RECORD_THREADS unset or 0, GPU timing,
-    // batch stamps or sample counting on.
+    // failed chunk's commands out. Null threads: APS5_DRAW_RECORD_THREADS unset or 0, GPU timing
+    // or sample counting on (the batch stamps of APS5_PROFILE_DRAW stay on the spine's buffers).
     struct ChunkJoin {
         std::shared_ptr<RecordedChunk> chunk;
         std::size_t thread = 0;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1026,16 +1027,14 @@ WriteTracker& Tracker() {
     return tracker;
 }
 
-// Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
-// ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
-    std::unique_lock lock(tracker.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        trackerWaits.fetch_add(1, std::memory_order_relaxed);
-        lock.lock();
-    }
+// Takes the tracker mutex; under the lock profile (APS5_PROFILE_DRAW) an acquisition that found it
+// held is counted ('tracker waits N / M' in [guestmem]), which says whether walking outside the
+// lock would pay, and the [lock] mutex line splits its waits and holds by thread role.
+ProfiledLock<std::mutex> lockTracker(WriteTracker& tracker) {
+    static MutexProfile profile("tracker");
+    ProfiledLock lock(tracker.mutex, profile);
+    if (!LockProfileEnabled()) return lock;
+    if (lock.waited()) trackerWaits.fetch_add(1, std::memory_order_relaxed);
     trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     return lock;
 }

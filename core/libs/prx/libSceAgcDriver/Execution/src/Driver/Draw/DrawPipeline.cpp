@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -134,6 +135,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     DrawPrepPool::ExemptThisThread();
     PinWorkerThread("draw committer");
+    TagLockRole(LockRole::Spine);
     for (;;) {
         Commit* commit = nullptr;
         CommitKind kind = CommitKind::Other;

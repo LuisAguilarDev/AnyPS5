@@ -45,11 +45,22 @@ struct RecordedChunk {
 // The recorder threads (APS5_DRAW_RECORD_THREADS) of one recorder: each records the chunks given
 // to it, in order, through a recording context of its own (its draw snapshot arena and caches)
 // into command buffers from a command pool of its own, and never takes GuestMemory::GpuMutex, so
-// the spine may wait for it while holding the mutex. Work is queued per thread with a bounded
-// depth (the spine waits for room); a chunk's draws and its seal go to the same thread.
+// the spine may wait for it while holding the mutex. Each thread runs on the cores of
+// APS5_DRAW_RECORD_AFFINITY_MASK (a hex mask; unset: the performance cores of a hybrid CPU, else
+// anywhere). Work is queued per thread with a bounded depth (the spine waits for room); a chunk's
+// draws and its seal go to the same thread.
 class DrawRecorders {
 public:
-    using Work = std::function<void(RecordingContext&)>;
+    // What a record half reports for the [record] lines (APS5_PROFILE_DRAW).
+    struct DrawStats {
+        double bindingsUs = 0;
+        double commandsUs = 0;
+        std::uint64_t freshSets = 0;
+        bool passBegun = false;
+    };
+    using Work = std::function<void(RecordingContext&, DrawStats&)>;
+    // APS5_PROFILE_DRAW: a recorder thread fills DrawStats and the [record] lines are printed.
+    static bool Profiled();
     DrawRecorders(const Context& context, Recorder& owner, std::size_t threads);
     ~DrawRecorders();
     DrawRecorders(const DrawRecorders&) = delete;
@@ -85,17 +96,28 @@ private:
         std::vector<VkCommandBuffer> returned;
         std::vector<VkCommandBuffer> free;
         std::thread thread;
+        // The [record] counters since the last report (nanoseconds for the times).
+        std::atomic<std::uint64_t> chunks{0};
+        std::atomic<std::uint64_t> draws{0};
+        std::atomic<std::uint64_t> busyNs{0};
+        std::atomic<std::uint64_t> idleNs{0};
+        std::atomic<std::uint64_t> bindingsNs{0};
+        std::atomic<std::uint64_t> commandsNs{0};
+        std::atomic<std::uint64_t> freshSets{0};
+        std::atomic<std::uint64_t> passesBegun{0};
     };
     void run(Worker& worker);
     void begin(Worker& worker, RecordedChunk& chunk);
     void finish(Worker& worker, RecordedChunk& chunk) noexcept;
     void push(Worker& worker, Item item);
+    void report();
 
     Context context;
     Recorder& owner;
     std::vector<std::unique_ptr<Worker>> workers;
     std::size_t next = 0;
     std::atomic<std::size_t> maxQueued{0};
+    std::atomic<std::int64_t> lastReport;
 };
 
 }

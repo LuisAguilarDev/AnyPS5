@@ -4,6 +4,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -31,12 +32,26 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <string_view>
 #include <tuple>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
+
+#ifndef _WIN32
+extern char** environ;
+#endif
 
 namespace AgcDriver::Graphics {
 
 namespace {
+
+// The process environment (OneRecordingStream scans it for debug switch prefixes).
+char** ProcessEnvironment() {
+#ifdef _WIN32
+    return _environ;
+#else
+    return environ;
+#endif
+}
 
 Recorder* activeRecorder = nullptr;
 
@@ -3010,13 +3025,40 @@ bool& Recorder::RecordingOffLock() {
     return offLock;
 }
 
+std::size_t Recorder::DrawRecordThreadsFor(unsigned usable, unsigned reserved) {
+    // The packet thread and the spine run serially beside the recorders.
+    constexpr long serial = 2;
+    return static_cast<std::size_t>(std::clamp<long>(static_cast<long>(usable) - static_cast<long>(reserved) - serial, 1, static_cast<long>(MaxDrawRecordThreads)));
+}
+
+bool Recorder::OneRecordingStream() {
+    static const bool one = [] {
+        // Debug and verify switches compare or capture draws in program order on one stream.
+        if (std::getenv("APS5_LOCKED_DRAW_PREPARE") != nullptr) return true;
+        for (char** entry = ProcessEnvironment(); entry != nullptr && *entry != nullptr; ++entry) {
+            const std::string_view variable(*entry);
+            for (const std::string_view prefix : {"APS5_VERIFY_", "APS5_CAPTURE_", "APS5_DUMP_"}) {
+                if (variable.starts_with(prefix)) return true;
+            }
+        }
+        return false;
+    }();
+    return one;
+}
+
 std::size_t Recorder::DrawRecordThreads() {
     static const std::size_t threads = [] {
         const char* text = std::getenv("APS5_DRAW_RECORD_THREADS");
         if (text == nullptr) return std::size_t{0};
-        // One recorder thread at most for now: several need the recorder's shared scratch made
-        // per draw (DrawBindings) first.
-        return std::min<std::size_t>(std::strtoull(text, nullptr, 10), 1);
+        std::size_t requested = 0;
+        if (std::string_view(text) == "auto") {
+            // The static formula: a third of the usable processors, at most 4, stay for the guest.
+            const auto usable = UsableProcessors();
+            requested = DrawRecordThreadsFor(usable, std::min(4u, usable / 3u));
+        } else {
+            requested = std::min<std::size_t>(std::strtoull(text, nullptr, 10), MaxDrawRecordThreads);
+        }
+        return requested != 0 && OneRecordingStream() ? std::size_t{1} : requested;
     }();
     return threads;
 }
@@ -3033,9 +3075,11 @@ std::size_t Recorder::ChunkDraws() {
 DrawRecorders* Recorder::Recorders() {
     if (!recordersMade) {
         recordersMade = true;
-        // Chunks hold no timing or sample queries: the batch-wide ranges and sample slots stay on
-        // the spine's command buffers, so either profile records every draw there.
-        if (DrawRecordThreads() != 0 && !GpuTimingEnabled() && !BatchStampsEnabled()) recorders = std::make_unique<DrawRecorders>(context, *this, DrawRecordThreads());
+        // Chunks hold no timing or sample queries. GPU timing ranges every draw on the spine; the
+        // batch stamps (APS5_PROFILE_DRAW, the performance trace) stay on the spine's command
+        // buffers: the batch's first one opens the range before any chunk and its last one, which
+        // follows every chunk in submit order (JoinChunk starts a fresh one), closes it.
+        if (DrawRecordThreads() != 0 && !GpuTimingEnabled()) recorders = std::make_unique<DrawRecorders>(context, *this, DrawRecordThreads());
     }
     // Sample counting starts on demand (the sample dump's first query): every draw from then on
     // records on the spine.

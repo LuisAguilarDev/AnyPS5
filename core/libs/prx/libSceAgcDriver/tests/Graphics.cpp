@@ -1,6 +1,7 @@
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
@@ -3555,6 +3556,10 @@ struct MockDescriptorWrite {
 struct MockVulkan {
     std::uint64_t next = 1;
     std::int64_t live = 0;
+    // The chunk determinism test logs what reaches each command buffer.
+    bool logCommands = false;
+    std::map<VkCommandBuffer, std::vector<std::string>> commandLog;
+    std::map<VkCommandPool, std::uint32_t> poolBuffers;
     std::map<VkBuffer, VkDeviceSize> bufferSizes;
     std::map<VkBuffer, VkBufferUsageFlags> bufferUsage;
     std::map<VkDeviceMemory, VkMemoryAllocateFlags> allocationFlags;
@@ -3840,13 +3845,25 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyPipeline(VkDevice, VkPipeline, const VkAll
     --mock.live;
 }
 
+void logCommand(VkCommandBuffer commands, std::string entry) {
+    if (mock.logCommands) mock.commandLog[commands].push_back(std::move(entry));
+}
+
 VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline pipeline) {
     mock.boundPipeline = pipeline;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t size, const void* values) {
+VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer commands, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t size, const void* values) {
     const auto* bytes = static_cast<const std::byte*>(values);
     mock.lastPushConstants.assign(bytes, bytes + size);
+    if (!mock.logCommands) return;
+    std::string entry = "push";
+    for (std::uint32_t at = 0; at + 4 <= size; at += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, bytes + at, 4);
+        entry += ' ' + std::to_string(word);
+    }
+    logCommand(commands, std::move(entry));
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
@@ -3862,10 +3879,28 @@ VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer,
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* commands) {
     for (std::uint32_t index = 0; index < info->commandBufferCount; ++index) commands[index] = makeHandle<VkCommandBuffer>();
     mock.live += info->commandBufferCount;
+    mock.poolBuffers[info->commandPool] += info->commandBufferCount;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool, std::uint32_t count, const VkCommandBuffer*) { mock.live -= count; }
+VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool pool, std::uint32_t count, const VkCommandBuffer*) {
+    mock.live -= count;
+    mock.poolBuffers[pool] -= count;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateCommandPool(VkDevice, const VkCommandPoolCreateInfo*, const VkAllocationCallbacks*, VkCommandPool* pool) {
+    *pool = makeHandle<VkCommandPool>();
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+// Destroying a pool frees the command buffers still allocated from it.
+VKAPI_ATTR void VKAPI_CALL mockDestroyCommandPool(VkDevice, VkCommandPool pool, const VkAllocationCallbacks*) {
+    mock.live -= 1 + static_cast<std::int64_t>(mock.poolBuffers[pool]);
+    mock.poolBuffers.erase(pool);
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdEndRenderPass(VkCommandBuffer commands) { logCommand(commands, "end pass"); }
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* fence) { *fence = makeHandle<VkFence>(); ++mock.live; return VK_SUCCESS; }
 VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence, const VkAllocationCallbacks*) { --mock.live; }
 VKAPI_ATTR VkResult VKAPI_CALL mockGetFenceStatus(VkDevice, VkFence) { return VK_SUCCESS; }
@@ -3874,7 +3909,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t, const 
 VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkCommandBufferBeginInfo*) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) { logCommand(commands, "barrier"); }
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
@@ -3910,6 +3945,9 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
     static const std::map<std::string_view, MockEntry> table{
         {"vkAllocateCommandBuffers", mockEntry<mockAllocateCommandBuffers>()},
         {"vkFreeCommandBuffers", mockEntry<mockFreeCommandBuffers>()},
+        {"vkCreateCommandPool", mockEntry<mockCreateCommandPool>()},
+        {"vkDestroyCommandPool", mockEntry<mockDestroyCommandPool>()},
+        {"vkCmdEndRenderPass", mockEntry<mockCmdEndRenderPass>()},
         {"vkCreateFence", mockEntry<mockCreateFence>()},
         {"vkDestroyFence", mockEntry<mockDestroyFence>()},
         {"vkGetFenceStatus", mockEntry<mockGetFenceStatus>()},
@@ -4552,6 +4590,91 @@ void drawCopiedWriterTests() {
     Require(wrong.load() == 0, "a draw copied writer snapshot changed under its reader or missed a listing");
     Require(AgcDriver::Graphics::DrawCopiedWriters()->empty(), "a delisted draw copied writer stayed listed");
     std::cout << "draw copied writers survive concurrent listing\n";
+}
+
+// Chunks recorded by one recorder thread and by three (DrawRecorders): each chunk's command buffer
+// must hold the same commands in the same order either way, its own draws in program order with
+// the same pass structure (a chunk starts without a pass, continues one while the key holds, and
+// ends its last pass behind the full barrier), whichever thread recorded it.
+std::vector<std::vector<std::string>> recordChunks(std::size_t threads) {
+    using AgcDriver::Graphics::DrawRecorders;
+    using AgcDriver::Graphics::PassAccess;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::RecordedChunk;
+    using AgcDriver::Graphics::RecordingContext;
+    mock = MockVulkan{};
+    mock.logCommands = true;
+    const auto context = mockContext();
+    constexpr std::uint32_t chunkCount = 48;
+    std::vector<std::vector<std::string>> logs;
+    {
+        Recorder recorder(context);
+        {
+            DrawRecorders recorders(context, recorder, threads);
+            std::vector<std::shared_ptr<RecordedChunk>> chunks;
+            for (std::uint32_t chunkIndex = 0; chunkIndex < chunkCount; ++chunkIndex) {
+                auto chunk = std::make_shared<RecordedChunk>();
+                const auto thread = recorders.Assign();
+                const std::uint32_t draws = 1 + chunkIndex % 7;
+                for (std::uint32_t draw = 0; draw < draws; ++draw) {
+                    recorders.Record(thread, chunk, [chunkIndex, draw](RecordingContext& recording, DrawRecorders::DrawStats&) {
+                        // Two pass keys per chunk, so a chunk both continues and ends passes.
+                        const std::uint64_t key = draw < 3 ? 1 : 2;
+                        const PassAccess access{};
+                        const auto start = recording.StartDrawPass(key, false, false, access);
+                        const std::array<std::uint32_t, 3> ids{chunkIndex, draw, start.continued ? 1u : 0u};
+                        SerializedMock<mockCmdPushConstants>::Call(start.commands, VK_NULL_HANDLE, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ids), ids.data());
+                        recording.LeaveRenderPassOpen(key, 0, false, access);
+                    });
+                }
+                recorders.Seal(thread, chunk);
+                chunks.push_back(std::move(chunk));
+            }
+            for (const auto& chunk : chunks) {
+                DrawRecorders::Wait(*chunk);
+                Require(chunk->failure == nullptr, "a recorder thread failed a chunk");
+                Require(chunk->commands != VK_NULL_HANDLE, "a chunk has no command buffer");
+                std::lock_guard lock(mockCallMutex);
+                logs.push_back(mock.commandLog[chunk->commands]);
+            }
+        }
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "chunk recording leaked Vulkan objects");
+    return logs;
+}
+
+void chunkDeterminismTests() {
+    // The static thread formula: usable less the reserved less the packet thread and the spine, 1 to 16.
+    using AgcDriver::Graphics::Recorder;
+    Require(Recorder::DrawRecordThreadsFor(16, 4) == 10, "16 processors with 4 reserved give 10 recorders");
+    Require(Recorder::DrawRecordThreadsFor(32, 4) == 16, "the recorder count stops at 16");
+    Require(Recorder::DrawRecordThreadsFor(6, 2) == 2, "6 processors with 2 reserved give 2 recorders");
+    Require(Recorder::DrawRecordThreadsFor(3, 1) == 1, "a small machine still gets one recorder");
+    serializeMock = true;
+    const auto serial = recordChunks(1);
+    const auto parallel = recordChunks(3);
+    serializeMock = false;
+    Require(serial.size() == parallel.size(), "the runs recorded different chunk counts");
+    for (std::size_t chunk = 0; chunk < serial.size(); ++chunk) {
+        Require(serial[chunk] == parallel[chunk], "chunk " + std::to_string(chunk) + " recorded different commands on three threads");
+        // Its own draws, in order, first on a fresh pass, then continuing until the key changes.
+        const std::uint32_t draws = 1 + static_cast<std::uint32_t>(chunk) % 7;
+        std::vector<std::string> expected;
+        for (std::uint32_t draw = 0; draw < draws; ++draw) {
+            if (draw == 3) {
+                expected.emplace_back("end pass");
+                expected.emplace_back("barrier");
+            }
+            const bool continued = draw != 0 && draw != 3;
+            expected.push_back("push " + std::to_string(chunk) + ' ' + std::to_string(draw) + ' ' + (continued ? '1' : '0'));
+        }
+        expected.emplace_back("end pass");
+        expected.emplace_back("barrier");
+        Require(serial[chunk] == expected, "chunk " + std::to_string(chunk) + " does not hold its draws in program order");
+    }
+    std::cout << "chunks record the same commands on one and on three recorder threads\n";
 }
 
 // The resource caches keep their use order with LruStamp (a hit stamps its entry, an eviction
@@ -8231,6 +8354,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lru-stamps") {
             lruStampTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunk-determinism") {
+            chunkDeterminismTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--shared-template-scratch") {

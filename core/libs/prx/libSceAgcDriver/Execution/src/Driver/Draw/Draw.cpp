@@ -15,6 +15,19 @@
 
 namespace AgcDriver::DriverDetail {
 
+namespace {
+
+// Takes PA_CL_VS_OUT_CNTL as a value, so a prep-pool job that runs the lookup decodes with the register
+// the packet thread read for its packet, not the one a later packet set.
+void decodeDrawVertexInfo(const DrawProgram& program, ShaderRecompiler::ProgramRole role, std::uint32_t vsOutControl, const Graphics::State& graphics, std::optional<ShaderRecompiler::ShaderVertexStageInfo>& info, std::vector<Graphics::DecodeRead>& reads) {
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment || role == ShaderRecompiler::ProgramRole::GeometryBack) return;
+    reads.clear();
+    info = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &reads, false, 8u - program.firstUserSgpr);
+    if (info) info->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, vsOutControl, program.tailContinuation.get()) | graphics.layerExports;
+}
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -236,13 +249,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos(programs.size());
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads(programs.size());
-    const auto decodeVertexInfo = [&](std::size_t i) {
-        const auto& program = programs[i];
-        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
-        decodeReads[i].clear();
-        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
-        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
-    };
+    const std::uint32_t vsOutControl = readRegister(queue.context, 0x207);
+    const auto decodeVertexInfo = [&](std::size_t i) { decodeDrawVertexInfo(programs[i], roles[i], vsOutControl, graphics, vertexInfos[i], decodeReads[i]); };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
@@ -272,12 +280,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     bool drawHit = false;
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+    static const bool prepPool = DrawPrepPool::Threads() != 0;
+    static const bool poolDataHits = std::getenv("APS5_POOL_DATA_HITS") != nullptr;
+    const bool poolEligible = prepPool && pipelined && !drawParameters.indirect && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !lockedPrepare && !verifyDrawDataHits() && !verifyDrawRecipe() && !traceCapSync();
+    // A draw the pool will take whatever the lookup finds leaves the lookup, its hit validation and
+    // what follows from them to the job (APS5_NO_POOL_LOOKUP=1 keeps them here). Without a data entry
+    // the lookup cannot produce data candidates, the only lookup outcome that keeps a draw off the pool.
+    const bool poolLookup = poolEligible && dataEntry == nullptr && DrawPrepPool::Lookup();
+    if (!poolLookup) lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
     for (auto& variant : matched) {
         if (variant != nullptr) applyShaderDataPatches(*variant);
     }
     const auto relocatedDecode = decode;
-    if (!userPatches.empty()) {
+    if (!poolLookup && !userPatches.empty()) {
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
@@ -285,7 +300,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
     }
-    if (!userPatches.empty() && !drawHit) {
+    if (!poolLookup && !userPatches.empty() && !drawHit) {
         auto current = std::make_shared<DrawDecode>(*decode);
         for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
         decode = std::move(current);
@@ -293,7 +308,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
     std::uint64_t stageDataVerified = 0;
 
-    if (registerKey) {
+    if (registerKey && !poolLookup) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (matched[i] != nullptr && drawHit && !verifyDrawRecipe()) {
@@ -316,7 +331,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
 
-    static const bool prepPool = DrawPrepPool::Threads() != 0;
     if (prepPool && pipelined) {
         static std::array<std::atomic<std::uint64_t>, 8> poolMiss{};
         static std::atomic<std::uint64_t> poolSeen{0};
@@ -324,8 +338,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         poolMiss[reason].fetch_add(1, std::memory_order_relaxed);
         if (poolSeen.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) std::fprintf(stderr, "[prep-pool-gate] eligible %llu, indirect %llu, labels %llu, dump %llu, locked %llu, data entry %llu, candidates %llu, verify %llu\n", static_cast<unsigned long long>(poolMiss[0].load()), static_cast<unsigned long long>(poolMiss[1].load()), static_cast<unsigned long long>(poolMiss[2].load()), static_cast<unsigned long long>(poolMiss[3].load()), static_cast<unsigned long long>(poolMiss[4].load()), static_cast<unsigned long long>(poolMiss[5].load()), static_cast<unsigned long long>(poolMiss[6].load()), static_cast<unsigned long long>(poolMiss[7].load()));
     }
-    static const bool poolDataHits = std::getenv("APS5_POOL_DATA_HITS") != nullptr;
-    if (prepPool && pipelined && !drawParameters.indirect && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !lockedPrepare && (dataEntry == nullptr || poolDataHits) && !verifyDrawDataHits() && !verifyDrawRecipe() && !traceCapSync() && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); })) {
+    if (poolEligible && (dataEntry == nullptr || poolDataHits) && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); })) {
         struct Pooled {
             std::shared_ptr<VulkanDevice> localDevice;
             std::shared_ptr<const DrawDecode> decode;
@@ -351,6 +364,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::vector<StageDataHit> stageData;
             bool patchedStages;
             std::shared_ptr<DrawEntry> dataEntry;
+            // The lookup moved into the job (APS5_NO_POOL_LOOKUP unset) and what it starts from: the
+            // entry and decode the register key found, the relocation patches, and PA_CL_VS_OUT_CNTL.
+            bool poolLookup;
+            bool lookupEntries;
+            std::shared_ptr<DrawEntry> lookupEntry;
+            std::shared_ptr<const DrawDecode> relocatedDecode;
+            std::vector<DrawUserPatch> userPatches;
+            std::uint64_t drawIdentity;
+            std::uint32_t vsOutControl;
         };
         std::optional<std::vector<DrawPrepPool::Range>> writeBound;
         if (drawHit && DrawPrepPool::WriteBounds()) {
@@ -362,15 +384,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto ranges = drawWriteRanges(graphics, boundStages);
             writeBound.emplace(ranges.begin(), ranges.end());
         }
-        auto pooledDraw = std::make_shared<Pooled>(Pooled{localDevice, decode, pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, stageData, patchedStages, dataEntry});
+        auto pooledDraw = std::make_shared<Pooled>(Pooled{localDevice, decode, pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, stageData, patchedStages, dataEntry, poolLookup, stageEntries, entry, relocatedDecode, poolLookup ? std::move(userPatches) : std::vector<DrawUserPatch>{}, drawIdentity, vsOutControl});
         const Submission* pooledSubmission = &submission;
         DrawPrepPool::Get().Submit([this, pooledDraw, pooledSubmission](std::uint64_t seq) {
             auto& pool = DrawPrepPool::Get();
             auto& P = *pooledDraw;
             DrawPipeline::FollowEpoch(P.epoch);
             GuestMemory::SetCurrentPacket(P.commitPacket, P.queueId);
-            const auto& graphics = P.decode->state;
-            const auto& roles = P.decode->roles;
+            const auto& graphics = P.relocatedDecode->state;
+            const auto& roles = P.relocatedDecode->roles;
             static const QueueState noQueue{};
             std::array<double, DrawDriverPhaseCount> quietMs{};
             auto quietLap = std::chrono::steady_clock::time_point{};
@@ -394,7 +416,51 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 std::uint64_t captures = 0;
             };
             auto work = std::make_unique<Work>();
+            // The packet thread's lookup, here. The guest cannot reuse what the validation reads before
+            // the label after this draw signals, and that label is a FIFO item enqueued only after this
+            // job (Enqueue waits for the pool). What an earlier job writes is caught by the redo at the
+            // turn, which repeats the lookup: its reads are the matched regions and the front reads.
+            const auto lookup = [&] {
+                const auto start = std::chrono::steady_clock::now();
+                const auto count = P.programs.size();
+                P.matched.assign(count, nullptr);
+                P.matchedRegions.assign(count, {});
+                P.stageData.assign(count, StageDataHit{});
+                P.drawHit = false;
+                P.verifyHit = false;
+                P.entry = P.lookupEntry;
+                P.decode = P.relocatedDecode;
+                if (P.registerKey) {
+                    P.vertexInfos.assign(count, std::nullopt);
+                    P.decodeReads.assign(count, {});
+                }
+                DrawDataCandidates candidates(count);
+                std::array<double, DrawDriverPhaseCount> lookupMs{};
+                auto lookupLap = start;
+                DrawPhaseTiming lookupTiming{profile, lookupMs, lookupLap};
+                lookupDraw(*pooledSubmission, P.localDevice, graphics, P.pixel, P.programs, roles, P.vertexInfos, P.lookupEntries, P.registerKey, profile, P.drawKey, P.entry, P.matched, P.matchedRegions, P.drawHit, P.verifyHit, lookupTiming, lookupMs, P.dataEntry, candidates, P.stageData);
+                for (auto& variant : P.matched) {
+                    if (variant != nullptr) applyShaderDataPatches(*variant);
+                }
+                if (!P.userPatches.empty() && !P.drawHit) {
+                    auto current = std::make_shared<DrawDecode>(*P.decode);
+                    for (const auto& patch : P.userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+                    P.decode = std::move(current);
+                }
+                P.patchedStages = std::any_of(P.stageData.begin(), P.stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
+                if (P.registerKey) {
+                    for (std::size_t i = 0; i < count; ++i) {
+                        if (P.matched[i] != nullptr && P.drawHit) {
+                            if (P.matched[i]->vertexInfo != nullptr) P.vertexInfos[i] = *P.matched[i]->vertexInfo;
+                            continue;
+                        }
+                        decodeDrawVertexInfo(P.programs[i], roles[i], P.vsOutControl, graphics, P.vertexInfos[i], P.decodeReads[i]);
+                    }
+                }
+                pool.NoteLookup(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+            };
             const auto attempt = [&](Work& w) {
+                if (P.poolLookup) lookup();
                 const auto count = P.programs.size();
                 w.pixel = P.pixel;
                 w.drawParameters = P.drawParameters;
@@ -453,22 +519,26 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             };
             const auto startMark = pool.Enqueued();
             bool ok = tryAttempt();
-            const bool refine = !P.drawHit && DrawPrepPool::RefinedBounds();
+            // A hit whose lookup ran here was submitted without a write bound, so it refines one like a miss.
+            const bool refine = (P.poolLookup || !P.drawHit) && DrawPrepPool::RefinedBounds();
             const auto refineBound = [&](std::uint64_t from, std::span<const DrawPrepPool::Range> reads) {
                 const auto ranges = drawWriteRanges(graphics, work->stages);
                 const std::vector<DrawPrepPool::Range> bound(ranges.begin(), ranges.end());
                 pool.Refine(seq, from, reads, bound);
             };
-            if (refine && ok && startMark < seq) {
+            const auto attemptReads = [&] {
                 std::vector<DrawPrepPool::Range> reads;
                 for (const auto& region : work->memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-                refineBound(startMark, reads);
-            }
+                if (!P.poolLookup) return reads;
+                for (const auto& stageReads : P.decodeReads) {
+                    for (const auto& read : stageReads) reads.emplace_back(read.address, read.address + read.bytes.size());
+                }
+                return reads;
+            };
+            if (refine && ok && startMark < seq) refineBound(startMark, attemptReads());
             pool.WaitTurn(seq);
             if (startMark < seq) {
-                std::vector<DrawPrepPool::Range> reads;
-                for (const auto& region : work->memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-                if (!ok || pool.WrittenBetween(startMark, seq, reads)) {
+                if (!ok || pool.WrittenBetween(startMark, seq, attemptReads())) {
                     pool.NoteRedo();
                     ok = tryAttempt();
                 }
@@ -477,6 +547,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     for (const auto& read : stageReads) frontReads.emplace_back(read.address, read.address + read.bytes.size());
                 }
                 if (!frontReads.empty() && pool.WrittenBetween(startMark, seq, frontReads)) pool.NoteFrontReadConflict();
+            }
+            // The relocation trial reads these hits on the packet thread; counting them in turn keeps
+            // them in packet order, a few draws later than the packet thread used to.
+            if (P.poolLookup && !P.userPatches.empty()) {
+                std::lock_guard cacheLock(drawCacheMutex);
+                if (P.drawHit || P.verifyHit) {
+                    ++drawRelocationCounters.hits;
+                    ++drawRelocationTrials[P.drawIdentity].hits;
+                }
+                if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
             }
             if (refine && ok) refineBound(seq, {});
             const auto skip = [&](const std::string& reason) {

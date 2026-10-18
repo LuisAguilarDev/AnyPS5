@@ -30,6 +30,7 @@ public:
     static bool WriteBounds();
     static bool VerifyWriteBounds();
     static bool RefinedBounds();
+    static bool Lookup();
 
     bool Pending() const { return submitted.load(std::memory_order_acquire) != turn.load(std::memory_order_acquire); }
     std::uint64_t Enqueued() const { return turn.load(std::memory_order_acquire); }
@@ -45,6 +46,12 @@ public:
     void NoteRedo() { redos.fetch_add(1, std::memory_order_relaxed); }
     void NoteFrontReadConflict() { frontReadConflicts.fetch_add(1, std::memory_order_relaxed); }
     void NoteSkip() { skips.fetch_add(1, std::memory_order_relaxed); }
+    void NoteLookup(std::uint64_t ns) {
+        lookups.fetch_add(1, std::memory_order_relaxed);
+        lookupNs.fetch_add(ns, std::memory_order_relaxed);
+        lookupsTotal.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::uint64_t Lookups() const { return lookupsTotal.load(std::memory_order_relaxed); }
 
 private:
     DrawPrepPool();
@@ -76,6 +83,9 @@ private:
     std::atomic<std::uint64_t> redos{0};
     std::atomic<std::uint64_t> frontReadConflicts{0};
     std::atomic<std::uint64_t> skips{0};
+    std::atomic<std::uint64_t> lookups{0};
+    std::atomic<std::uint64_t> lookupNs{0};
+    std::atomic<std::uint64_t> lookupsTotal{0};
     std::uint64_t jobs = 0;
     std::uint64_t waitAlls = 0;
     std::uint64_t waitAllNs = 0;

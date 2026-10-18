@@ -202,7 +202,7 @@ bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry&) {
 std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages) {
     std::shared_ptr<const std::vector<DrawRecipeRecord>> records;
     {
-        std::lock_guard cacheLock(drawCacheMutex);
+        std::shared_lock cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
         if (found == drawCache.end()) return nullptr;
         records = found->second->recipes.load();
@@ -217,7 +217,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
 void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
     std::shared_ptr<DrawEntry> entry;
     {
-        std::lock_guard cacheLock(drawCacheMutex);
+        std::shared_lock cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
         if (found == drawCache.end()) return;
         entry = found->second;

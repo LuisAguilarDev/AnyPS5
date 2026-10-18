@@ -29,7 +29,12 @@
 #include <utility>
 #include <vector>
 
-// Two thousand small draws in one DCB, every hundredth followed by a label (RELEASE_MEM and// WRITE_DATA in turn). With draws recorded in chunks of two this is a thousand chunks and twenty// sealing points: the submission must finish (ctest's TIMEOUT catches a hang), every label must// land, the target must hold the last draw, and the recorder's caps must hold (CheckCaps).
+// Two thousand small draws in one DCB, every hundredth followed by a DMA_DATA copy of the target's
+// first pixel into a snapshot slot and a label (RELEASE_MEM and WRITE_DATA in turn). With draws
+// recorded in chunks of two this is a thousand chunks and twenty sealing points: the submission
+// must finish (ctest's TIMEOUT catches a hang), every label must land, every snapshot must hold the
+// draw recorded just before it (a copy between chunks reads the chunk's output), the target the
+// last draw, and the recorder's caps must hold (CheckCaps).
 
 namespace {
 
@@ -51,6 +56,7 @@ constexpr std::size_t Block = 65536;
 constexpr std::size_t ColorBytes = Width * Height * 4;
 std::byte* ColorMemory = nullptr;
 alignas(256) volatile std::uint32_t SealLabels[Seals]{};
+alignas(256) std::array<std::uint32_t, Seals> Snapshots{};
 alignas(64) volatile std::uint32_t EndOfPipe = 0;
 
 std::byte* AllocateWatched(std::size_t bytes) {
@@ -173,6 +179,13 @@ void Draw(std::vector<std::uint32_t>& words, std::uint8_t value) {
 }
 
 
+// DMA_DATA memory to memory, the packet of PipelinedDma.
+void CopyData(std::vector<std::uint32_t>& words, const void* source, void* destination, std::uint32_t bytes) {
+    const auto from = reinterpret_cast<std::uintptr_t>(source);
+    const auto to = reinterpret_cast<std::uintptr_t>(destination);
+    words.insert(words.end(), {0xc0055000u, 0u, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(from >> 32u), static_cast<std::uint32_t>(to), static_cast<std::uint32_t>(to >> 32u), bytes});
+}
+
 void ReleaseLabel(std::vector<std::uint32_t>& words, volatile std::uint32_t* target, std::uint32_t value) {
     words.insert(words.end(), {0xc0064900u, 0x514u, (1u << 29u) | (2u << 24u), Low(target), High(target), value, 0u, 0u});
 }
@@ -197,6 +210,7 @@ std::uint32_t LabelValue(std::uint32_t round, std::uint32_t seal) {
 void Run(std::uint32_t round) {
     const auto name = "round " + std::to_string(round + 1);
     std::fill_n(ColorMemory, ColorBytes, std::byte{0});
+    Snapshots.fill(0xdeadbeefu);
     for (auto& label : SealLabels) label = 0;
     EndOfPipe = 0;
     std::vector<std::uint32_t> words;
@@ -206,6 +220,7 @@ void Run(std::uint32_t round) {
         Draw(words, ValueOf(draw));
         if (draw % DrawsPerSeal != 0) continue;
         const auto seal = draw / DrawsPerSeal - 1u;
+        CopyData(words, ColorMemory, &Snapshots[seal], 4u);
         if (seal % 2u == 0) {
             ReleaseLabel(words, &SealLabels[seal], LabelValue(round, seal));
         } else {
@@ -221,6 +236,12 @@ void Run(std::uint32_t round) {
     Require(EndOfPipe == 1u, name + ": the end-of-pipe label was not written");
     for (std::uint32_t seal = 0; seal < Seals; ++seal) {
         Require(SealLabels[seal] == LabelValue(round, seal), name + ": the label after draw " + std::to_string((seal + 1u) * DrawsPerSeal) + " holds " + std::to_string(SealLabels[seal]) + ", expected " + std::to_string(LabelValue(round, seal)));
+    }
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(Snapshots.data()), sizeof(Snapshots));
+    for (std::uint32_t seal = 0; seal < Seals; ++seal) {
+        const auto draw = (seal + 1u) * DrawsPerSeal;
+        const auto expected = PixelWord(ValueOf(draw));
+        Require(Snapshots[seal] == expected, name + ": the copy after draw " + std::to_string(draw) + " read " + std::to_string(Snapshots[seal]) + ", expected " + std::to_string(expected) + ", the pixel of that draw");
     }
     std::vector<std::byte> colors(ColorBytes);
     AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(ColorMemory), ColorBytes, nullptr, "test read-back");

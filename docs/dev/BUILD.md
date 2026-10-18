@@ -98,7 +98,7 @@ With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Roset
 
 ## Resource cache LRU stamps
 
-`agc_driver_graphics_tests --benchmark-lru-stamps` times resource cache hits and inserts at the default bound of 1024 entries on the mock device and prints one line; run it with and without `APS5_NO_LRU_STAMPS=1` (splice on every hit, the old way) for an A/B. It is not part of the suite. `agc_driver_lru_stamps` and `agc_driver_lru_stamps_spliced` check that both ways evict the same entries in the same order, and `agc_driver_shared_template_scratch` records draws of one cached template on four threads at once.
+`agc_driver_graphics_tests --benchmark-lru-stamps` times resource cache hits and inserts at the default bound of 1024 entries on the mock device and prints one line; run it with and without `APS5_NO_LRU_STAMPS=1` (splice on every hit, the old way) for an A/B. It is not part of the suite. `agc_driver_lru_stamps` and `agc_driver_lru_stamps_spliced` check that both ways evict the same entries in the same order, and `agc_driver_shared_template_scratch` records draws of one cached template on four threads at once. `agc_shared_template_proof` proves and marks one reused template on four threads without the GPU lock, under `APS5_VERIFY_TEMPLATE_USES=1` (a use that finds another thread inside one throws), and `agc_driver_draw_copied_writers` lists, delists and reads the draw copied-writer list on four threads.
 
 ## Tracy
 

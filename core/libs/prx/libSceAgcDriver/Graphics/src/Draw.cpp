@@ -917,10 +917,52 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
     return {groups, groups != 0 ? record.instances : 0u, groups != 0 ? 1u : 0u, effective, first};
 }
 
-std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters() {
-    // Never destroyed: a completion action of a batch still in flight at static teardown may erase from it.
-    static auto* const writers = new std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>>(std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>());
-    return *writers;
+namespace {
+
+// The published list (see DrawCopiedWriters): replaced, never changed, under the mutex.
+struct CopiedWriterRegistry {
+    SlimMutex mutex;
+    std::shared_ptr<const CopiedWriterList> list = std::make_shared<const CopiedWriterList>();
+};
+
+CopiedWriterRegistry& copiedWriterRegistry() {
+    // Never destroyed: a completion action of a batch still in flight at static teardown may delist from it.
+    static auto* const registry = new CopiedWriterRegistry();
+    return *registry;
+}
+
+}
+
+std::shared_ptr<const CopiedWriterList> DrawCopiedWriters() {
+    auto& registry = copiedWriterRegistry();
+    std::lock_guard lock(registry.mutex);
+    return registry.list;
+}
+
+void ListDrawCopiedWriter(std::shared_ptr<ShaderResources> writer) {
+    auto& registry = copiedWriterRegistry();
+    std::lock_guard lock(registry.mutex);
+    auto list = std::make_shared<CopiedWriterList>(*registry.list);
+    list->push_back(std::move(writer));
+    registry.list = std::move(list);
+}
+
+void DelistDrawCopiedWriter(const std::shared_ptr<ShaderResources>& writer) {
+    auto& registry = copiedWriterRegistry();
+    std::shared_ptr<const CopiedWriterList> replaced;
+    std::lock_guard lock(registry.mutex);
+    if (std::find(registry.list->begin(), registry.list->end(), writer) == registry.list->end()) return;
+    auto list = std::make_shared<CopiedWriterList>(*registry.list);
+    list->erase(std::remove(list->begin(), list->end(), writer), list->end());
+    // The old list (and the writers only it held) is released after the lock.
+    replaced = std::exchange(registry.list, std::move(list));
+}
+
+void ClearDrawCopiedWriters() {
+    auto& registry = copiedWriterRegistry();
+    std::shared_ptr<const CopiedWriterList> replaced;
+    std::lock_guard lock(registry.mutex);
+    replaced = std::exchange(registry.list, std::make_shared<const CopiedWriterList>());
 }
 
 const char* IndirectDrawPathName(IndirectDrawPath path) {
@@ -1775,12 +1817,11 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         // As VulkanDevice::dispatch lists its copied writers: delisted before the write-back
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
-        auto writers = DrawCopiedWriters();
-        recorder.OnComplete([resources, writers] {
-            writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
+        recorder.OnComplete([resources] {
+            DelistDrawCopiedWriter(resources);
             resources->WriteBackBuffers();
         });
-        writers->push_back(resources);
+        ListDrawCopiedWriter(resources);
     } else if (completion) {
         if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
@@ -2372,8 +2413,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                     const auto texel = clearTexel(color, keys);
                     for (std::size_t offset = 0; offset + color.elementBytes <= pixels.size(); offset += color.elementBytes) std::memcpy(pixels.data() + offset, texel.data(), color.elementBytes);
                 } else if (!FillDccClear(color.format, keys, color.dccAlphaOnMsb, pixels)) {
+                    static SlimMutex reportedMutex;
                     static std::set<std::pair<std::uint64_t, int>> reported;
-                    if (reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
+                    const bool report = [&] {
+                        std::lock_guard lock(reportedMutex);
+                        return reported.size() < 32 && reported.insert({color.address, static_cast<int>(keys)}).second;
+                    }();
+                    if (report) std::fprintf(stderr, "[gpu] color target 0x%llx (VkFormat %d) has %s DCC keys; its stored texels are used\n", static_cast<unsigned long long>(color.address), static_cast<int>(color.format), DccKeysName(keys));
                     if (binding.gpuTiling) std::memcpy(pixels.data(), binding.original.data(), binding.original.size());
                     else ReadColorTarget(color, pixels);
                 }
@@ -2443,7 +2489,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
             const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
             if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+            const auto drawWriters = DrawCopiedWriters();
+            if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
             if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
             return IndirectDrawPath::Gpu;
         };

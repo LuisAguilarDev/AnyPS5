@@ -4531,7 +4531,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return PrepareDrawBindings(recorder.Main(), moved, profile);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved, DrawBindingsProfile* profile) const {
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved, DrawBindingsProfile* profile, const std::vector<std::uint8_t>* pendingWrites) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -4616,7 +4616,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!direct || (pendingWrites != nullptr ? (*pendingWrites)[index] != 0 : recorder.PendingWriteOverlaps(item.address, item.size))) continue;
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
@@ -4738,6 +4738,24 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
+}
+
+void ShaderResources::PendingSnapshotWrites(Recorder& recorder, std::span<const MovedBuffer> moved, std::vector<std::uint8_t>& pendingWrites) const {
+    // Every unwritten guest range a snapshot could copy (a superset of the ones PrepareDrawBindings
+    // asks about: the in-place and overlap tests stay there).
+    pendingWrites.assign(allocations.size(), 0);
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || item.written || std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; })) continue;
+        pendingWrites[index] = recorder.PendingWriteOverlaps(item.address, item.size) ? 1 : 0;
+    }
+}
+
+bool ShaderResources::WritesStorageImages() const {
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index] && storageTextures[index] != nullptr) return true;
+    }
+    return false;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

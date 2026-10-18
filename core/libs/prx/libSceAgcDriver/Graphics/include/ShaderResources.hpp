@@ -188,8 +188,18 @@ public:
         double wordUs = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
-    // The same through a recording context (Recorder::Main for the overload above).
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
+    // The same through a recording context (Recorder::Main for the overload above). With
+    // `pendingWrites` (PendingSnapshotWrites, taken before the draw's own writes were noted) the
+    // snapshot choice asks it instead of the recorder: the record half of a split draw runs after
+    // its keep (see recordDraw).
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr, const std::vector<std::uint8_t>* pendingWrites = nullptr) const;
+    // Per allocation, whether recorded work writes the range a draw snapshot would copy (what
+    // PrepareDrawBindings asks Recorder::PendingWriteOverlaps for; 0 where it would not ask).
+    void PendingSnapshotWrites(Recorder& recorder, std::span<const MovedBuffer> moved, std::vector<std::uint8_t>& pendingWrites) const;
+    // Whether MarkGpuWrites records commands after the work: copy-backs of copied regions, and store
+    // backs of written storage images. Such a use must keep that order (see recordDraw).
+    bool OwesCopyBacks() const { return guestMemory.OwesCopyBacks(); }
+    bool WritesStorageImages() const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();

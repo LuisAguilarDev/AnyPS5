@@ -358,6 +358,15 @@ constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-reside
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
 
+// How recordDraw recorded a lean draw (the [spine] line): split into its resolve (everything
+// that needs the recorder and GuestMemory::GpuMutex, the keep included) and its record half (the
+// descriptor sets, snapshots and commands, which need neither), or serially, record then keep as
+// before, and why: APS5_NO_DRAW_RESOLVE_SPLIT, a record half that needs the recorder itself
+// (indirect and mesh argument records, stencil replay pipelines, attachment proxies, completion
+// work or a lease, input capture, GPU timing, barrier validation) or a keep that records commands
+// after the work (MarkGpuWrites: copy-backs of copied regions, store backs of written storage images).
+enum SpinePath : std::size_t { SpineSplit, SpineSwitchedOff, SpineIndirect, SpineStencil, SpineProxy, SpineCompletion, SpineCapture, SpineTiming, SpineValidate, SpineCopyBacks, SpineStorageWrites, SpineNone, SpinePathCount = SpineNone };
+constexpr std::array<const char*, SpinePathCount> SpinePathNames{"split", "switched off", "indirect or mesh", "stencil replay", "attachment proxy", "completion or lease", "capture", "gpu timing", "barrier validation", "copy-backs", "storage writes"};
 // What became of one draw, for the totals.
 struct DrawOutcome {
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
@@ -398,6 +407,9 @@ struct DrawOutcome {
     // in ownSyncUs: those wait by design and would otherwise count as nested hook waits.
     double hookWaitUs = 0;
     double ownSyncUs = 0;
+    // How recordDraw recorded it (SpinePath), and the record half's time of a split one.
+    SpinePath spine = SpineNone;
+    double spineRecordUs = 0;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
@@ -480,6 +492,11 @@ struct DrawProfile {
     std::array<std::uint64_t, KindCount> splitKindDraws{};
     std::array<std::uint64_t, KindCount> splitKindSets{};
     std::array<std::uint64_t, KindCount> splitKindFreshSets{};
+    // The [spine] line: lean draws by how recordDraw recorded them (SpinePath), and the split
+    // ones' time on the spine (the whole draw less its record half) and in the record half.
+    std::array<std::uint64_t, SpinePathCount> spinePaths{};
+    double spineResolveUs = 0;
+    double spineRecordUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
@@ -554,6 +571,22 @@ void resetRecordSplit(DrawProfile& profile) {
     profile.splitKindFreshSets.fill(0);
 }
 
+// [spine] lean draws over 10 s: how many recordDraw split into resolve and record (with the
+// average time of each half) and how many it recorded serially, by reason (SpinePath).
+void printSpine(const DrawProfile& profile) {
+    std::uint64_t lean = 0;
+    for (const auto count : profile.spinePaths) lean += count;
+    if (lean == 0) return;
+    const auto split = profile.spinePaths[SpineSplit];
+    const auto perSplit = [&](double total) { return split != 0 ? total / static_cast<double>(split) : 0.0; };
+    char line[1024];
+    int n = std::snprintf(line, sizeof(line), "[spine] %llu lean draws over 10 s: %llu split (%.1f%%; resolve avg %.2f us, record avg %.2f us), serial by reason:", static_cast<unsigned long long>(lean), static_cast<unsigned long long>(split), 100.0 * static_cast<double>(split) / static_cast<double>(lean), perSplit(profile.spineResolveUs), perSplit(profile.spineRecordUs));
+    for (std::size_t i = SpineSplit + 1; i < SpinePathCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
+        if (profile.spinePaths[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SpinePathNames[i], static_cast<unsigned long long>(profile.spinePaths[i]));
+    }
+    std::fprintf(stderr, "%s\n", line);
+}
+
 void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& split, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
@@ -569,6 +602,13 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
+    if (outcome.spine < SpinePathCount) {
+        ++profile.spinePaths[outcome.spine];
+        if (outcome.spine == SpineSplit) {
+            profile.spineRecordUs += outcome.spineRecordUs;
+            profile.spineResolveUs += std::max(0.0, drawUs - outcome.spineRecordUs);
+        }
+    }
     if (built != nullptr) {
         profile.bindingsUs += built->bindingsMs * 1000.0;
         profile.uploadUs += built->uploadMs * 1000.0;
@@ -655,6 +695,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     }
     std::fprintf(stderr, "%s\n", line);
     if (profile.splitDraws != 0) printRecordSplit(profile);
+    printSpine(profile);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.lookupPartsUs.fill(0);
@@ -682,6 +723,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.skips.fill(0);
     profile.skipUs.fill(0);
     resetRecordSplit(profile);
+    profile.spinePaths.fill(0);
+    profile.spineResolveUs = profile.spineRecordUs = 0;
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -1750,13 +1793,14 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+// With `shareInputs` the draw's inputs stay in `inputs` for a record half that follows (recordDraw).
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, bool shareInputs = false) {
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
     kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
+    kept->indices = shareInputs ? inputs.indices : std::move(inputs.indices);
+    kept->vertexBuffers = shareInputs ? inputs.vertexBuffers : std::move(inputs.vertexBuffers);
     kept->scratch = std::move(scratch);
     kept->targets = std::move(targets);
     const auto& residents = kept->targets;
@@ -2019,37 +2063,45 @@ Recorder::PassSample passSample(const State& state, std::span<const CompiledShad
     return sample;
 }
 
-void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+// How recordDraw records a lean draw (see SpinePath): SpineSplit when its record half needs
+// neither the recorder nor the order of its keep after the commands. Debug aid:
+// APS5_NO_DRAW_RESOLVE_SPLIT=1 records every lean draw serially, record then keep, as before.
+SpinePath spinePath(const State& state, const RecordedDraw& record, const ShaderResources& resources, bool capture) {
+    static const bool serial = std::getenv("APS5_NO_DRAW_RESOLVE_SPLIT") != nullptr;
+    if (serial) return SpineSwitchedOff;
+    if (record.indirect != nullptr || state.stages.mesh) return SpineIndirect;
+    if (!record.stencilReplay.empty()) return SpineStencil;
+    if (!record.proxies.empty()) return SpineProxy;
+    if (record.waited || record.listed || record.completion || resources.HoldsLease()) return SpineCompletion;
+    if (capture) return SpineCapture;
+    if (Recorder::GpuTimingEnabled()) return SpineTiming;
+    if (Recorder::BarrierValidate()) return SpineValidate;
+    if (resources.OwesCopyBacks()) return SpineCopyBacks;
+    if (resources.WritesStorageImages()) return SpineStorageWrites;
+    return SpineSplit;
+}
+
+// What the record half of a lean draw leaves to its keep: an indirect draw's scratch copies and
+// its record check.
+struct RecordedCommands {
+    std::unique_ptr<DeviceBuffer> scratch;
+    std::function<void()> checkRecords;
+};
+
+// The record half of a lean draw: its descriptor sets and snapshots, the render pass it starts or
+// continues, the barriers, the bind, the push constants and the draw commands, recorded through
+// `recording`. `pendingWrites` (a split draw's, see recordDraw) stands for the recorder's pending
+// writes before the draw's keep. Only a serial draw (SpinePath) uses `record.recorder` here: the
+// input capture and the indirect and mesh argument records.
+RecordedCommands recordDrawHalf(const Context& context, RecordingContext& recording, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawInputs& inputs, const RecordedDraw& record, std::uint64_t passKey, bool readsTarget, bool capture, const std::vector<std::uint8_t>* pendingWrites, DrawOutcome& outcome, DrawTimer& timer) {
     auto* recorder = record.recorder;
-    // The record calls go through the recorder's recording context (the draw snapshot caches and arena).
-    auto& recording = recorder->Main();
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
-    // The pass is named by its attachment views (stable while the kept targets live, so unique
-    // within the open batch) and the extent. The previous draw's pass is continued only when this
-    // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
-    // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
-    const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
-    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
-    // A queued DCC key store over memory the draw writes or reads in place (unknown for an
-    // address-based build), or over its GPU-side records, lands before it, as before a dispatch
-    // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
-    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
-        const auto bytes = static_cast<std::size_t>(end - begin);
-        if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
-        if (!gpuIndirect) return false;
-        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
-    };
-    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
-    // A queued label store over such memory likewise (Recorder::RecordStore).
-    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
-    timer.part(RecordPrologue);
-    const auto drawBindings = resources.PrepareDrawBindings(recording, record.moved, timer.bindingsProfile());
+    const auto drawBindings = resources.PrepareDrawBindings(recording, record.moved, timer.bindingsProfile(), pendingWrites);
     timer.part(RecordBindings);
-    const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
@@ -2093,7 +2145,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recording.NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     timer.part(RecordPass);
-    std::unique_ptr<DeviceBuffer> scratch;
+    RecordedCommands recorded;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
@@ -2121,7 +2173,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
         } else if (gpuIndirect) {
-            rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentBuffer, argumentOffset, countBarrier);
+            rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, recorded.scratch, argumentBuffer, argumentOffset, countBarrier);
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
@@ -2160,7 +2212,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (meshArguments != nullptr) recording.Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
-    auto checkRecords = indirectRecordCheck(record.indirect);
+    recorded.checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     timer.part(RecordCommands);
     std::function<void(VkCommandBuffer)> storeProxies;
@@ -2175,8 +2227,60 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     recording.LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     recording.CountPassDraw(Recorder::GpuTimingEnabled() ? fragmentFlags(fragmentProgram(shaders)) : 0);
     timer.part(RecordLeave);
+    return recorded;
+}
+
+// A lean draw into the device's open batch: the prologue (queued stores the draw must follow),
+// then either serially its record half (recordDrawHalf) and its keep (keepRecordedDraw), or,
+// split (SpinePath), the keep first and the record half after it, with the recorder's pending
+// writes taken before the keep noted them. Everything the split record half reads was settled by
+// then: the resources were revalidated, the targets refreshed, the pipeline and framebuffer
+// acquired; the keep's notes, marks and completion actions only take effect at the batch's
+// submission and completion, after the commands either way. Then, for a waited-for draw, the
+// recorder sync.
+void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+    auto* recorder = record.recorder;
+    // The record calls go through the recorder's recording context (the draw snapshot caches and arena).
+    auto& recording = recorder->Main();
+    auto& resources = *record.resources;
+    const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
+    const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
+    // The pass is named by its attachment views (stable while the kept targets live, so unique
+    // within the open batch) and the extent. The previous draw's pass is continued only when this
+    // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
+    // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
+    const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
+    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
+    // A queued DCC key store over memory the draw writes or reads in place (unknown for an
+    // address-based build), or over its GPU-side records, lands before it, as before a dispatch
+    // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
+    const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
+        if (!gpuIndirect) return false;
+        return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
+    };
+    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
+    // A queued label store over such memory likewise (Recorder::RecordStore).
+    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    timer.part(RecordPrologue);
+    const bool capture = CaptureInputsEnabled();
+    outcome.spine = spinePath(state, record, resources, capture);
+    if (outcome.spine == SpineSplit) {
+        thread_local std::vector<std::uint8_t>* pendingSlot = nullptr;
+        auto& pendingWrites = ShaderRecompiler::ThreadOwned(pendingSlot);
+        resources.PendingSnapshotWrites(*recorder, record.moved, pendingWrites);
+        keepRecordedDraw(*recorder, record.resources, record.pipeline, record.framebuffer, inputs, record.targets, record.targetSlices, nullptr, {}, record.listed, record.completion, outcome, true);
+        timer.phase(PhaseKeep);
+        const auto recordStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        static_cast<void>(recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, &pendingWrites, outcome, timer));
+        if (timer.profile) outcome.spineRecordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
+        timer.phase(PhaseRecord);
+        return;
+    }
+    auto recorded = recordDrawHalf(context, recording, state, draw, shaders, inputs, record, passKey, readsTarget, capture, nullptr, outcome, timer);
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(recorded.scratch), std::move(recorded.checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the

@@ -4025,6 +4025,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
+bool GuestBufferMemory::OwesCopyBacks() const {
+    if (!uploaded || committed) return false;
+    return std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && !region.copiedBack; });
+}
+
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

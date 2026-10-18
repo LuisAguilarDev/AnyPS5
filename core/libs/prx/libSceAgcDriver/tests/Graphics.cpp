@@ -41,7 +41,9 @@
 #include <random>
 #include <initializer_list>
 #include <iostream>
+#include <list>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -3878,58 +3880,84 @@ VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::ui
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdCopyQueryPoolResults(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer, VkDeviceSize, VkDeviceSize, VkQueryResultFlags) {}
 
-PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
-    static const std::map<std::string_view, PFN_vkVoidFunction> table{
-        {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateCommandBuffers)},
-        {"vkFreeCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(mockFreeCommandBuffers)},
-        {"vkCreateFence", reinterpret_cast<PFN_vkVoidFunction>(mockCreateFence)},
-        {"vkDestroyFence", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyFence)},
-        {"vkGetFenceStatus", reinterpret_cast<PFN_vkVoidFunction>(mockGetFenceStatus)},
-        {"vkResetFences", reinterpret_cast<PFN_vkVoidFunction>(mockResetFences)},
-        {"vkWaitForFences", reinterpret_cast<PFN_vkVoidFunction>(mockWaitForFences)},
-        {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockBeginCommandBuffer)},
-        {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
-        {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
-        {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPipelineBarrier)},
-        {"vkCmdBeginQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBeginQuery)},
-        {"vkCmdEndQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdEndQuery)},
-        {"vkCmdResetQueryPool", reinterpret_cast<PFN_vkVoidFunction>(mockCmdResetQueryPool)},
-        {"vkCmdCopyQueryPoolResults", reinterpret_cast<PFN_vkVoidFunction>(mockCmdCopyQueryPoolResults)},
+// The mock's state is one unlocked struct: a test that records from several threads sets
+// serializeMock before it resolves an entry point, and gets each one wrapped in one mutex.
+std::recursive_mutex mockCallMutex;
+bool serializeMock = false;
 
-        {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
-        {"vkGetMemoryHostPointerPropertiesEXT", reinterpret_cast<PFN_vkVoidFunction>(mockGetMemoryHostPointerProperties)},
-        {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCreateBuffer)},
-        {"vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferMemoryRequirements)},
-        {"vkAllocateMemory", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateMemory)},
-        {"vkBindBufferMemory", reinterpret_cast<PFN_vkVoidFunction>(mockBindBufferMemory)},
-        {"vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(mockMapMemory)},
-        {"vkUnmapMemory", reinterpret_cast<PFN_vkVoidFunction>(mockUnmapMemory)},
-        {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyBuffer)},
-        {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(mockFreeMemory)},
-        {"vkCreateDescriptorSetLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorSetLayout)},
-        {"vkDestroyDescriptorSetLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorSetLayout)},
-        {"vkCreateDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockCreateDescriptorPool)},
-        {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
-        {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
-        {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
-        {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
-        {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)},
-        {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},
-        {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
-        {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateGraphicsPipelines)},
-        {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
-        {"vkDestroyPipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipelineLayout)},
-        {"vkCreateShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockCreateShaderModule)},
-        {"vkDestroyShaderModule", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyShaderModule)},
-        {"vkCreateComputePipelines", reinterpret_cast<PFN_vkVoidFunction>(mockCreateComputePipelines)},
-        {"vkDestroyPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyPipeline)},
-        {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
-        {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
-        {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
-        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
+template<auto Function>
+struct SerializedMock;
+
+template<typename TResult, typename... TArgs, TResult (VKAPI_PTR* Function)(TArgs...)>
+struct SerializedMock<Function> {
+    static TResult VKAPI_CALL Call(TArgs... args) {
+        std::lock_guard lock(mockCallMutex);
+        return Function(args...);
+    }
+};
+
+struct MockEntry {
+    PFN_vkVoidFunction direct;
+    PFN_vkVoidFunction serialized;
+};
+
+template<auto Function>
+MockEntry mockEntry() {
+    return {reinterpret_cast<PFN_vkVoidFunction>(Function), reinterpret_cast<PFN_vkVoidFunction>(&SerializedMock<Function>::Call)};
+}
+
+PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
+    static const std::map<std::string_view, MockEntry> table{
+        {"vkAllocateCommandBuffers", mockEntry<mockAllocateCommandBuffers>()},
+        {"vkFreeCommandBuffers", mockEntry<mockFreeCommandBuffers>()},
+        {"vkCreateFence", mockEntry<mockCreateFence>()},
+        {"vkDestroyFence", mockEntry<mockDestroyFence>()},
+        {"vkGetFenceStatus", mockEntry<mockGetFenceStatus>()},
+        {"vkResetFences", mockEntry<mockResetFences>()},
+        {"vkWaitForFences", mockEntry<mockWaitForFences>()},
+        {"vkBeginCommandBuffer", mockEntry<mockBeginCommandBuffer>()},
+        {"vkEndCommandBuffer", mockEntry<mockEndCommandBuffer>()},
+        {"vkQueueSubmit", mockEntry<mockQueueSubmit>()},
+        {"vkCmdPipelineBarrier", mockEntry<mockCmdPipelineBarrier>()},
+        {"vkCmdBeginQuery", mockEntry<mockCmdBeginQuery>()},
+        {"vkCmdEndQuery", mockEntry<mockCmdEndQuery>()},
+        {"vkCmdResetQueryPool", mockEntry<mockCmdResetQueryPool>()},
+        {"vkCmdCopyQueryPoolResults", mockEntry<mockCmdCopyQueryPoolResults>()},
+
+        {"vkGetBufferDeviceAddressKHR", mockEntry<mockGetBufferDeviceAddress>()},
+        {"vkGetMemoryHostPointerPropertiesEXT", mockEntry<mockGetMemoryHostPointerProperties>()},
+        {"vkCreateBuffer", mockEntry<mockCreateBuffer>()},
+        {"vkGetBufferMemoryRequirements", mockEntry<mockGetBufferMemoryRequirements>()},
+        {"vkAllocateMemory", mockEntry<mockAllocateMemory>()},
+        {"vkBindBufferMemory", mockEntry<mockBindBufferMemory>()},
+        {"vkMapMemory", mockEntry<mockMapMemory>()},
+        {"vkUnmapMemory", mockEntry<mockUnmapMemory>()},
+        {"vkDestroyBuffer", mockEntry<mockDestroyBuffer>()},
+        {"vkFreeMemory", mockEntry<mockFreeMemory>()},
+        {"vkCreateDescriptorSetLayout", mockEntry<mockCreateDescriptorSetLayout>()},
+        {"vkDestroyDescriptorSetLayout", mockEntry<mockDestroyDescriptorSetLayout>()},
+        {"vkCreateDescriptorPool", mockEntry<mockCreateDescriptorPool>()},
+        {"vkDestroyDescriptorPool", mockEntry<mockDestroyDescriptorPool>()},
+        {"vkAllocateDescriptorSets", mockEntry<mockAllocateDescriptorSets>()},
+        {"vkResetDescriptorPool", mockEntry<mockResetDescriptorPool>()},
+        {"vkCreateSampler", mockEntry<mockCreateSampler>()},
+        {"vkDestroySampler", mockEntry<mockDestroySampler>()},
+        {"vkUpdateDescriptorSets", mockEntry<mockUpdateDescriptorSets>()},
+        {"vkCmdBindDescriptorSets", mockEntry<mockCmdBindDescriptorSets>()},
+        {"vkCreateGraphicsPipelines", mockEntry<mockCreateGraphicsPipelines>()},
+        {"vkCreatePipelineLayout", mockEntry<mockCreatePipelineLayout>()},
+        {"vkDestroyPipelineLayout", mockEntry<mockDestroyPipelineLayout>()},
+        {"vkCreateShaderModule", mockEntry<mockCreateShaderModule>()},
+        {"vkDestroyShaderModule", mockEntry<mockDestroyShaderModule>()},
+        {"vkCreateComputePipelines", mockEntry<mockCreateComputePipelines>()},
+        {"vkDestroyPipeline", mockEntry<mockDestroyPipeline>()},
+        {"vkCmdBindPipeline", mockEntry<mockCmdBindPipeline>()},
+        {"vkCmdPushConstants", mockEntry<mockCmdPushConstants>()},
+        {"vkCmdDispatch", mockEntry<mockCmdDispatch>()},
+        {"vkCmdUpdateBuffer", mockEntry<mockCmdUpdateBuffer>()}
     };
     const auto it = table.find(name);
-    return it == table.end() ? nullptr : it->second;
+    return it == table.end() ? nullptr : serializeMock ? it->second.serialized : it->second.direct;
 }
 
 AgcDriver::Graphics::Context mockContext() {
@@ -4414,6 +4442,235 @@ void wordSnapshotArenaTests() {
         recorder.Sync();
     }
     Require(mock.live == 0, "data word snapshots leaked Vulkan objects");
+}
+
+// Draws of one cached template recorded on several threads at once, each with its own recorder and
+// without the GPU lock (the multi-threaded draw translation): the template's data words held by
+// content (a ShaderData block past an arena slice, or every one with APS5_NO_WORD_SNAPSHOT_ARENA=1,
+// which this mode sets) live in a ring on the shared object, which every draw searches and replaces
+// in. Every draw must bind a buffer holding exactly its own words; an unlocked ring crashes or binds
+// another draw's buffer.
+void sharedTemplateScratchTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+#ifdef _WIN32
+    _putenv_s("APS5_NO_WORD_SNAPSHOT_ARENA", "1");
+#else
+    setenv("APS5_NO_WORD_SNAPSHOT_ARENA", "1", 1);
+#endif
+    serializeMock = true;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        constexpr std::size_t compact = ShaderRecompiler::RuntimeAbi::UserDataDword + 4u;
+        // More word sets than the ring holds, so draws both find held buffers and replace them.
+        constexpr std::uint32_t variants = 12;
+        std::vector<std::vector<std::uint32_t>> words;
+        for (std::uint32_t variant = 0; variant < variants; ++variant) {
+            words.push_back(ShaderDataWords({7, 8, 100 + variant}));
+            words.back().resize(compact);
+        }
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, words[0]));
+        vertex.shaderDataDwords = compact;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        std::optional<ShaderResources> resources;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            resources.emplace(context, vertex, fragment, state.color, 0, 0);
+        }
+        constexpr std::uint32_t threads = 4;
+        constexpr std::uint32_t draws = 4000;
+        std::atomic<std::uint32_t> wrong{0};
+        std::atomic<std::uint64_t> held{0};
+        std::mutex failureMutex;
+        std::string failure;
+        std::vector<std::thread> recorders;
+        for (std::uint32_t thread = 0; thread < threads; ++thread) {
+            recorders.emplace_back([&, thread] {
+                try {
+                    Recorder recorder(context);
+                    ShaderResources::DrawBindingsProfile profile;
+                    for (std::uint32_t draw = 0; draw < draws; ++draw) {
+                        const auto& expected = words[(thread * 7u + draw) % variants];
+                        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, expected.size() * 4u, expected}}};
+                        const auto bindings = resources->PrepareDrawBindings(recorder, moved, &profile);
+                        if (bindings == nullptr || bindings->snapshots.size() != 1 || bindings->snapshots[0].buffer->Bytes().size() < expected.size() * 4u || std::memcmp(bindings->snapshots[0].buffer->Bytes().data(), expected.data(), expected.size() * 4u) != 0) wrong.fetch_add(1);
+                    }
+                    held.fetch_add(profile.wordSnapshots - profile.copiedSnapshots);
+                    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                    recorder.Sync();
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(failureMutex);
+                    failure = error.what();
+                }
+            });
+        }
+        for (auto& recorder : recorders) recorder.join();
+        Require(failure.empty(), "a recorder thread failed: " + failure);
+        Require(wrong.load() == 0, "a draw bound data words another draw of the shared template held");
+        Require(held.load() != 0, "no draw found its words held, so the shared ring was not exercised");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        resources.reset();
+    }
+    serializeMock = false;
+    Require(mock.live == 0, "shared template scratch test leaked Vulkan objects");
+    std::cout << "shared template scratch survives concurrent recorders\n";
+}
+
+// The resource caches keep their use order with LruStamp (a hit stamps its entry, an eviction
+// orders the list first) or, with APS5_NO_LRU_STAMPS=1, by splicing on every hit: either way the
+// order an eviction sees is exactly the order of the last uses. This mode sets a ResourceCache bound
+// of 4 entries.
+void lruStampTests() {
+    using AgcDriver::Graphics::LruStamp;
+    struct Entry {
+        std::uint32_t id;
+        LruStamp recency;
+    };
+    // Random hits, promotions, inserts and evictions against a list spliced on every use.
+    std::mt19937 random(7);
+    std::list<Entry> stamped;
+    std::list<std::uint32_t> reference;
+    std::uint32_t next = 0;
+    const auto find = [&](std::uint32_t id) {
+        return std::find_if(stamped.begin(), stamped.end(), [&](const Entry& entry) { return entry.id == id; });
+    };
+    for (std::uint32_t step = 0; step < 20000; ++step) {
+        const auto action = random() % 8u;
+        if (action < 2 || stamped.size() < 4) {
+            stamped.push_front({next, {}});
+            AgcDriver::Graphics::PlacedFrontLru(stamped);
+            reference.push_front(next++);
+        } else if (action < 6) {
+            const auto id = *std::next(reference.begin(), static_cast<std::ptrdiff_t>(random() % reference.size()));
+            AgcDriver::Graphics::TouchLru(stamped, find(id));
+            reference.remove(id);
+            reference.push_front(id);
+        } else if (action == 6) {
+            AgcDriver::Graphics::OrderLruBack(stamped);
+            const auto id = reference.back();
+            Require(stamped.back().id == id, "the stamped LRU evicted another entry than the spliced one");
+            AgcDriver::Graphics::PromoteLru(stamped, std::prev(stamped.end()));
+            reference.pop_back();
+            reference.push_front(id);
+        } else {
+            AgcDriver::Graphics::OrderLruBack(stamped);
+            Require(stamped.back().id == reference.back(), "the stamped LRU evicted another entry than the spliced one");
+            stamped.pop_back();
+            reference.pop_back();
+        }
+    }
+    AgcDriver::Graphics::OrderLru(stamped);
+    Require(std::equal(stamped.begin(), stamped.end(), reference.begin(), reference.end(), [](const Entry& entry, std::uint32_t id) { return entry.id == id; }), "the stamped LRU order differs from the spliced one");
+
+    // ResourceCache: Find and Touch keep an entry, the least recently used one goes.
+#ifdef _WIN32
+    _putenv_s("APS5_RESOURCE_CACHE_ENTRIES", "4");
+#else
+    setenv("APS5_RESOURCE_CACHE_ENTRIES", "4", 1);
+#endif
+    serializeMock = true;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    {
+        AgcDriver::Graphics::DescriptorCache descriptors(context);
+        context.descriptorCache = &descriptors;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        std::vector<std::shared_ptr<AgcDriver::Graphics::ShaderResources>> objects;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            for (int index = 0; index < 8; ++index) objects.push_back(std::make_shared<AgcDriver::Graphics::ShaderResources>(context, vertex, fragment, state.color, 0, 0));
+        }
+        const auto key = [](std::uint32_t id) { return AgcDriver::Graphics::ResourceCache::Key{0x5eedu, id}; };
+        {
+            AgcDriver::Graphics::ResourceCache cache;
+            for (std::uint32_t id = 0; id < 4; ++id) cache.Insert(key(id), objects[id]);
+            Require(cache.Find(key(0)) == objects[0] && cache.Touch(key(2)), "a cached entry was not found");
+            cache.Insert(key(4), objects[4]);
+            Require(cache.Find(key(1)) == nullptr, "the least recently used entry was kept");
+            cache.Insert(key(5), objects[5]);
+            Require(cache.Find(key(3)) == nullptr, "the second least recently used entry was kept");
+            for (const auto id : {0u, 2u, 4u, 5u}) Require(cache.Find(key(id)) == objects[id], "a recently used entry was evicted");
+            // Several threads finding, touching and inserting at once (the recorder threads' lookups).
+            std::vector<std::thread> workers;
+            std::atomic<std::uint32_t> wrong{0};
+            for (std::uint32_t worker = 0; worker < 4; ++worker) {
+                workers.emplace_back([&, worker] {
+                    std::mt19937 local(worker);
+                    for (std::uint32_t step = 0; step < 20000; ++step) {
+                        const auto id = local() % 8u;
+                        const auto action = local() % 4u;
+                        if (action == 0) cache.Insert(key(id), objects[id]);
+                        else if (action == 1) cache.Touch(key(id));
+                        else if (const auto found = cache.Find(key(id)); found != nullptr && found != objects[id]) wrong.fetch_add(1);
+                        if (cache.Size() > 4) wrong.fetch_add(1);
+                    }
+                });
+            }
+            for (auto& worker : workers) worker.join();
+            Require(wrong.load() == 0, "concurrent resource cache use returned another key's object or overran the bound");
+        }
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        objects.clear();
+    }
+    serializeMock = false;
+    Require(mock.live == 0, "LRU stamp tests leaked Vulkan objects");
+    std::cout << "LRU stamps keep the spliced use order (" << (LruStamp::Enabled() ? "stamps" : "splices") << ")\n";
+}
+
+// ResourceCache hit and insert cost at its default bound (1024 entries), for A/B runs with and
+// without APS5_NO_LRU_STAMPS=1; not part of the suite.
+void lruStampBenchmark() {
+    mock = MockVulkan{};
+    auto context = mockContext();
+    {
+        AgcDriver::Graphics::DescriptorCache descriptors(context);
+        context.descriptorCache = &descriptors;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        std::shared_ptr<AgcDriver::Graphics::ShaderResources> object;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            object = std::make_shared<AgcDriver::Graphics::ShaderResources>(context, vertex, fragment, state.color, 0, 0);
+        }
+        // Draw keys are a few dozen words long.
+        const auto key = [](std::uint32_t id) {
+            AgcDriver::Graphics::ResourceCache::Key words(24, 0x5eedu);
+            words[0] = id;
+            return words;
+        };
+        constexpr std::uint32_t entries = 1024;
+        std::vector<AgcDriver::Graphics::ResourceCache::Key> keys;
+        for (std::uint32_t id = 0; id < 4 * entries; ++id) keys.push_back(key(id));
+        AgcDriver::Graphics::ResourceCache cache;
+        for (std::uint32_t id = 0; id < entries; ++id) cache.Insert(keys[id], object);
+        std::mt19937 random(3);
+        std::vector<std::uint32_t> order(1u << 20);
+        for (auto& id : order) id = random() % entries;
+        auto start = std::chrono::steady_clock::now();
+        std::size_t found = 0;
+        for (const auto id : order) found += cache.Find(keys[id]) != nullptr;
+        const auto hitNs = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / static_cast<double>(order.size());
+        // Inserts at the bound, with hits in between (each insert evicts one entry).
+        start = std::chrono::steady_clock::now();
+        constexpr std::uint32_t inserts = 4096;
+        for (std::uint32_t step = 0; step < inserts; ++step) {
+            for (std::uint32_t hit = 0; hit < 16; ++hit) cache.Find(keys[random() % (4 * entries)]);
+            cache.Insert(keys[entries + step % (3 * entries)], object);
+        }
+        const auto insertNs = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / inserts;
+        Require(found == order.size(), "benchmark hits missed");
+        std::cout << "resource cache (" << (AgcDriver::Graphics::LruStamp::Enabled() ? "stamps" : "splices") << "): hit " << hitNs << " ns, insert with 16 lookups " << insertNs << " ns\n";
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        cache.Clear();
+        object.reset();
+    }
 }
 
 // A Buffer keeps only its device of the context (BufferDevice): every snapshot and upload allocates
@@ -7935,6 +8192,18 @@ int main(int argc, char** argv) {
             Require(mock.live == 0, "sparse buffer hole tests leaked Vulkan objects");
             std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
             return passed ? 0 : 1;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-lru-stamps") {
+            lruStampBenchmark();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lru-stamps") {
+            lruStampTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-template-scratch") {
+            sharedTemplateScratchTests();
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--address-space-teardown") {
             addressSpaceTeardownTests();

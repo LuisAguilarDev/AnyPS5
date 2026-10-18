@@ -96,6 +96,10 @@ ctest --test-dir build/write-watch --output-on-failure
 
 With `CMAKE_OSX_ARCHITECTURES=x86_64` Apple silicon runs the tests through Rosetta, which is how relinked titles run; without it they run natively. The full `BUILD_TESTING` build on macOS also registers them.
 
+## Resource cache LRU stamps
+
+`agc_driver_graphics_tests --benchmark-lru-stamps` times resource cache hits and inserts at the default bound of 1024 entries on the mock device and prints one line; run it with and without `APS5_NO_LRU_STAMPS=1` (splice on every hit, the old way) for an A/B. It is not part of the suite. `agc_driver_lru_stamps` and `agc_driver_lru_stamps_spliced` check that both ways evict the same entries in the same order, and `agc_driver_shared_template_scratch` records draws of one cached template on four threads at once.
+
 ## Tracy
 
 `-DAPS5_ENABLE_TRACY=ON` builds the [Tracy](https://github.com/wolfpld/tracy) 0.14.1 client from `3rdparty/tracy` as a shared library next to the patched `.prx` files (`libTracyClient.dll`, `libTracyClient.so.0.14.1` on Linux); copy it with them. Every `PerformanceTimer` scope of libSceAgcDriver and libSceVideoOut is a zone, every presented flip ends a frame, and the queue workers and the presenter are named threads. Connect the Tracy 0.14.1 profiler to `127.0.0.1`: the client listens only on localhost and records only while a profiler is connected. Sampling, system tracing, call stacks, code transfer and Tracy's crash handler are disabled. Without the flag nothing of Tracy is built.

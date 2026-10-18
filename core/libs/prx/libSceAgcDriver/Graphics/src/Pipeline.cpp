@@ -624,7 +624,11 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     bool resident = true;
     for (std::size_t i = 0; i < owners.size(); ++i) resident = resident && (owners[i] != nullptr || (i < persistent.size() && persistent[i] != 0));
+    // Draws of one pipeline may be recorded on several threads: the ring is searched, trimmed and
+    // filled under its own lock (a non-resident framebuffer is not cached and needs none).
+    std::unique_lock lock(framebufferMutex, std::defer_lock);
     if (resident) {
+        lock.lock();
         // Entries whose views are gone can never match again and go as soon as no recorded draw holds
         // them (Kept keeps its framebuffer until the batch completes).
         std::erase_if(framebuffers, [](const CachedFramebuffer& entry) {

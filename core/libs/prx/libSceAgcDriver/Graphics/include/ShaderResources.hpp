@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LruStamp.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include <array>
 #include <chrono>
 #include <limits>
@@ -551,9 +553,12 @@ private:
         std::size_t size;
         std::shared_ptr<Buffer> buffer;
     };
+    // Buffers of data words past an arena slice, held by their words for a later draw of this
+    // template. Draws of one cached template may be recorded on several threads, so the ring has a
+    // lock of its own; a buffer is made and filled outside it.
+    mutable SlimMutex movedWordMutex;
     mutable std::vector<MovedWordBuffer> movedWordBuffers;
     mutable std::size_t movedWordBufferNext = 0;
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;
@@ -655,7 +660,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
-    // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
+    // Marks the entry the most recently used (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
@@ -676,8 +681,14 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
+    struct Entry {
+        Key key;
+        std::shared_ptr<ShaderResources> resources;
+        LruStamp recency;
+    };
     mutable std::mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
+    // Use order (front = most recent) by LruStamp: a hit stamps its entry, an eviction orders first.
+    std::list<Entry> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
 };
 

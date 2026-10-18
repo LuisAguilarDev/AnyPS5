@@ -410,12 +410,18 @@ struct DrawOutcome {
     // How recordDraw recorded it (SpinePath), and the record half's time of a split one.
     SpinePath spine = SpineNone;
     double spineRecordUs = 0;
+    // A template hit whose data words moved (MovedBuffer::words): a data hit in the [spine] line.
+    bool dataHit = false;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
 enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindCount };
 constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA"};
+// The [spine] line's resolve by the draw's resources: the DrawKind, with the template hits whose
+// data words moved apart as data hits.
+enum SpineKind : std::size_t { SpineRecipeHit, SpineTemplateHit, SpineDataHit, SpineBuild, SpineBda, SpineKindCount };
+constexpr std::array<const char*, SpineKindCount> SpineKindNames{"recipe hit", "template hit", "data hit", "build", "BDA"};
 
 struct DrawProfile {
     std::mutex mutex;
@@ -496,6 +502,10 @@ struct DrawProfile {
     // ones' time on the spine (the whole draw less its record half) and in the record half.
     std::array<std::uint64_t, SpinePathCount> spinePaths{};
     double spineResolveUs = 0;
+    std::array<std::uint64_t, SpineKindCount> spineKindDraws{};
+    std::array<double, SpineKindCount> spineKindResolveUs{};
+    // The split draws' phases other than the record half's (DrawPhase): where resolve goes.
+    std::array<double, PhaseCount> spinePhaseUs{};
     double spineRecordUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -572,17 +582,29 @@ void resetRecordSplit(DrawProfile& profile) {
 }
 
 // [spine] lean draws over 10 s: how many recordDraw split into resolve and record (with the
-// average time of each half) and how many it recorded serially, by reason (SpinePath).
+// average time of each half) and how many it recorded serially, by reason (SpinePath), then the
+// split ones' resolve by the draw's resources (SpineKind) and by phase (DrawPhase, the record half
+// left out).
 void printSpine(const DrawProfile& profile) {
     std::uint64_t lean = 0;
     for (const auto count : profile.spinePaths) lean += count;
     if (lean == 0) return;
     const auto split = profile.spinePaths[SpineSplit];
     const auto perSplit = [&](double total) { return split != 0 ? total / static_cast<double>(split) : 0.0; };
-    char line[1024];
+    char line[2048];
     int n = std::snprintf(line, sizeof(line), "[spine] %llu lean draws over 10 s: %llu split (%.1f%%; resolve avg %.2f us, record avg %.2f us), serial by reason:", static_cast<unsigned long long>(lean), static_cast<unsigned long long>(split), 100.0 * static_cast<double>(split) / static_cast<double>(lean), perSplit(profile.spineResolveUs), perSplit(profile.spineRecordUs));
     for (std::size_t i = SpineSplit + 1; i < SpinePathCount && n > 0 && static_cast<std::size_t>(n) < sizeof(line); ++i) {
         if (profile.spinePaths[i] != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", SpinePathNames[i], static_cast<unsigned long long>(profile.spinePaths[i]));
+    }
+    const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
+    if (split != 0 && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; resolve by kind (avg us, count):");
+    for (std::size_t kind = 0; split != 0 && kind < SpineKindCount && room(); ++kind) {
+        const auto draws = profile.spineKindDraws[kind];
+        if (draws != 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f (%llu)", SpineKindNames[kind], profile.spineKindResolveUs[kind] / static_cast<double>(draws), static_cast<unsigned long long>(draws));
+    }
+    if (split != 0 && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; resolve phases (avg us per split draw):");
+    for (std::size_t i = 0; split != 0 && i < PhaseCount && room(); ++i) {
+        if (i != PhaseRecord && profile.spinePhaseUs[i] > 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", DrawPhaseNames[i], perSplit(profile.spinePhaseUs[i]));
     }
     std::fprintf(stderr, "%s\n", line);
 }
@@ -606,7 +628,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
         ++profile.spinePaths[outcome.spine];
         if (outcome.spine == SpineSplit) {
             profile.spineRecordUs += outcome.spineRecordUs;
-            profile.spineResolveUs += std::max(0.0, drawUs - outcome.spineRecordUs);
+            const auto resolveUs = std::max(0.0, drawUs - outcome.spineRecordUs);
+            profile.spineResolveUs += resolveUs;
+            if (outcome.kind < KindCount) {
+                constexpr std::array<SpineKind, KindCount> kinds{SpineRecipeHit, SpineTemplateHit, SpineBuild, SpineBda};
+                const auto kind = outcome.kind == KindTemplateHit && outcome.dataHit ? SpineDataHit : kinds[outcome.kind];
+                ++profile.spineKindDraws[kind];
+                profile.spineKindResolveUs[kind] += resolveUs;
+            }
+            for (std::size_t i = 0; i < PhaseCount; ++i) {
+                if (i != PhaseRecord) profile.spinePhaseUs[i] += us[i];
+            }
         }
     }
     if (built != nullptr) {
@@ -725,6 +757,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     resetRecordSplit(profile);
     profile.spinePaths.fill(0);
     profile.spineResolveUs = profile.spineRecordUs = 0;
+    profile.spineKindDraws.fill(0);
+    profile.spineKindResolveUs.fill(0);
+    profile.spinePhaseUs.fill(0);
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {
@@ -1587,6 +1622,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
+                outcome.dataHit = std::any_of(resolved.moved.begin(), resolved.moved.end(), [](const ShaderResources::MovedBuffer& buffer) { return !buffer.words.empty(); });
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);

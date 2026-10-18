@@ -18,6 +18,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
     ++counters.tried;
     auto candidate = variant;
     const bool rebased = moved != 0 || movedBeyond;
+    const auto based = drawBufferBaseWords() ? moved & variant->bufferBaseWords & ~variant->rebaseWords : 0;
     if (rebased) {
         if (!drawRebaseEnabled()) {
             ++counters.refusedOff;
@@ -25,7 +26,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
         }
         const auto fetchWords = variant->vertexInfo == nullptr ? std::uint64_t{0} : fetchTableWords(*variant->vertexInfo);
         const auto forwarded = drawForwardedWords() && now.hiddenUserWords == 0 ? forwardedOnlyWords(*variant, fetchWords) : 0;
-        const auto untagged = moved & ~variant->rebaseWords & ~forwarded;
+        const auto untagged = moved & ~variant->rebaseWords & ~forwarded & ~based;
         if (movedBeyond || untagged != 0) {
             ++counters.refusedUntagged;
             const auto index = movedBeyond ? 64u : static_cast<std::uint32_t>(std::countr_zero(untagged));
@@ -43,6 +44,10 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
             const auto index = static_cast<std::uint32_t>(std::countr_zero(bits));
             const auto from = was.userData[index], to = now.userData[index];
             if (((variant->rebaseWords >> index) & 1u) == 0) {
+                if (((based >> index) & 1u) != 0 && (to == 0 || ((from ^ to) & 3u) != 0)) {
+                    ++counters.refusedPointer;
+                    return nullptr;
+                }
                 forwardVariantWord(*copy, index, to);
                 continue;
             }
@@ -52,6 +57,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
             }
             rebaseVariantWord(*copy, index, from, to);
         }
+        if (based != 0) copy->compiled = patchBufferBaseWords(*copy, based, now.userData);
         applyShaderDataPatches(*copy);
         candidate = std::move(copy);
     }
@@ -72,6 +78,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
         candidate->compiled = patchDataWords(*candidate, candidate->words);
     }
     if (!rebased) ++(data ? counters.equalData : counters.equal);
+    else if (based != 0) ++counters.bufferBases;
     else if ((moved & ~variant->rebaseWords) != 0) ++counters.forwarded;
     else ++(data ? counters.rebasedData : counters.rebased);
     const auto movedWord = [&](std::uint32_t index) { return index < 64u && ((moved >> index) & 1u) != 0; };

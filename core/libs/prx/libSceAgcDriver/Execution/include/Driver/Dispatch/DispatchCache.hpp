@@ -48,6 +48,9 @@ struct DispatchVariant {
     std::uint64_t userDataMask = ~std::uint64_t{0};
     std::uint64_t baseWords = 0;
     std::uint64_t valueWords = ~std::uint64_t{0};
+    std::uint64_t bufferBaseCandidates = 0;
+    std::uint64_t bufferBaseWords = 0;
+    std::vector<std::array<std::uint32_t, 3>> bufferBaseSlots;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

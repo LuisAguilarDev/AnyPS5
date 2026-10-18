@@ -1015,6 +1015,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         }
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
+    result.bufferBaseSlots = std::move(bindings.bufferBaseSlots);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
     if (!tables.map.empty()) {
         result.imageTablePoison.reserve(tables.poison.size());
@@ -1408,6 +1409,32 @@ std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& re
 
 namespace {
 
+// The user words the walk read only as dword 0 of buffer descriptors (inline V# bases) become
+// SrtUserDataUse::asBufferBase, paired with their buffers. Every word read that way joins asValue
+// as before, so a consumer that does not patch the bases keeps the word exact.
+void noteBufferBaseWords(ResourceCapture& capture) {
+    auto& use = capture.userDataUse;
+    if (use.descriptorBases.empty()) return;
+    const auto& plan = *capture.plan;
+    std::uint64_t read = 0, buffers = 0, others = 0;
+    for (const auto& [source, word] : use.descriptorBases) {
+        const auto bit = std::uint64_t {1} << word;
+        read |= bit;
+        const bool shared = std::any_of(plan.info.images.begin(), plan.info.images.end(), [&](const ImageResource& image) { return image.source == source; }) || std::any_of(plan.info.samplers.begin(), plan.info.samplers.end(), [&](const SamplerResource& sampler) { return sampler.source == source; });
+        bool found = false;
+        for (std::uint32_t buffer = 0; buffer < plan.info.buffers.size() && buffer < plan.materializationSources.size(); ++buffer) {
+            if (plan.materializationSources[buffer] != source) continue;
+            found = true;
+            const std::pair<std::uint32_t, std::uint32_t> base{word, buffer};
+            if (std::find(use.bufferBases.begin(), use.bufferBases.end(), base) == use.bufferBases.end()) use.bufferBases.push_back(base);
+        }
+        (found && !shared ? buffers : others) |= bit;
+    }
+    use.asBufferBase = buffers & ~others & ~use.asValue & ~use.asBase;
+    use.asValue |= read;
+    std::erase_if(use.bufferBases, [&](const std::pair<std::uint32_t, std::uint32_t>& base) { return (use.asBufferBase >> base.first & 1u) == 0; });
+}
+
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
@@ -1416,10 +1443,12 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+        noteBufferBaseWords(capture);
         return;
     }
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+    noteBufferBaseWords(capture);
     auto& other = capture.readTrace.otherReads;
     std::sort(other.begin(), other.end());
     other.erase(std::unique(other.begin(), other.end()), other.end());

@@ -44,6 +44,23 @@ const DescriptorSource* Source(const IrResourcePlan& program, std::uint32_t sour
     return &program.descriptorSources[source];
 }
 
+// Dword 0 of a 4-dword source that is a bare user word (an inline V# base) is read from the user
+// data without evaluating the node: it lands in no evaluator cache, so any other use of the word
+// still marks it asValue and SrtUserDataUse::descriptorBases records only this one.
+template<typename TNode>
+bool readDescriptorBase(const IrResourcePlan& program, const SrtRuntime& runtime, std::uint32_t source, std::uint32_t dword, std::uint32_t& value) {
+    const auto* descriptor = Source(program, source);
+    if (runtime.userDataUse == nullptr || descriptor == nullptr || descriptor->dwordCount != 4u || dword != 0u) return false;
+    const TNode node = TNode::SourceDword(program, source, dword);
+    if (node.HasImmediate() || node.Opcode() != IrOpcode::GetUserData) return false;
+    const auto reg = RegIndex(static_cast<ScalarReg>(node.Argument(0).RegisterIndex()));
+    if (reg < program.userDataBase || reg - program.userDataBase >= runtime.userData.size() || reg - program.userDataBase >= SrtUserDataUse::TrackedWords) return false;
+    const auto word = reg - program.userDataBase;
+    value = runtime.userData[word];
+    runtime.userDataUse->descriptorBases.emplace_back(source, word);
+    return true;
+}
+
 template<typename TNode>
 bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) {
     failureReason().clear();
@@ -130,6 +147,7 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
         if (!evaluateFlat || active[sourceIndex]) {
             for (std::uint32_t index = 0; index < source->dwordCount; index++) {
                 inaccessible = {};
+                if (readDescriptorBase<TNode>(program, runtime, sourceIndex, index, value.dwords[index])) continue;
                 if (!evaluator.Evaluate(TNode::SourceDword(program, sourceIndex, index), value.dwords[index])) {
                     if (inaccessible.read != nullptr) {
                         if (debug) std::fprintf(stderr, "[srt] descriptor source %u reads inaccessible 0x%llx at pc 0x%x: zero words\n", sourceIndex, static_cast<unsigned long long>(inaccessible.address), inaccessible.read->Flags<MemoryFlags>().pc);

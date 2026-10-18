@@ -34,6 +34,8 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
 alignas(256) constexpr std::array<std::uint32_t, 10> ArithmeticPixelCode{0xf4000100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x06000002u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 8> InlinePixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 10> InlineAndScalarPixelCode{0xf4000200u, 0xfa000000u, 0xe0300000u, 0x80000000u, 0xbf8c0070u, 0x7e020208u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) std::array<float, 4> PixelConstant{};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 
@@ -47,6 +49,8 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
 alignas(8) Header ArithmeticPixelHeader{};
+alignas(8) Header InlinePixelHeader{};
+alignas(8) Header InlineAndScalarPixelHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -84,13 +88,13 @@ void PixelUserData(std::vector<std::uint32_t>& commands, const std::uint32_t* po
 }
 
 struct Modes {
-    bool verify = false, rebase = true, forwarded = true;
+    bool verify = false, rebase = true, forwarded = true, bufferBases = true;
 };
 
-std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false) {
+std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false, const std::uint32_t* pixelCode = nullptr, std::uint32_t pixelUserWords = 3) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(triangle ? TriangleVertexCode.data() : VertexCode.data());
-    const auto pixel = reinterpret_cast<std::uintptr_t>(triangle && !loadPixel ? ArithmeticPixelCode.data() : PixelCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode != nullptr ? pixelCode : triangle && !loadPixel ? ArithmeticPixelCode.data() : PixelCode.data());
     std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
@@ -114,7 +118,7 @@ std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false) 
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, triangle ? 0u : 1u << 1u}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 3u << 1u},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, pixelUserWords << 1u},
     };
     if (triangle) context.insert(context.end(), {{0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0}});
     std::vector<std::uint32_t> commands;
@@ -145,7 +149,7 @@ void Describe(std::uint32_t* table, std::uint32_t* data, float value) {
 }
 
 std::string CandidateCounts(const AgcDriver::DriverDetail::DrawCandidateCounters& counters) {
-    return std::to_string(counters.tried) + " candidates tried, equal " + std::to_string(counters.equal) + " / " + std::to_string(counters.equalData) + ", rebased " + std::to_string(counters.rebased) + " / " + std::to_string(counters.rebasedData) + ", forwarded " + std::to_string(counters.forwarded) + ", refused " + std::to_string(counters.refusedUntagged) + " untagged / " + std::to_string(counters.refusedOff) + " off, differing " + std::to_string(counters.differingEqual) + " / " + std::to_string(counters.differingRebased);
+    return std::to_string(counters.tried) + " candidates tried, equal " + std::to_string(counters.equal) + " / " + std::to_string(counters.equalData) + ", rebased " + std::to_string(counters.rebased) + " / " + std::to_string(counters.rebasedData) + ", forwarded " + std::to_string(counters.forwarded) + ", buffer bases " + std::to_string(counters.bufferBases) + ", refused " + std::to_string(counters.refusedUntagged) + " untagged / " + std::to_string(counters.refusedOff) + " off, differing " + std::to_string(counters.differingEqual) + " / " + std::to_string(counters.differingRebased);
 }
 
 void UnreadUserWordsKeepTheStage(const Modes& modes) {
@@ -284,6 +288,99 @@ void MovedTablesRenderTheirBuffers(const Modes& modes) {
 
 }
 
+void InlineDescriptor(std::vector<std::uint32_t>& commands, const std::uint32_t* data, std::uint32_t records) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    const std::array<std::uint32_t, 4> descriptor{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, records, 0x31016facu};
+    for (std::uint32_t word = 0; word < descriptor.size(); ++word) Append(commands, 0x76, {0x00c + word, descriptor[word]});
+}
+
+void InlineBufferBasesRenderTheirBuffers(const Modes& modes) {
+    using AgcDriver::DriverDetail::DrawRefusedWord;
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(InlinePixelHeader, InlinePixelCode.data(), sizeof(InlinePixelCode), 1);
+    auto* block = GuestBlock();
+    auto* dataA = block;
+    auto* dataB = block + 1024;
+    auto* dataC = block + 2048;
+    dataA[0] = std::bit_cast<std::uint32_t>(0.25f);
+    dataB[0] = std::bit_cast<std::uint32_t>(0.25f);
+    dataC[0] = std::bit_cast<std::uint32_t>(0.5f);
+    const auto draw = [&](const std::uint32_t* data, std::uint32_t records, bool setup) {
+        auto commands = setup ? Setup(true, true, InlinePixelCode.data(), 4) : std::vector<std::uint32_t>{};
+        InlineDescriptor(commands, data, records);
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    const auto counters = [] { return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters(); };
+    const auto refusedAsBase = [](const AgcDriver::DriverDetail::DrawEntryCounters& value) { return value.candidates.refusedBy[static_cast<std::size_t>(DrawRefusedWord::BufferBase)]; };
+    draw(dataA, 16, true);
+    const auto a = draw(dataA, 16, false);
+    Require(withinTwo(a, 64), "the pixel stage loading 0.25 through an inline V# at A wrote " + std::to_string(a) + ", expected 64");
+
+    const auto beforeB = counters();
+    const auto b = draw(dataB, 16, false);
+    const auto afterB = counters();
+    Require(withinTwo(b, 64), "the pixel stage loading 0.25 through an inline V# at B wrote " + std::to_string(b) + ", expected 64 (" + CandidateCounts(afterB.candidates) + ")");
+    Require(afterB.dataHits == beforeB.dataHits + 1, "moving the inline V# base was not a data-only hit: " + Counts(afterB));
+    if (!modes.rebase) {
+        Require(afterB.candidates.bufferBases == beforeB.candidates.bufferBases, "rebasing off: the moved inline V# base was patched: " + CandidateCounts(afterB.candidates));
+    } else if (!modes.bufferBases) {
+        Require(afterB.candidates.bufferBases == beforeB.candidates.bufferBases && refusedAsBase(afterB) > refusedAsBase(beforeB), "buffer base words off: the moved inline V# base was not refused as a buffer base: " + CandidateCounts(afterB.candidates));
+    } else {
+        Require(afterB.candidates.bufferBases - beforeB.candidates.bufferBases == 1, "the pixel stage whose inline V# base moved was not reused with the base patched: " + CandidateCounts(afterB.candidates));
+        if (modes.verify) Require(afterB.dataVerified - beforeB.dataVerified == 2, "verify mode: the patched draw was not built and compared on both stages: " + Counts(afterB));
+        else Require(afterB.dataDrawsReused - beforeB.dataDrawsReused == 1, "the draw whose inline V# base moved did not reuse both stages: " + Counts(afterB));
+    }
+
+    const auto beforeC = counters();
+    const auto c = draw(dataC, 16, false);
+    const auto afterC = counters();
+    Require(withinTwo(c, 128), "the pixel stage loading 0.5 through an inline V# at C wrote " + std::to_string(c) + ", expected 128 (" + CandidateCounts(afterC.candidates) + ")");
+    if (modes.rebase && modes.bufferBases) Require(afterC.candidates.bufferBases - beforeC.candidates.bufferBases == 1, "the inline V# moved to C was not patched: " + CandidateCounts(afterC.candidates));
+
+    const auto beforeRecords = counters();
+    const auto d = draw(dataC, 32, false);
+    const auto afterRecords = counters();
+    Require(withinTwo(d, 128), "the pixel stage loading 0.5 through an inline V# at C with 32 records wrote " + std::to_string(d) + ", expected 128");
+    Require(afterRecords.candidates.bufferBases == beforeRecords.candidates.bufferBases, "an inline V# whose record count changed was patched: " + CandidateCounts(afterRecords.candidates));
+
+    dataC[0] = std::bit_cast<std::uint32_t>(0.75f);
+    const auto again = draw(dataB, 16, false);
+    Require(withinTwo(again, 64), "the pixel stage loading 0.25 through an inline V# back at B wrote " + std::to_string(again) + ", expected 64");
+    const auto last = draw(dataC, 16, false);
+    Require(withinTwo(last, 191), "the pixel stage loading 0.75 through an inline V# back at C wrote " + std::to_string(last) + ", expected 191 (" + CandidateCounts(counters().candidates) + ")");
+}
+
+void InlineBasesTheWalkReadsStayExact(const Modes& modes) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(InlineAndScalarPixelHeader, InlineAndScalarPixelCode.data(), sizeof(InlineAndScalarPixelCode), 1);
+    auto* block = GuestBlock();
+    auto* dataA = block;
+    auto* dataB = block + 1024;
+    dataA[0] = std::bit_cast<std::uint32_t>(0.25f);
+    dataB[0] = std::bit_cast<std::uint32_t>(0.5f);
+    const auto draw = [&](const std::uint32_t* data, bool setup) {
+        auto commands = setup ? Setup(true, true, InlineAndScalarPixelCode.data(), 4) : std::vector<std::uint32_t>{};
+        InlineDescriptor(commands, data, 16);
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    draw(dataA, true);
+    const auto a = draw(dataA, false);
+    Require(withinTwo(a, 64), "the pixel stage loading 0.25 through an inline V# it also reads as a pointer wrote " + std::to_string(a) + ", expected 64");
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto b = draw(dataB, false);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(withinTwo(b, 128), "the pixel stage loading 0.5 through a moved inline V# it also reads as a pointer wrote " + std::to_string(b) + ", expected 128 (" + CandidateCounts(after.candidates) + ")");
+    Require(after.candidates.bufferBases == before.candidates.bufferBases, "an inline V# base the walk also reads through was patched: " + CandidateCounts(after.candidates));
+    const auto both = static_cast<std::size_t>(AgcDriver::DriverDetail::DrawRefusedWord::BaseAndValue);
+    if (modes.rebase) Require(after.candidates.refusedBy[both] > before.candidates.refusedBy[both], "an inline V# base the walk also reads through was not refused as a base and a value: " + CandidateCounts(after.candidates));
+}
+
 int main() {
     try {
         bool libraries = false;
@@ -297,9 +394,12 @@ int main() {
         modes.verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr || std::getenv("APS5_VERIFY_DRAW_REBASE") != nullptr;
         modes.rebase = std::getenv("APS5_NO_DRAW_REBASE") == nullptr;
         modes.forwarded = std::getenv("APS5_NO_DRAW_FORWARDED_WORDS") == nullptr;
+        modes.bufferBases = std::getenv("APS5_NO_DRAW_BUFFER_BASE_WORDS") == nullptr;
         UnreadUserWordsKeepTheStage(modes);
         ReadUserWordsChangeTheOutput(modes);
         MovedTablesRenderTheirBuffers(modes);
+        InlineBufferBasesRenderTheirBuffers(modes);
+        InlineBasesTheWalkReadsStayExact(modes);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (modes.verify ? "verified" : "reused") << " the stages whose read user words did not change" << (modes.rebase ? " or whose tables only moved" : "") << '\n';
         return 0;

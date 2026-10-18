@@ -3075,9 +3075,11 @@ std::size_t Recorder::ChunkDraws() {
 DrawRecorders* Recorder::Recorders() {
     if (!recordersMade) {
         recordersMade = true;
-        // Chunks hold no timing or sample queries: the batch-wide ranges and sample slots stay on
-        // the spine's command buffers, so either profile records every draw there.
-        if (DrawRecordThreads() != 0 && !GpuTimingEnabled() && !BatchStampsEnabled()) recorders = std::make_unique<DrawRecorders>(context, *this, DrawRecordThreads());
+        // Chunks hold no timing or sample queries. GPU timing ranges every draw on the spine; the
+        // batch stamps (APS5_PROFILE_DRAW, the performance trace) stay on the spine's command
+        // buffers: the batch's first one opens the range before any chunk and its last one, which
+        // follows every chunk in submit order (JoinChunk starts a fresh one), closes it.
+        if (DrawRecordThreads() != 0 && !GpuTimingEnabled()) recorders = std::make_unique<DrawRecorders>(context, *this, DrawRecordThreads());
     }
     // Sample counting starts on demand (the sample dump's first query): every draw from then on
     // records on the spine.

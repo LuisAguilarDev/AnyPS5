@@ -1867,6 +1867,14 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     set_tests_properties(agc_driver_draw_cache_reuse_chunked PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+    # The draw profile's batch stamps stay on the spine's command buffers, so chunks are still
+    # recorded under APS5_PROFILE_DRAW (the flood asserts that its draws went through chunks).
+    add_test(NAME agc_driver_chunked_draw_flood_profiled COMMAND agc_driver_chunked_draw_flood_tests)
+    set_tests_properties(agc_driver_chunked_draw_flood_profiled PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_RECORD_THREADS=3;APS5_DRAW_CHUNK_DRAWS=2;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_chunked_draw_flood_profiled PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     set_property(TEST agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_RECIPE=1" "APS5_VERIFY_REGISTER_KEYS=1")
     add_test(NAME agc_driver_draw_data_hit_user_words_verify COMMAND agc_driver_draw_data_hit_user_words_tests)
     set_tests_properties(agc_driver_draw_data_hit_user_words_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_DATA_HITS=1" SKIP_RETURN_CODE 77)

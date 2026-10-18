@@ -432,7 +432,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         ~Release() {
             recorder.Sync();
             writers.clear();
-            DrawCopiedWriters()->clear();
+            ClearDrawCopiedWriters();
             if (pipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
             if (layout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
             if (module) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
@@ -499,12 +499,14 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         copiedContext.dmaBufImport = false;
         auto copied = std::make_shared<ShaderResources>(copiedContext, compute);
         Require(copied->HasCopiedWrites(), "ordering producer did not take the copied path");
-        auto& pending = mode == 2 ? *DrawCopiedWriters() : writers;
-        pending.push_back(copied);
+        const bool drawList = mode == 2;
+        if (drawList) ListDrawCopiedWriter(copied);
+        else writers.push_back(copied);
         update(copied, 1);
-        recorder.OnComplete([copied, &pending] {
+        recorder.OnComplete([copied, drawList, &writers] {
             copied->WriteBackBuffers();
-            std::erase(pending, copied);
+            if (drawList) DelistDrawCopiedWriter(copied);
+            else std::erase(writers, copied);
         });
         Require(!recorder.Idle() && *block == 10, "copied producer was completed before the consumer test");
         if (mode == 0) direct = std::make_shared<ShaderResources>(context, compute);
@@ -6845,6 +6847,102 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+// Uses of one cached template on several threads at once, each with its own recorder and without
+// the GPU lock (the multi-threaded draw translation): every use proves the template (Revalidate,
+// which rewrites its proof records and takes the GPU lock for its flushes) and marks its writes
+// (MarkGpuWrites, without the GPU lock). APS5_VERIFY_TEMPLATE_USES=1
+// (this mode sets it) fails a use that finds another thread inside one; every proof must hold.
+void sharedTemplateProofTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    context.nullDescriptors = device.NullDescriptors();
+    if (context.hostImportAlignment == 0 || !context.nullDescriptors || !AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "Host imports, null descriptors or write watching unavailable: shared template proof test skipped\n";
+        return;
+    }
+    recorder.Sync();
+    const auto bytes = static_cast<std::size_t>(std::max<VkDeviceSize>(131072, context.hostImportAlignment));
+    auto* block = static_cast<std::uint32_t*>(AllocateWatched(bytes, bytes));
+    Require(block != nullptr, "allocate shared template memory");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    struct Release {
+        const Context& context;
+        Recorder& recorder;
+        std::uint32_t* block;
+        std::size_t bytes;
+        ~Release() {
+            recorder.Sync();
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            static_cast<void>(HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes));
+            recorder.Sync();
+            ReleaseWatched(block, bytes);
+        }
+    } release{context, recorder, block, bytes};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    std::memset(block, 0, bytes);
+    Require(HostImportFor(context, address, bytes) != nullptr, "import shared template memory");
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
+    binding.bufferWritten = {true};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto shared = std::make_shared<ShaderResources>(context, compute);
+    Require(shared->Reusable(), "the shared template is not reusable");
+    constexpr std::uint32_t threads = 4;
+    constexpr std::uint32_t uses = 5000;
+    std::atomic<std::uint32_t> ready{0};
+    std::atomic<std::uint32_t> failed{0};
+    std::mutex failureMutex;
+    std::string failure;
+    std::vector<std::thread> users;
+    {
+        // The harness holds the GPU lock once; the users run without it.
+        GpuMutex().unlock();
+        struct Relock {
+            ~Relock() { GpuMutex().lock(); }
+        } relock;
+        for (std::uint32_t thread = 0; thread < threads; ++thread) {
+            users.emplace_back([&] {
+                try {
+                    Recorder own(context);
+                    {
+                        // Opening a recorder's batch still needs the GPU lock (the recording
+                        // contexts are the spine's part), so it is opened before the uses.
+                        std::lock_guard gpu(GpuMutex());
+                        static_cast<void>(own.Commands());
+                    }
+                    ready.fetch_add(1);
+                    while (ready.load() != threads) std::this_thread::yield();
+                    for (std::uint32_t use = 0; use < uses; ++use) {
+                        if (!shared->Revalidate(compute)) failed.fetch_add(1);
+                        shared->MarkGpuWrites(own);
+                    }
+                    std::lock_guard gpu(GpuMutex());
+                    own.Sync();
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(failureMutex);
+                    failure = error.what();
+                }
+            });
+        }
+        for (auto& user : users) user.join();
+    }
+    Require(failure.empty(), "a concurrent use of one template failed: " + failure);
+    Require(failed.load() == 0, "a concurrent proof of an unchanged template did not hold");
+    shared.reset();
+}
+
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -8363,6 +8461,16 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-template-proof-only") {
+#ifdef _WIN32
+            _putenv_s("APS5_VERIFY_TEMPLATE_USES", "1");
+#else
+            setenv("APS5_VERIFY_TEMPLATE_USES", "1", 1);
+#endif
+            sharedTemplateProofTests(device, recorder);
+            std::cout << "shared template uses survive concurrent recorders\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {

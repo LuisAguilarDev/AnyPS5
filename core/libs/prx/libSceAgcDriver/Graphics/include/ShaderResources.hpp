@@ -597,6 +597,14 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    // Draws of one cached template may be recorded on several threads at once: this serializes the
+    // uses that write its per-use state, the proof records above (Revalidate) and its buffers' GPU
+    // copy-back marks (MarkGpuWrites). Taken after the GPU lock, which a proof takes first (see
+    // UseScope). APS5_VERIFY_TEMPLATE_USES=1 counts the threads inside one and fails a use that
+    // finds another there.
+    SlimMutex useMutex;
+    std::atomic<std::uint32_t> users{0};
+    class UseScope;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).
     std::uint64_t dataWordsHash = 14695981039346656037ull;
     void rehashDataWords();

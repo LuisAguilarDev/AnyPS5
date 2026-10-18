@@ -2824,9 +2824,41 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
     return nullptr;
 }
 
+// One use of a shared template that writes its per-use state, under its use lock (see useMutex).
+// Lock order: the GPU lock, then a use lock. A proof flushes pending images and refreshes surfaces
+// under the GPU lock (StorageTexture::FlushPending takes it), so a proof on a thread without it
+// takes it first (`gpuFirst`); the copy-back marks take no lock that could wait for it.
+class ShaderResources::UseScope {
+public:
+    UseScope(ShaderResources& resources, bool gpuFirst) : resources(resources) {
+        if (gpuFirst && !GuestMemory::GpuMutex().HeldByThisThread()) gpu = std::unique_lock(GuestMemory::GpuMutex());
+        resources.useMutex.lock();
+        if (Verify() && resources.users.fetch_add(1, std::memory_order_relaxed) != 0) {
+            resources.users.fetch_sub(1, std::memory_order_relaxed);
+            resources.useMutex.unlock();
+            throw std::runtime_error("two threads are inside one use of a shared template");
+        }
+    }
+    ~UseScope() {
+        if (Verify()) resources.users.fetch_sub(1, std::memory_order_relaxed);
+        resources.useMutex.unlock();
+    }
+    UseScope(const UseScope&) = delete;
+    UseScope& operator=(const UseScope&) = delete;
+
+private:
+    static bool Verify() {
+        static const bool verify = std::getenv("APS5_VERIFY_TEMPLATE_USES") != nullptr;
+        return verify;
+    }
+    ShaderResources& resources;
+    std::unique_lock<GuestMemory::GpuMutexType> gpu;
+};
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    const UseScope use(*this, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -4816,12 +4848,16 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     }
     // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
     // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
-    // and the note and mark below cover them like direct writes.
-    guestMemory.RecordCopyBacks(recorder);
-    // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
-    // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
-    guestMemory.MarkDirectWrites();
+    // and the note and mark below cover them like direct writes. The marks are per-use state of a
+    // shared template, so under its use lock.
+    {
+        const UseScope use(*this, false);
+        guestMemory.RecordCopyBacks(recorder);
+        // Only the written elements' ranges (AddWritable): a read-only element is neither noted
+        // here nor marked as a direct write, so CPU reads of its memory never wait for this work.
+        recorder.NotePendingWrites(guestMemory.Writes());
+        guestMemory.MarkDirectWrites();
+    }
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

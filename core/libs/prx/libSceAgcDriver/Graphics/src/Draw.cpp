@@ -2021,6 +2021,8 @@ Recorder::PassSample passSample(const State& state, std::span<const CompiledShad
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
+    // The record calls go through the recorder's recording context (the draw snapshot caches and arena).
+    auto& recording = recorder->Main();
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
@@ -2045,7 +2047,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
     timer.part(RecordPrologue);
-    const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, timer.bindingsProfile());
+    const auto drawBindings = resources.PrepareDrawBindings(recording, record.moved, timer.bindingsProfile());
     timer.part(RecordBindings);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -2067,16 +2069,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recording.StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
-    if (!continued) recorder->PrepareSampleSlot();
+    if (!continued) recording.PrepareSampleSlot();
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
-    const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    const auto drawTiming = !continued ? recording.BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2088,7 +2090,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         for (const auto& target : record.targets) {
             if (target != nullptr) images.emplace_back(target->Image(), true);
         }
-        recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
+        recording.NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     timer.part(RecordPass);
     std::unique_ptr<DeviceBuffer> scratch;
@@ -2125,7 +2127,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         timer.part(RecordBarriers);
-        if (Recorder::GpuTimingEnabled()) recorder->BeginPassTiming(passTarget(state), passSample(state, shaders));
+        if (Recorder::GpuTimingEnabled()) recording.BeginPassTiming(passTarget(state), passSample(state, shaders));
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
         timer.part(RecordBegin);
     }
@@ -2146,7 +2148,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
-        for (const auto& [reference, pipeline] : record.stencilReplay) recorder->Keep(pipeline);
+        for (const auto& [reference, pipeline] : record.stencilReplay) recording.Keep(pipeline);
     }
     if (record.pipeline->SplitsFaces()) {
         record.pipeline->ContinueBackFaces(commands, state);
@@ -2156,7 +2158,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
-    if (meshArguments != nullptr) recorder->Keep(meshArguments);
+    if (meshArguments != nullptr) recording.Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
@@ -2170,8 +2172,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
-    recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
-    recorder->CountPassDraw(Recorder::GpuTimingEnabled() ? fragmentFlags(fragmentProgram(shaders)) : 0);
+    recording.LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    recording.CountPassDraw(Recorder::GpuTimingEnabled() ? fragmentFlags(fragmentProgram(shaders)) : 0);
     timer.part(RecordLeave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);

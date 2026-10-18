@@ -4528,6 +4528,10 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingsProfile* profile) const {
+    return PrepareDrawBindings(recorder.Main(), moved, profile);
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved, DrawBindingsProfile* profile) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -4655,7 +4659,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         result->snapshots.push_back({begin, std::move(buffer)});
         totalSnapshotBytes += bytes;
         countSnapshot(bytes, override != moved.end(), copied);
-        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+        CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.OpenSerial()), static_cast<unsigned long long>(begin), bytes);
     }
     lap(&DrawBindingsProfile::snapshotUs);
     if (selected.empty()) return {};

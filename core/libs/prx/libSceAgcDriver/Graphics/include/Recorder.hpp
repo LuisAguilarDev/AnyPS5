@@ -26,6 +26,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class RecordingContext;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -167,6 +168,10 @@ public:
     static constexpr std::uint32_t StreamedInputMisses = 2;
     static constexpr std::uint32_t StreamedInputRetryUses = 256;
     static constexpr std::size_t StreamedInputEntries = 65536;
+    // The draw snapshot caches below, the snapshot arena and the record calls of a draw live in a
+    // RecordingContext; these forward to the recorder's own (Main), the one every draw records
+    // through on the thread that holds GuestMemory::GpuMutex.
+    RecordingContext& Main() { return *mainContext; }
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     // `stale`, when given, says whether a miss found an entry whose guest bytes changed since.
@@ -917,6 +922,54 @@ private:
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;
     std::chrono::steady_clock::time_point newestSubmittedAt{};
+    // The draw snapshot caches, the arena and the record calls of draws recorded on the mutex holder.
+    std::unique_ptr<RecordingContext> mainContext;
+    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
+    mutable bool publishedWriteRangesValid = false;
+};
+
+// What the record phase of a draw (its descriptor sets, snapshots and commands, after everything
+// it depends on was resolved) records through: the draw snapshot arena and caches, and the calls
+// that start, continue and leave its render pass, keep its objects and time it. A recorder owns
+// one (Recorder::Main), which records into the recorder's open batch under GuestMemory::GpuMutex;
+// every member is used by one thread at a time. The arena's slices may be released on any thread
+// (a kept batch's objects), so its reuse test (use_count() == 1) holds for the owner alone.
+class RecordingContext {
+public:
+    RecordingContext(const Context& context, Recorder& owner);
+    RecordingContext(const RecordingContext&) = delete;
+    RecordingContext& operator=(const RecordingContext&) = delete;
+    using SnapshotUse = Recorder::SnapshotUse;
+    using DrawInputOutcome = Recorder::DrawInputOutcome;
+
+    // The draw snapshot caches (see Recorder::DrawSnapshotBuffer and its neighbours).
+    std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp);
+    void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, bool* stale = nullptr);
+    void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    std::shared_ptr<Buffer> DrawSnapshotBuffer(std::size_t bytes);
+    void NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome);
+    bool StreamedDrawInput(std::uint64_t address);
+    bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
+    void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
+
+    // The record calls (see the Recorder members of the same names).
+    Recorder::DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    void KeepBytes(const void* owner, std::size_t bytes);
+    void PrepareSampleSlot();
+    std::uint32_t BeginGpuTiming(Recorder::CommandClass which);
+    void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    void BeginPassTiming(const Recorder::PassTarget& target, const Recorder::PassSample& sample);
+    void CountPassDraw(std::uint8_t fragmentFlags);
+    void NoteAccess(Recorder::CommandClass which, const Recorder::Access& access);
+    // Whether work recorded before this draw writes the range (Recorder::PendingWriteOverlaps).
+    bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // The serial the batch recorded into will get (the [capture] trace's batch number).
+    std::uint64_t OpenSerial() const;
+
+private:
     using DrawSnapshotKey = std::tuple<std::uint64_t, SnapshotUse, std::size_t>;
     struct DrawSnapshot {
         std::uint64_t generation;
@@ -929,35 +982,36 @@ private:
         std::list<DrawSnapshotKey> recency;
         std::size_t bytes = 0;
     };
-    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
     struct UnwrittenSnapshot {
         std::size_t bytes;
         std::shared_ptr<Buffer> buffer;
     };
-    std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
-    std::array<std::uint64_t, 3> unwrittenStamp{};
-    std::size_t unwrittenBytes = 0;
-    void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
-    std::array<DrawSnapshotPool, 2> drawSnapshotPools;
-    std::shared_ptr<Buffer> snapshotArena;
-    std::size_t snapshotArenaUsed = 0;
     struct StreamedInput {
         std::uint32_t misses = 0;
         std::uint32_t inPlaceUses = 0;
     };
-    std::unordered_map<std::uint64_t, StreamedInput> streamedInputs;
-    void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
         std::list<DrawSnapshotKey>::iterator recent;
         std::optional<std::uint32_t> highest;
     };
+    void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
+    void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+
+    Context context;
+    Recorder& owner;
+    std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    std::array<std::uint64_t, 3> unwrittenStamp{};
+    std::size_t unwrittenBytes = 0;
+    std::shared_ptr<Buffer> snapshotArena;
+    std::size_t snapshotArenaUsed = 0;
+    std::unordered_map<std::uint64_t, StreamedInput> streamedInputs;
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
-    bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
-    mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
-    mutable bool publishedWriteRangesValid = false;
 };
 
 }

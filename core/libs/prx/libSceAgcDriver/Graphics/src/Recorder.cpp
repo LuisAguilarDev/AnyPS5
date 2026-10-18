@@ -1074,7 +1074,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
 
 }
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), mainContext(std::make_unique<RecordingContext>(context, *this)) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -2687,42 +2687,42 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
-void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
+void RecordingContext::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
 }
 
-void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
+void RecordingContext::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     if (stamp == unwrittenStamp) return;
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
 }
 
-std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
+std::shared_ptr<Buffer> RecordingContext::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) {
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
     if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
     return found->second.buffer;
 }
 
-void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
+void RecordingContext::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) {
     retireUnwrittenSnapshots(stamp);
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
         unwrittenBytes -= found->second.bytes;
         unwrittenSnapshots.erase(found);
     }
-    if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
+    if (unwrittenSnapshots.size() >= Recorder::UnwrittenSnapshotEntries || bytes > Recorder::DrawSnapshotBudget - unwrittenBytes) return;
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer)});
     unwrittenBytes += bytes;
 }
 
-std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
+std::shared_ptr<Buffer> RecordingContext::DrawSnapshotBuffer(std::size_t bytes) {
     static const bool separate = std::getenv("APS5_NO_DRAW_SNAPSHOT_ARENA") != nullptr;
     constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (separate || bytes > DrawSnapshotSliceBytes) return std::make_shared<Buffer>(context, bytes, usage);
+    if (separate || bytes > Recorder::DrawSnapshotSliceBytes) return std::make_shared<Buffer>(context, bytes, usage);
     // Slices start on a cache line and the storage buffer offset alignment. Only the slices keep the
     // arena alive past this recorder's hold: a recorded draw keeps its bindings (and so its slices)
     // until its batch completed, so an arena no slice holds any more is free to be filled again
@@ -2734,17 +2734,17 @@ std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) {
         std::atomic_thread_fence(std::memory_order_acquire);
         offset = 0;
     }
-    if (snapshotArena == nullptr || offset + bytes > DrawSnapshotArenaBytes) {
+    if (snapshotArena == nullptr || offset + bytes > Recorder::DrawSnapshotArenaBytes) {
         // Device-local under APS5_DEVICE_LOCAL_DRAW_BUFFERS (see DrawInputBuffer): the CPU only
         // copies into the slices, so the shaders read them from video memory.
-        snapshotArena = DrawInputBuffer(context, DrawSnapshotArenaBytes, usage);
+        snapshotArena = DrawInputBuffer(context, Recorder::DrawSnapshotArenaBytes, usage);
         offset = 0;
     }
     snapshotArenaUsed = offset + bytes;
     return std::make_shared<Buffer>(snapshotArena, static_cast<VkDeviceSize>(offset), bytes);
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* stale) {
+std::shared_ptr<Buffer> RecordingContext::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* stale) {
     if (stale != nullptr) *stale = false;
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) return {};
@@ -2763,31 +2763,31 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     return found->second.buffer;
 }
 
-void Recorder::NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome) {
+void RecordingContext::NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome) {
     if (outcome == DrawInputOutcome::Absent) return;
     const auto found = streamedInputs.find(address);
     if (outcome == DrawInputOutcome::Reused) {
         if (found != streamedInputs.end()) found->second.misses = 0;
         return;
     }
-    if (found == streamedInputs.end() && streamedInputs.size() >= StreamedInputEntries) streamedInputs.clear();
+    if (found == streamedInputs.end() && streamedInputs.size() >= Recorder::StreamedInputEntries) streamedInputs.clear();
     auto& entry = streamedInputs[address];
-    entry.misses += outcome == DrawInputOutcome::Untracked ? StreamedInputMisses : 1u;
+    entry.misses += outcome == DrawInputOutcome::Untracked ? Recorder::StreamedInputMisses : 1u;
     entry.inPlaceUses = 0;
 }
 
-bool Recorder::StreamedDrawInput(std::uint64_t address) {
+bool RecordingContext::StreamedDrawInput(std::uint64_t address) {
     static const bool copyAll = std::getenv("APS5_NO_STREAMED_DRAW_INPUTS") != nullptr;
     if (copyAll) return false;
     const auto found = streamedInputs.find(address);
-    if (found == streamedInputs.end() || found->second.misses < StreamedInputMisses) return false;
-    if (++found->second.inPlaceUses < StreamedInputRetryUses) return true;
-    found->second.misses = StreamedInputMisses - 1;
+    if (found == streamedInputs.end() || found->second.misses < Recorder::StreamedInputMisses) return false;
+    if (++found->second.inPlaceUses < Recorder::StreamedInputRetryUses) return true;
+    found->second.misses = Recorder::StreamedInputMisses - 1;
     found->second.inPlaceUses = 0;
     return false;
 }
 
-bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
+bool RecordingContext::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes) {
     const auto held = entry.buffer->Bytes();
     if (held.size() != bytes || bytes == 0) return false;
     constexpr std::uint64_t block = 65536;
@@ -2834,10 +2834,10 @@ bool Recorder::refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, s
     return true;
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
+void RecordingContext::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) {
     const bool storage = use == SnapshotUse::Storage;
-    const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
-    const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
+    const auto budget = storage ? Recorder::DrawSnapshotBudget : Recorder::DrawInputBudget;
+    const auto maxEntries = storage ? Recorder::DrawSnapshotEntries : Recorder::DrawInputEntries;
     auto& pool = drawSnapshotPools[SnapshotPool(use)];
     if (generation == 0 || bytes > budget) return;
     if (use == SnapshotUse::Vertex) {
@@ -2857,7 +2857,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     pool.bytes += bytes;
 }
 
-bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
+bool RecordingContext::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
     const auto found = indexRanges.find({address, use, bytes});
     if (found == indexRanges.end()) return false;
     if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
@@ -2870,7 +2870,7 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
     return true;
 }
 
-void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) {
+void RecordingContext::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) {
     Require(use != SnapshotUse::Storage && use != SnapshotUse::Vertex, "a highest index belongs to an index buffer");
     if (generation == 0) return;
     const DrawSnapshotKey key{address, use, bytes};
@@ -2878,7 +2878,7 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
         indexRangeRecency.erase(found->second.recent);
         indexRanges.erase(found);
     }
-    while (indexRanges.size() >= IndexRangeEntries) {
+    while (indexRanges.size() >= Recorder::IndexRangeEntries) {
         indexRanges.erase(indexRangeRecency.front());
         indexRangeRecency.pop_front();
     }
@@ -2890,6 +2890,31 @@ void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, Snapsh
         throw;
     }
 }
+
+RecordingContext::RecordingContext(const Context& context, Recorder& owner) : context(context), owner(owner) {}
+
+Recorder::DrawPassStart RecordingContext::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access) { return owner.StartDrawPass(key, forced, fenced, access); }
+void RecordingContext::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) { owner.LeaveRenderPassOpen(key, timing, fenced, access, std::move(afterPass)); }
+void RecordingContext::Keep(std::shared_ptr<void> object, std::size_t bytes) { owner.Keep(std::move(object), bytes); }
+void RecordingContext::KeepBytes(const void* keeper, std::size_t bytes) { owner.KeepBytes(keeper, bytes); }
+void RecordingContext::PrepareSampleSlot() { owner.PrepareSampleSlot(); }
+std::uint32_t RecordingContext::BeginGpuTiming(Recorder::CommandClass which) { return owner.BeginGpuTiming(which); }
+void RecordingContext::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) { owner.EndGpuTiming(index, bytes); }
+void RecordingContext::BeginPassTiming(const Recorder::PassTarget& target, const Recorder::PassSample& sample) { owner.BeginPassTiming(target, sample); }
+void RecordingContext::CountPassDraw(std::uint8_t fragmentFlags) { owner.CountPassDraw(fragmentFlags); }
+void RecordingContext::NoteAccess(Recorder::CommandClass which, const Recorder::Access& access) { owner.NoteAccess(which, access); }
+std::uint64_t RecordingContext::OpenSerial() const { return owner.OpenSerial(); }
+bool RecordingContext::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const { return owner.PendingWriteOverlaps(address, bytes); }
+
+std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp) { return mainContext->UnwrittenDrawSnapshot(address, bytes, stamp); }
+void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer) { mainContext->NoteUnwrittenDrawSnapshot(address, bytes, stamp, std::move(buffer)); }
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, bool* stale) { return mainContext->ReusableDrawSnapshot(address, bytes, use, derived, generation, stale); }
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived) { mainContext->KeepDrawSnapshot(address, bytes, generation, registryGeneration, std::move(buffer), use, derived); }
+std::shared_ptr<Buffer> Recorder::DrawSnapshotBuffer(std::size_t bytes) { return mainContext->DrawSnapshotBuffer(bytes); }
+void Recorder::NoteDrawInputCopy(std::uint64_t address, DrawInputOutcome outcome) { mainContext->NoteDrawInputCopy(address, outcome); }
+bool Recorder::StreamedDrawInput(std::uint64_t address) { return mainContext->StreamedDrawInput(address); }
+bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) { return mainContext->KnownHighestIndex(address, bytes, use, highest); }
+void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) { mainContext->KeepHighestIndex(address, bytes, use, generation, registryGeneration, highest); }
 
 void Recorder::OnComplete(std::function<void()> action) {
     ensureOpen();

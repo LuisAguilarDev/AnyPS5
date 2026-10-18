@@ -25,6 +25,7 @@ namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::Graphics {
 
 class Recorder;
+class RecordingContext;
 
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
@@ -187,6 +188,8 @@ public:
         double wordUs = 0;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
+    // The same through a recording context (Recorder::Main for the overload above).
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(RecordingContext& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingsProfile* profile = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();

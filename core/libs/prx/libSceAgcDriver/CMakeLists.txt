@@ -212,6 +212,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawRecorders.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
@@ -1438,6 +1439,7 @@ set_target_properties(agc_driver_mesh_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_mesh_tests)
 
 set(ANYPS5_AGC_EXECUTION_TESTS "" CACHE STRING "tests/execution sources to build, by file name without extension; the others build a stub that reports a skip. Empty builds all")
+option(ANYPS5_AGC_CHUNKED_VARIANTS "Register a _chunked variant (lean draws recorded in chunks of two on recorder threads) of every tests/execution test" OFF)
 file(GLOB agcExecutionTestSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/execution/*.cpp)
 set(agcExecutionTests)
 foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
@@ -1782,10 +1784,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_descriptor_pool_reset_failure COMMAND agc_driver_graphics_tests --descriptor-pool-reset-failure)
     add_test(NAME agc_driver_address_space_teardown COMMAND agc_driver_graphics_tests --address-space-teardown)
     set_tests_properties(agc_driver_address_space_teardown PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    # Several recorder threads sharing one cached template (the multi-threaded draw translation).
+    add_test(NAME agc_driver_shared_template_scratch COMMAND agc_driver_graphics_tests --shared-template-scratch)
+    set_tests_properties(agc_driver_shared_template_scratch PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    add_test(NAME agc_driver_lru_stamps COMMAND agc_driver_graphics_tests --lru-stamps)
+    add_test(NAME agc_driver_lru_stamps_spliced COMMAND agc_driver_graphics_tests --lru-stamps)
+    set_tests_properties(agc_driver_lru_stamps PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
+    set_tests_properties(agc_driver_lru_stamps_spliced PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_LRU_STAMPS=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 120)
     add_test(NAME agc_driver_pm4_failure_inline COMMAND agc_driver_pm4_tests failure)
     set_tests_properties(agc_driver_pm4_failure_inline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PIPELINED_DRAWS=0" SKIP_RETURN_CODE 77)
     if(WIN32)
-        set_tests_properties(agc_driver_pm4_failure agc_driver_pm4_failure_inline agc_descriptor_pool_reset_failure agc_driver_address_space_teardown PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_pm4_failure agc_driver_pm4_failure_inline agc_descriptor_pool_reset_failure agc_driver_address_space_teardown agc_driver_shared_template_scratch agc_driver_lru_stamps agc_driver_lru_stamps_spliced PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(NOT WIN32)
@@ -1818,6 +1827,32 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    # Lean draws recorded in chunks of two on recorder threads (APS5_DRAW_RECORD_THREADS, see
+    # Recorder::JoinChunk): the chunk ordering tests, the draw-heavy PM4 tests, and with
+    # ANYPS5_AGC_CHUNKED_VARIANTS=ON every tests/execution test.
+    set(agcChunkedTests agc_driver_chunked_label_order agc_driver_chunked_target_feedback agc_driver_chunked_dispatch_reads agc_driver_chunked_draw_flood
+        agc_driver_sample_mask_draw agc_driver_vertex_clip_cull_draw agc_driver_layered_volume_submit agc_driver_draw_cache_reuse agc_driver_draw_data_hit_user_words
+        agc_driver_draw_cache_relocation agc_driver_fragment_user_data_tail agc_driver_vertex_user_data_tail agc_driver_msaa_enable_single_sample
+        agc_driver_inactive_vertex_point_size agc_driver_indirect_patched_stage agc_driver_mesh_index_cache agc_driver_pipelined_dispatch agc_driver_pipelined_dma
+        agc_driver_pipelined_predicated_label_order agc_driver_same_queue_label_wait agc_driver_unimported_label_order agc_driver_pm4)
+    if(ANYPS5_AGC_CHUNKED_VARIANTS)
+        foreach(agcTest IN LISTS agcExecutionTests)
+            string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
+            if(TEST ${agcTestName} AND NOT agcTestName IN_LIST agcChunkedTests)
+                list(APPEND agcChunkedTests ${agcTestName})
+            endif()
+        endforeach()
+    endif()
+    set_tests_properties(agc_driver_chunked_draw_flood agc_driver_chunked_recorder_failure PROPERTIES TIMEOUT 120)
+    foreach(agcChunkedTest IN LISTS agcChunkedTests)
+        add_test(NAME ${agcChunkedTest}_chunked COMMAND ${agcChunkedTest}_tests)
+        set_tests_properties(${agcChunkedTest}_chunked PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_RECORD_THREADS=3;APS5_DRAW_CHUNK_DRAWS=2" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcChunkedTest}_chunked PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_driver_draw_cache_reuse_chunked PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     set_property(TEST agc_driver_draw_cache_reuse agc_driver_draw_cache_reuse_off APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_DRAW_RECIPE=1" "APS5_VERIFY_REGISTER_KEYS=1")
     add_test(NAME agc_driver_pool_lookup_label_order_pool COMMAND agc_driver_pool_lookup_label_order_tests)
     set_tests_properties(agc_driver_pool_lookup_label_order_pool PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PREP_THREADS=3" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

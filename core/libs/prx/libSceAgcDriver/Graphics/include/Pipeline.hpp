@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -91,6 +92,8 @@ private:
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
     bool sampleLocationsEnabled = false;
+    // Guarded by framebufferMutex (AcquireFramebuffer); release and Abandon run with no draw recording.
+    SlimMutex framebufferMutex;
     std::vector<CachedFramebuffer> framebuffers;
 };
 

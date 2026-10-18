@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCacheMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
@@ -378,7 +379,7 @@ private:
     DrawRelocationPending drawRelocationPending;
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
-    std::mutex drawCacheMutex;
+    DrawCacheMutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;

@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <shared_mutex>
 
 namespace AgcDriver::DriverDetail {
 
@@ -222,25 +224,56 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
-            std::lock_guard cacheLock(drawCacheMutex);
-            auto& counters = drawEntryCounters;
-            counters.stageValidations += stageValidations;
-            counters.stageEqual += stageEqual;
-            counters.variantsCompared += compared;
-            counters.validateSteps += validateSteps().Since(stepsBefore);
-            if (drawHit) {
-                ++counters.hits;
-                counters.stageDataHits += dataStages;
-                counters.stageDataWords += dataWords;
-                if (registerKey) ++counters.registerKeyHits;
-                ++drawCacheHits;
-                bool rotate = false;
-                for (std::size_t i = 0; i < programs.size(); ++i) {
-                    if (matched[i] == nullptr) continue;
-                    ++counters.variantHitsByRank[ranks[i]];
-                    if (ranks[i] != 0) rotate = true;
-                }
+            if (profile) {
 
+                phaseTiming.Phase(DrawRowKeyLookupValidate);
+                const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
+                phaseMs[DrawRowKeyLookupValidate] -= waited;
+                phaseMs[DrawRowValidateWait] += waited;
+                const auto poolWaited = std::min(DrawPrepPool::ThreadWaitedMs() - poolWaitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
+                phaseMs[DrawRowKeyLookupValidate] -= poolWaited;
+                phaseMs[DrawRowValidatePoolWait] += poolWaited;
+            }
+            // Prep-pool jobs validate concurrently (APS5_NO_POOL_LOOKUP unset), so the tally takes the
+            // cache lock shared and counts through atomic_ref; the exclusive holders (inserts, reports,
+            // the LRU touch below) never overlap it. Only a rank rotation or a due touch upgrades.
+            const auto add = [](auto& counter, auto value) { std::atomic_ref(counter).fetch_add(value, std::memory_order_relaxed); };
+            bool rotate = false, touch = false;
+            {
+                std::shared_lock cacheLock(drawCacheMutex);
+                auto& counters = drawEntryCounters;
+                add(counters.stageValidations, stageValidations);
+                add(counters.stageEqual, stageEqual);
+                add(counters.variantsCompared, compared);
+                const auto steps = validateSteps().Since(stepsBefore);
+                for (const auto field : {&ValidateSteps::calls, &ValidateSteps::runs, &ValidateSteps::bytes, &ValidateSteps::pipelineNs, &ValidateSteps::syncNs, &ValidateSteps::gatesNs, &ValidateSteps::compareNs}) add(counters.validateSteps.*field, steps.*field);
+                if (drawHit) {
+                    add(counters.hits, std::uint64_t{1});
+                    add(counters.stageDataHits, dataStages);
+                    add(counters.stageDataWords, dataWords);
+                    if (registerKey) add(counters.registerKeyHits, std::uint64_t{1});
+                    const auto hits = std::atomic_ref(drawCacheHits).fetch_add(1, std::memory_order_relaxed) + 1;
+                    for (std::size_t i = 0; i < programs.size(); ++i) {
+                        if (matched[i] == nullptr) continue;
+                        add(counters.variantHitsByRank[ranks[i]], std::uint64_t{1});
+                        if (ranks[i] != 0) rotate = true;
+                    }
+                    const auto again = drawCache.find(drawKey);
+                    touch = again != drawCache.end() && again->second == entry && hits - again->second->touched > drawCacheEntries() / 8;
+                    if (verifyDrawEntries()) {
+                        add(counters.verifyHits, std::uint64_t{1});
+                        verifyHit = true;
+                        drawHit = false;
+                    }
+                    if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
+                } else {
+                    add(counters.misses[static_cast<std::size_t>(*miss)], std::uint64_t{1});
+                    if (registerKey && entry->decode != nullptr) add(counters.decodePartial, std::uint64_t{1});
+                }
+                if (profile) add(counters.validateUs, phaseMs[DrawRowKeyLookupValidate] * 1000);
+            }
+            if (rotate || touch) {
+                std::lock_guard cacheLock(drawCacheMutex);
                 const auto again = drawCache.find(drawKey);
                 if (again != drawCache.end() && again->second == entry) {
                     if (rotate) {
@@ -262,29 +295,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
                         drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
                         again->second->touched = drawCacheHits;
-                        ++counters.touches;
+                        ++drawEntryCounters.touches;
                     }
                 }
-                if (verifyDrawEntries()) {
-                    ++counters.verifyHits;
-                    verifyHit = true;
-                    drawHit = false;
-                }
-                if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
-            } else {
-                ++counters.misses[static_cast<std::size_t>(*miss)];
-                if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
-            }
-            if (profile) {
-
-                phaseTiming.Phase(DrawRowKeyLookupValidate);
-                const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
-                phaseMs[DrawRowKeyLookupValidate] -= waited;
-                phaseMs[DrawRowValidateWait] += waited;
-                const auto poolWaited = std::min(DrawPrepPool::ThreadWaitedMs() - poolWaitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
-                phaseMs[DrawRowKeyLookupValidate] -= poolWaited;
-                phaseMs[DrawRowValidatePoolWait] += poolWaited;
-                counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
             }
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;

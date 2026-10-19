@@ -421,6 +421,9 @@ struct PageSpan {
 
 struct PageStates {
     std::once_flag once;
+    // Set once `once` has run: every guest range check (describePages) asks, and a completed
+    // std::call_once still costs tens of nanoseconds per call on MinGW against an acquire load.
+    std::atomic<bool> ready{false};
     PageSpan arena;
     PageSpan image;
 
@@ -479,6 +482,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 }
 
 void PageStates::initialize() {
+    if (ready.load(std::memory_order_acquire)) return;
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
         const bool arenaCached = arena.allocate();
@@ -502,6 +506,7 @@ void PageStates::initialize() {
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
     });
+    ready.store(true, std::memory_order_release);
 }
 
 struct PageRun {
@@ -635,31 +640,40 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     return true;
 }
 
-bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
-    struct Bounds {
-        std::uintptr_t low = 0;
-        std::uintptr_t high = 0;
-        Bounds() {
+struct StackBounds {
+    std::uintptr_t low = 0;
+    std::uintptr_t high = 0;
+    bool known = false;
+};
+
+StackBounds threadStackBounds() {
+    StackBounds bounds{0, 0, true};
 #ifdef _WIN32
-            ULONG_PTR lowLimit = 0;
-            ULONG_PTR highLimit = 0;
-            GetCurrentThreadStackLimits(&lowLimit, &highLimit);
-            low = static_cast<std::uintptr_t>(lowLimit);
-            high = static_cast<std::uintptr_t>(highLimit);
+    ULONG_PTR lowLimit = 0;
+    ULONG_PTR highLimit = 0;
+    GetCurrentThreadStackLimits(&lowLimit, &highLimit);
+    bounds.low = static_cast<std::uintptr_t>(lowLimit);
+    bounds.high = static_cast<std::uintptr_t>(highLimit);
 #else
-            pthread_attr_t attributes;
-            if (pthread_getattr_np(pthread_self(), &attributes) != 0) return;
-            void* base = nullptr;
-            std::size_t size = 0;
-            if (pthread_attr_getstack(&attributes, &base, &size) == 0 && base != nullptr) {
-                low = reinterpret_cast<std::uintptr_t>(base);
-                high = low + size;
-            }
-            pthread_attr_destroy(&attributes);
+    pthread_attr_t attributes;
+    if (pthread_getattr_np(pthread_self(), &attributes) != 0) return bounds;
+    void* base = nullptr;
+    std::size_t size = 0;
+    if (pthread_attr_getstack(&attributes, &base, &size) == 0 && base != nullptr) {
+        bounds.low = reinterpret_cast<std::uintptr_t>(base);
+        bounds.high = bounds.low + size;
+    }
+    pthread_attr_destroy(&attributes);
 #endif
-        }
-    };
-    thread_local const Bounds bounds;
+    return bounds;
+}
+
+bool onOwnLiveStack(std::uintptr_t address, std::size_t bytes) {
+    // Constant-initialized and filled on first use: a thread_local with a constructor pays an
+    // initialization guard on every access (MinGW's emulated TLS), and every guest range check
+    // comes here.
+    thread_local StackBounds bounds{};
+    if (!bounds.known) bounds = threadStackBounds();
     const volatile unsigned char marker = 0;
     const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
     return bounds.high != 0 && frame >= bounds.low && frame < bounds.high && address >= frame && address < bounds.high && bytes <= bounds.high - address;

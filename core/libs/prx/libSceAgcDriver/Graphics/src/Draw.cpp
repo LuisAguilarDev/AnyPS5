@@ -516,6 +516,10 @@ struct DrawProfile {
     std::array<double, SpineKindCount> spineKindResolveUs{};
     // The split draws' phases other than the record half's (DrawPhase): where resolve goes.
     std::array<double, PhaseCount> spinePhaseUs{};
+    // The same per SpineKind, with the lookup phase's parts: a data hit's resolve against a
+    // template hit's.
+    std::array<std::array<double, PhaseCount>, SpineKindCount> spineKindPhaseUs{};
+    std::array<std::array<double, LookupPartCount>, SpineKindCount> spineKindLookupUs{};
     double spineRecordUs = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -619,6 +623,32 @@ void printSpine(const DrawProfile& profile) {
         if (i != PhaseRecord && profile.spinePhaseUs[i] > 0) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", DrawPhaseNames[i], perSplit(profile.spinePhaseUs[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    if (split == 0) return;
+    // [spine] by kind: each kind's resolve phases, and the lookup phase's parts with what is left
+    // of it (`rest`: a hit's cache bookkeeping, a miss's build being the resources phase).
+    n = std::snprintf(line, sizeof(line), "[spine] resolve phases by kind (avg us per split draw):");
+    bool first = true;
+    for (std::size_t kind = 0; kind < SpineKindCount && room(); ++kind) {
+        const auto draws = profile.spineKindDraws[kind];
+        if (draws == 0) continue;
+        const auto perDraw = [&](double total) { return total / static_cast<double>(draws); };
+        const auto& phases = profile.spineKindPhaseUs[kind];
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s (%llu):", first ? "" : ";", SpineKindNames[kind], static_cast<unsigned long long>(draws));
+        first = false;
+        for (std::size_t i = 0; i < PhaseCount && room(); ++i) {
+            if (i == PhaseRecord || phases[i] <= 0) continue;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.2f", DrawPhaseNames[i], perDraw(phases[i]));
+            if (i != PhaseLookup || !room()) continue;
+            double partsUs = 0;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
+            for (std::size_t part = 0; part < LookupPartCount && room(); ++part) {
+                partsUs += profile.spineKindLookupUs[kind][part];
+                n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %.2f, ", LookupPartNames[part], perDraw(profile.spineKindLookupUs[kind][part]));
+            }
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "rest %.2f)", perDraw(std::max(0.0, phases[i] - partsUs)));
+        }
+    }
+    std::fprintf(stderr, "%s\n", line);
 }
 
 void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& split, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
@@ -649,6 +679,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
                 const auto kind = outcome.kind == KindTemplateHit && outcome.dataHit ? SpineDataHit : kinds[outcome.kind];
                 ++profile.spineKindDraws[kind];
                 profile.spineKindResolveUs[kind] += resolveUs;
+                for (std::size_t i = 0; i < PhaseCount; ++i) profile.spineKindPhaseUs[kind][i] += us[i];
+                for (std::size_t i = 0; i < LookupPartCount; ++i) profile.spineKindLookupUs[kind][i] += split.lookup[i];
             }
             for (std::size_t i = 0; i < PhaseCount; ++i) {
                 if (i != PhaseRecord) profile.spinePhaseUs[i] += us[i];
@@ -781,6 +813,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.spineKindDraws.fill(0);
     profile.spineKindResolveUs.fill(0);
     profile.spinePhaseUs.fill(0);
+    profile.spineKindPhaseUs = {};
+    profile.spineKindLookupUs = {};
 }
 
 void countCache(std::uint64_t DrawProfile::*counter) {

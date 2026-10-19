@@ -4583,24 +4583,48 @@ ShaderResources::DrawBindings::~DrawBindings() {
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    // The kept binding of a program binding. Binding numbers are unique but for the image tables'
+    // (one per set), and the programs usually list their bindings in the order the build kept them,
+    // so the search starts after the last match (wrapping around): one step per binding instead of
+    // a scan of all of them, and the same match as a scan. APS5_NO_MOVED_BINDING_CURSOR=1 scans.
+    static const bool scan = std::getenv("APS5_NO_MOVED_BINDING_CURSOR") != nullptr;
+    auto cursor = bindings.begin();
+    const auto findKept = [&](std::uint32_t number) {
+        const auto matches = [number](const Binding& item) { return item.layout.binding == number; };
+        if (scan || number == ShaderRecompiler::RuntimeAbi::ImageTableBinding) return std::find_if(bindings.begin(), bindings.end(), matches);
+        auto kept = std::find_if(cursor, bindings.end(), matches);
+        if (kept == bindings.end()) {
+            kept = std::find_if(bindings.begin(), cursor, matches);
+            if (kept == cursor) return bindings.end();
+        }
+        cursor = std::next(kept);
+        return kept;
+    };
+    // One allocation for all of a draw's moved buffers, none when nothing moved.
+    const auto add = [&](MovedBuffer&& buffer) {
+        if (moved.empty()) moved.reserve(bindings.size());
+        moved.push_back(std::move(buffer));
+    };
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
-                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                const auto kept = findKept(binding.binding);
                 if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
                 if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
-                const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
-                const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
-                if (same) continue;
-                if (item.dataWords.empty() && patched) return std::nullopt;
-                moved.push_back({index, 0, item.size, binding.guestDescriptor});
+                if (!item.dataWords.empty()) {
+                    if (item.dataWords != binding.guestDescriptor) add({index, 0, item.size, binding.guestDescriptor});
+                    continue;
+                }
+                // Without its kept words the buffer is compared in place, which a patch defeats.
+                if (std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; })) return std::nullopt;
+                if (std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) != 0) add({index, 0, item.size, binding.guestDescriptor});
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            const auto kept = findKept(binding.binding);
             if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
@@ -4621,7 +4645,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
-                moved.push_back({index, address, static_cast<std::size_t>(size)});
+                add({index, address, static_cast<std::size_t>(size), {}});
             }
         }
     }

@@ -2329,8 +2329,18 @@ constexpr std::array<const char*, static_cast<std::size_t>(FastFail::Count)> Fas
 using OwnRefreshFallback = ShaderResources::OwnRefreshFallback;
 constexpr std::array<const char*, static_cast<std::size_t>(OwnRefreshFallback::Count)> OwnRefreshFallbackNames{"disabled", "snapshot texture", "cleared view", "foreign view", "surface key", "not imported", "uncached", "re-run failed"};
 
+// Where a Revalidate's time goes ([rescache] revalidate parts): the pending CPU writes completed
+// first, the proof (fast, own-object refresh or full walk), the imported regions' flushes and
+// serials, the staging copies and the depth copies; the fast proof's own time split into its
+// texture loop, storage loop, pending-registry scan, stamp query and cache check. The parts
+// before the proof run before the call's start, so the calls' total leaves them out.
+enum class RevalidatePart : std::size_t { Complete, Proof, Imports, Staging, Depth, FastTextures, FastStorage, FastPending, FastUnchanged, FastCached, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RevalidatePart::Count)> RevalidatePartNames{"complete", "proof", "imports", "staging", "depth", "textures", "storage", "pending", "unchanged", "cached"};
+
 struct RevalidateProfile {
     std::atomic<std::uint64_t> calls{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalidatePart::Count)> partNs{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalidatePart::Count)> partCalls{};
     std::atomic<std::uint64_t> nanoseconds{0};
     std::atomic<std::uint64_t> fast{0};
     std::atomic<std::uint64_t> full{0};
@@ -2372,6 +2382,24 @@ RevalidateProfile& Revalidations() {
     static RevalidateProfile profile;
     return profile;
 }
+
+// Charges the time since the last lap to a part (APS5_PROFILE_DRAW only).
+class RevalidateLap {
+public:
+    explicit RevalidateLap(bool profile) : profile(profile), last(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    void operator()(RevalidatePart part) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        auto& revalidations = Revalidations();
+        revalidations.partNs[static_cast<std::size_t>(part)].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        revalidations.partCalls[static_cast<std::size_t>(part)].fetch_add(1, std::memory_order_relaxed);
+        last = now;
+    }
+
+private:
+    bool profile;
+    std::chrono::steady_clock::time_point last;
+};
 
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -2454,6 +2482,15 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    std::string parts;
+    for (std::size_t i = 0; i < RevalidatePartNames.size(); ++i) {
+        const auto count = profile.partCalls[i].load(std::memory_order_relaxed);
+        if (count == 0) continue;
+        char part[96];
+        std::snprintf(part, sizeof(part), " %s %.2f (%llu)", RevalidatePartNames[i], static_cast<double>(profile.partNs[i].load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count), static_cast<unsigned long long>(count));
+        parts += part;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate parts (avg us per pass, passes; textures to cached split the fast proof):%s\n", parts.c_str());
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2502,6 +2539,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
+    RevalidateLap lap(BuildProfiled());
     const auto fail = [&reason](FastFail why) {
         reason = why;
         countFastFail(why);
@@ -2584,6 +2622,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    lap(RevalidatePart::FastTextures);
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -2605,6 +2644,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
+    lap(RevalidatePart::FastStorage);
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -2639,9 +2679,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    lap(RevalidatePart::FastPending);
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    lap(RevalidatePart::FastUnchanged);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
+    lap(RevalidatePart::FastCached);
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
         if (surface.source == nullptr) surface.generation = surface.collected;
@@ -2861,6 +2904,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     const UseScope use(*this, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    RevalidateLap lap(profile);
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
@@ -2871,6 +2915,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    lap(RevalidatePart::Complete);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -3022,6 +3067,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    lap(RevalidatePart::Proof);
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -3066,6 +3112,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    lap(RevalidatePart::Imports);
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
@@ -3077,10 +3124,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    lap(RevalidatePart::Staging);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
+    lap(RevalidatePart::Depth);
     return finish(fast, true);
 }
 

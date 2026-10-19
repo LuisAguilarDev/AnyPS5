@@ -342,12 +342,17 @@ constexpr std::array<const char*, RecordPartCount> RecordPartNames{"prologue", "
 // the template's Revalidate, its moved read-only buffers and the alias checks of a hit.
 enum LookupPart : std::size_t { LookupKey, LookupFind, LookupRevalidate, LookupMoved, LookupAliases, LookupPartCount };
 constexpr std::array<const char*, LookupPartCount> LookupPartNames{"key", "find", "revalidate", "moved", "aliases"};
+// The vertex phase (prepareDrawInputs): the index range and copy, the vertex input layout, the
+// fetch plan and the vertex ranges' imports or copies.
+enum VertexPart : std::size_t { VertexIndex, VertexLayout, VertexPlan, VertexRanges, VertexPartCount };
+constexpr std::array<const char*, VertexPartCount> VertexPartNames{"index", "layout", "plan", "ranges"};
 
 struct RecordSplit {
     bool used = false;
     std::array<double, RecordPartCount> us{};
     ShaderResources::DrawBindingsProfile bindings;
     std::array<double, LookupPartCount> lookup{};
+    std::array<double, VertexPartCount> vertex{};
 };
 
 // Why a draw did not go into the recorder without a wait (counted in the [draws] line): its targets
@@ -437,6 +442,7 @@ struct DrawProfile {
     double walkUs = 0;
     std::array<double, PhaseCount> totalsUs{};
     std::array<double, LookupPartCount> lookupPartsUs{};
+    std::array<double, VertexPartCount> vertexPartsUs{};
     // The longest single draw's time per phase, and the longest draw: the [lock] line's 'draw'
     // hold max (tens of ms against an average well under a millisecond) needs a phase name.
     std::array<double, PhaseCount> maxUs{};
@@ -620,6 +626,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     std::lock_guard lock(profile.mutex);
     if (split.used) addRecordSplit(profile, split, us[PhaseRecord], outcome.kind);
     for (std::size_t i = 0; i < LookupPartCount; ++i) profile.lookupPartsUs[i] += split.lookup[i];
+    for (std::size_t i = 0; i < VertexPartCount; ++i) profile.vertexPartsUs[i] += split.vertex[i];
     double drawUs = 0;
     for (std::size_t i = 0; i < PhaseCount; ++i) {
         profile.totalsUs[i] += us[i];
@@ -696,6 +703,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
+        if (i == PhaseVertex && room()) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
+            for (std::size_t part = 0; part < VertexPartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", part == 0 ? "" : ", ", VertexPartNames[part], profile.vertexPartsUs[part] / 1000.0);
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
+        }
         if (i == PhaseLookup && room()) {
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
             for (std::size_t part = 0; part < LookupPartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", part == 0 ? "" : ", ", LookupPartNames[part], profile.lookupPartsUs[part] / 1000.0);
@@ -738,6 +750,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.lookupPartsUs.fill(0);
+    profile.vertexPartsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
@@ -1119,6 +1132,15 @@ struct DrawTimer {
         split.lookup[which] += elapsed;
         phaseStart = now;
     }
+    // A slice of the vertex phase, likewise.
+    void vertex(VertexPart which) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
+        us[PhaseVertex] += elapsed;
+        split.vertex[which] += elapsed;
+        phaseStart = now;
+    }
     ShaderResources::DrawBindingsProfile* bindingsProfile() { return profile ? &split.bindings : nullptr; }
 };
 
@@ -1495,6 +1517,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
+    timer.vertex(VertexIndex);
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) {
@@ -1503,6 +1526,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (context.vertexInputs != nullptr) inputs.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (inputs.retainedVertexInput == nullptr) inputs.vertexInput = BuildVertexInputLayout(context, attributes);
     }
+    timer.vertex(VertexLayout);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -1545,6 +1569,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         plannedFetches.push_back(fetches[f]);
     }
     const auto plan = PlanVertexCopies(plannedFetches);
+    timer.vertex(VertexPlan);
     std::vector<VkBuffer> rangeHandles;
     std::vector<VkDeviceSize> rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
@@ -1590,7 +1615,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
-    timer.phase(PhaseVertex);
+    timer.vertex(VertexRanges);
     return inputs;
 }
 

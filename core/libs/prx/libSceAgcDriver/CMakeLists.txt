@@ -1857,7 +1857,7 @@ if(BUILD_TESTING)
     # Lean draws recorded in chunks of two on recorder threads (APS5_DRAW_RECORD_THREADS, see
     # Recorder::JoinChunk): the chunk ordering tests, the draw-heavy PM4 tests, and with
     # ANYPS5_AGC_CHUNKED_VARIANTS=ON every tests/execution test.
-    set(agcChunkedTests agc_driver_chunked_label_order agc_driver_chunked_target_feedback agc_driver_chunked_dispatch_reads agc_driver_chunked_draw_flood
+    set(agcChunkedTests agc_driver_chunked_label_order agc_driver_chunked_target_feedback agc_driver_chunked_dispatch_reads agc_driver_chunked_draw_flood agc_driver_chunked_ride_along
         agc_driver_sample_mask_draw agc_driver_vertex_clip_cull_draw agc_driver_layered_volume_submit agc_driver_draw_cache_reuse agc_driver_draw_data_hit_user_words
         agc_driver_draw_cache_relocation agc_driver_fragment_user_data_tail agc_driver_vertex_user_data_tail agc_driver_msaa_enable_single_sample
         agc_driver_inactive_vertex_point_size agc_driver_indirect_patched_stage agc_driver_mesh_index_cache agc_driver_pipelined_dispatch agc_driver_pipelined_dma
@@ -1880,6 +1880,22 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     set_tests_properties(agc_driver_draw_cache_reuse_chunked PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+    # The chunk ordering tests with every note and queued label sealing the open chunk again
+    # (APS5_NO_CHUNK_RIDE_ALONG), and the ride-along chunk counts at the default cap of 32 draws.
+    foreach(agcSealingTest IN ITEMS agc_driver_chunked_ride_along agc_driver_chunked_label_order agc_driver_chunked_draw_flood agc_driver_same_queue_label_wait agc_driver_pipelined_predicated_label_order)
+        add_test(NAME ${agcSealingTest}_chunked_sealing COMMAND ${agcSealingTest}_tests)
+        set_tests_properties(${agcSealingTest}_chunked_sealing PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_RECORD_THREADS=3;APS5_DRAW_CHUNK_DRAWS=2;APS5_NO_CHUNK_RIDE_ALONG=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcSealingTest}_chunked_sealing PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_chunked_ride_along_wide COMMAND agc_driver_chunked_ride_along_tests)
+    set_tests_properties(agc_driver_chunked_ride_along_wide PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_RECORD_THREADS=3" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_chunked_ride_along_wide PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     # The draw profile's batch stamps stay on the spine's command buffers, so chunks are still
     # recorded under APS5_PROFILE_DRAW (the flood asserts that its draws went through chunks).
     add_test(NAME agc_driver_chunked_draw_flood_profiled COMMAND agc_driver_chunked_draw_flood_tests)

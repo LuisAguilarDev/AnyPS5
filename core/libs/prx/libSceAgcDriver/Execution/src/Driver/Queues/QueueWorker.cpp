@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
@@ -125,6 +126,16 @@ void Driver::reapCompletionLabels() {
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
 }
 
+void Driver::noteFrameStepDequeue(const Submission& submission, std::int64_t waitStartNs, std::int64_t& dequeuedNs) {
+    const auto now = std::chrono::steady_clock::now();
+    dequeuedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    auto& counters = FrameSteps::Global();
+    FrameSteps::Counters::AddNs(counters.packetIdleNs, dequeuedNs - waitStartNs);
+    if (submission.suspend || submission.enqueuedAt == std::chrono::steady_clock::time_point{}) return;
+    FrameSteps::Counters::AddNs(counters.queueLatencyNs, std::chrono::duration_cast<std::chrono::nanoseconds>(now - submission.enqueuedAt).count());
+    FrameSteps::Counters::Add(counters.queueLatencies, 1);
+}
+
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
     char role[32];
@@ -137,9 +148,12 @@ void Driver::run(std::uint32_t id) noexcept {
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
+    const bool frameSteps = id == 0 && FrameSteps::Enabled();
     try {
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {
+            const auto waitStartNs = frameSteps ? FrameSteps::NowNs() : 0;
+            std::int64_t dequeuedNs = 0;
             submission = Submission{};
             struct Running {
                 std::atomic<std::uint32_t>& count;
@@ -254,6 +268,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 timing.Mark("dequeue_order");
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 running.Start();
+                if (frameSteps) noteFrameStepDequeue(submission, waitStartNs, dequeuedNs);
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             execute(submission);
@@ -276,6 +291,11 @@ void Driver::run(std::uint32_t id) noexcept {
             if (notify) changed.notify_all();
             else ++costs.notifiesSkipped;
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
+            if (frameSteps) {
+                auto& counters = FrameSteps::Global();
+                FrameSteps::Counters::AddNs(counters.packetBusyNs, FrameSteps::NowNs() - dequeuedNs);
+                FrameSteps::Counters::Add(counters.packetSubmissions, 1);
+            }
         }
     } catch (const ProcessShutdown&) {
         submission = Submission{};

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -195,6 +196,11 @@ void DrawRecorders::run(Worker& worker) {
     Recorder::RecordingOffLock() = true;
     TagLockRole(LockRole::Recorder);
     const bool profiled = Profiled();
+    const bool frameSteps = FrameSteps::Enabled();
+    const bool timed = profiled || frameSteps;
+    std::size_t slot = 0;
+    while (slot < workers.size() && workers[slot].get() != &worker) ++slot;
+    slot = FrameSteps::Counters::Slot(slot);
     for (;;) {
         Item item;
         {
@@ -207,7 +213,7 @@ void DrawRecorders::run(Worker& worker) {
             worker.items.pop_front();
         }
         worker.room.notify_one();
-        const auto busyStart = profiled ? nowNs() : 0;
+        const auto busyStart = timed ? nowNs() : 0;
         auto& chunk = *item.chunk;
         if (item.seal) {
             finish(worker, chunk);
@@ -229,9 +235,17 @@ void DrawRecorders::run(Worker& worker) {
                 if (stats.passBegun) worker.passesBegun.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        if (profiled) {
-            worker.busyNs.fetch_add(static_cast<std::uint64_t>(nowNs() - busyStart), std::memory_order_relaxed);
-            report();
+        if (timed) {
+            const auto busy = nowNs() - busyStart;
+            if (frameSteps) {
+                auto& counters = FrameSteps::Global();
+                FrameSteps::Counters::AddNs(counters.recorderBusyNs[slot], busy);
+                FrameSteps::Counters::Add(item.seal ? counters.recorderChunks : counters.recorderDraws, 1);
+            }
+            if (profiled) {
+                worker.busyNs.fetch_add(static_cast<std::uint64_t>(busy), std::memory_order_relaxed);
+                report();
+            }
         }
     }
 }

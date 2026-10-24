@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1857,11 +1858,19 @@ const void* ThreadToken() {
 }
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+thread_local std::int64_t frameStepHoldStartNs = 0;
+
+std::size_t FrameStepRole() {
+    return std::min(static_cast<std::size_t>(ThreadLockRole()), FrameSteps::LockRoles - 1);
+}
 }
 
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    if (++depth == 1) {
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        if (FrameSteps::Enabled()) frameStepHoldStartNs = FrameSteps::NowNs();
+    }
 }
 
 bool GpuMutexType::try_lock() {
@@ -1900,6 +1909,7 @@ void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);
+        if (FrameSteps::Enabled()) FrameSteps::Counters::AddNs(FrameSteps::Global().lockHoldNs[FrameStepRole()], FrameSteps::NowNs() - frameStepHoldStartNs);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
     }
@@ -1931,7 +1941,13 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            LockSpinning(mutex, HandoffSpinWindow());
+            if (!FrameSteps::Enabled()) {
+                LockSpinning(mutex, HandoffSpinWindow());
+            } else if (!mutex.try_lock()) {
+                const auto start = FrameSteps::NowNs();
+                LockSpinning(mutex, HandoffSpinWindow());
+                FrameSteps::Counters::AddNs(FrameSteps::Global().lockWaitNs[FrameStepRole()], FrameSteps::NowNs() - start);
+            }
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {

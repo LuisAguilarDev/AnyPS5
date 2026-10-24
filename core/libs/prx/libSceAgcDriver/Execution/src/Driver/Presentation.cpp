@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -11,6 +12,15 @@
 namespace AgcDriver::DriverDetail {
 
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
+    struct Timed {
+        std::int64_t startNs;
+        ~Timed() {
+            if (startNs == 0) return;
+            auto& counters = FrameSteps::Global();
+            FrameSteps::Counters::Add(counters.eopReserves, 1);
+            FrameSteps::Counters::AddNs(counters.eopReserveNs, FrameSteps::NowNs() - startNs);
+        }
+    } timed{FrameSteps::Enabled() ? FrameSteps::NowNs() : 0};
     std::lock_guard lock(mutex);
     rethrowFailure();
     checkStopping();
@@ -148,6 +158,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
+        if (FrameSteps::Enabled()) reportFrameSteps(FrameSteps::NowNs());
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
@@ -182,6 +193,26 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     previousFlips = flipsCounted.load();
     previousUnsignaled = flipBatchesUnsignaled.load();
     waits.clear();
+}
+
+void Driver::reportFrameSteps(std::int64_t nowNs) {
+    static bool started = false;
+    static double previousGpuBusyMs = 0;
+    if (!started) {
+        started = true;
+        FrameSteps::Global().Take();
+        previousGpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
+    }
+    auto& frames = FrameSteps::GlobalFrames();
+    if (!frames.Present(nowNs)) return;
+    auto window = frames.Take(nowNs);
+    const auto gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
+    window.gpuBusyMs = gpuBusyMs - previousGpuBusyMs;
+    previousGpuBusyMs = gpuBusyMs;
+    const auto totals = FrameSteps::Global().Take();
+    auto& output = ProfileOutput_nid_no_patch();
+    output.Write(FrameSteps::FormatGuest(totals, window));
+    output.Write(FrameSteps::FormatLanes(totals, window));
 }
 
 void Driver::ReleaseWindow(void* window) {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -77,6 +78,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    if (FrameSteps::Enabled() && !submission.suspend) FrameSteps::NoteExecuted(submission.commands, submission.queue == 0);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;

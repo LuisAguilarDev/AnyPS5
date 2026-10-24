@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
@@ -13,6 +14,8 @@ namespace {
 thread_local bool poolThread = false;
 thread_local bool exemptThread = false;
 thread_local std::uint64_t threadWaitedNs = 0;
+thread_local std::uint64_t threadTurnWaitedNs = 0;
+std::atomic<std::size_t> poolThreadsStarted{0};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -91,6 +94,8 @@ void DrawPrepPool::run() {
     }();
     if (mask != 0) CpuTopology::PinTraced("draw prep", nullptr, mask);
     TagLockRole(LockRole::Prep);
+    const bool frameSteps = FrameSteps::Enabled();
+    const auto slot = FrameSteps::Counters::Slot(poolThreadsStarted.fetch_add(1, std::memory_order_relaxed));
     for (;;) {
         Task task;
         {
@@ -99,6 +104,8 @@ void DrawPrepPool::run() {
             task = std::move(tasks.front());
             tasks.pop_front();
         }
+        const auto busyStartNs = frameSteps ? FrameSteps::NowNs() : 0;
+        const auto turnWaitedBefore = threadTurnWaitedNs;
         try {
             task.job(task.seq);
         } catch (const std::exception& error) {
@@ -109,6 +116,12 @@ void DrawPrepPool::run() {
         if (turn.load(std::memory_order_acquire) <= task.seq) {
             WaitTurn(task.seq);
             FinishTurn(task.seq, {});
+        }
+        if (frameSteps) {
+            auto& counters = FrameSteps::Global();
+            const auto turnWaited = static_cast<std::int64_t>(threadTurnWaitedNs - turnWaitedBefore);
+            FrameSteps::Counters::AddNs(counters.prepBusyNs[slot], FrameSteps::NowNs() - busyStartNs - turnWaited);
+            FrameSteps::Counters::Add(counters.prepJobs, 1);
         }
     }
 }
@@ -135,7 +148,10 @@ void DrawPrepPool::WaitTurn(std::uint64_t seq) {
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
     progress.wait(lock, [&] { return turn.load(std::memory_order_relaxed) == seq; });
-    turnWaitNs += elapsedNs(start);
+    const auto waited = elapsedNs(start);
+    turnWaitNs += waited;
+    threadTurnWaitedNs += waited;
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().prepTurnWaitNs, waited);
 }
 
 void DrawPrepPool::FinishTurn(std::uint64_t seq, std::span<const Range> writes) {
@@ -242,6 +258,7 @@ void DrawPrepPool::WaitForWriters(std::span<const Range> ranges) {
     ++writerWaits;
     writerWaitNs += waited;
     threadWaitedNs += waited;
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().packetPoolWaitNs, waited);
 }
 
 void DrawPrepPool::WaitAll() {
@@ -253,6 +270,7 @@ void DrawPrepPool::WaitAll() {
     ++waitAlls;
     waitAllNs += waited;
     threadWaitedNs += waited;
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().packetPoolWaitNs, waited);
 }
 
 void DrawPrepPool::report() {

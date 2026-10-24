@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
@@ -317,6 +318,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
 }
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
+    const bool frameSteps = FrameSteps::Enabled();
+    const auto entryNs = frameSteps ? FrameSteps::NowNs() : 0;
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < SubmissionQueueEnd), "unsupported compute queue");
@@ -341,21 +344,25 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
+    const auto throttleStartNs = frameSteps ? FrameSteps::NowNs() : 0;
     waitForFlipRoom(submission);
     holdFlipBehindWorker(submission);
     AwaitRegistrationPreparation();
+    const auto throttleNs = frameSteps ? FrameSteps::NowNs() - throttleStartNs : 0;
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
     const auto validated = profile ? std::chrono::steady_clock::now() : start;
     auto* const capture = SubmissionCapture::Active();
     auto captured = capture != nullptr ? SubmissionCapture::Prepare(queue, SubmissionKind::Submit, submission.commands, submission.conditionalEnds) : CapturedSubmission{};
+    bool flips = false;
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
         checkStopping();
         require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");
         reserveOutputs(submission);
+        flips = !submission.flips.empty();
         submission.shaders = shaders;
         submission.serial = accepted + 1;
 
@@ -379,6 +386,20 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     }
     changed.notify_all();
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
+    if (frameSteps) noteFrameStepSubmit(entryNs, throttleNs, flips);
+}
+
+void Driver::noteFrameStepSubmit(std::int64_t entryNs, std::int64_t throttleNs, bool flips) {
+    const auto exitNs = FrameSteps::NowNs();
+    auto& counters = FrameSteps::Global();
+    FrameSteps::Counters::Add(counters.submits, 1);
+    FrameSteps::Counters::AddNs(counters.submitNs, exitNs - entryNs);
+    FrameSteps::Counters::AddNs(counters.throttleNs, throttleNs);
+    if (flips) {
+        FrameSteps::Counters::Add(counters.flipSubmits, 1);
+        FrameSteps::Counters::AddNs(counters.flipSubmitNs, exitNs - entryNs);
+    }
+    FrameSteps::GlobalFrames().Submit(entryNs, exitNs, flips);
 }
 
 void Driver::SuspendPoint() {

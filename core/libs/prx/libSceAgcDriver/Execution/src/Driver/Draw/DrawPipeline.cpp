@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -81,8 +82,15 @@ void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> wr
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() < Depth(); });
         --idleWaiters;
-        fullWaitNs += elapsedNs(start);
+        const auto waited = elapsedNs(start);
+        fullWaitNs += waited;
+        if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().fifoFullNs, waited);
         rethrowFailure();
+    }
+    if (FrameSteps::Enabled()) {
+        auto& counters = FrameSteps::Global();
+        FrameSteps::Counters::Add(counters.fifoDepthSum, items.size());
+        FrameSteps::Counters::Add(counters.fifoEnqueued, 1);
     }
     depthSum += items.size();
     ++enqueued;
@@ -136,7 +144,9 @@ void DrawPipeline::run() {
     DrawPrepPool::ExemptThisThread();
     PinWorkerThread("draw committer");
     TagLockRole(LockRole::Spine);
+    const bool frameSteps = FrameSteps::Enabled();
     for (;;) {
+        const auto emptyStart = frameSteps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Commit* commit = nullptr;
         CommitKind kind = CommitKind::Other;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
@@ -149,6 +159,7 @@ void DrawPipeline::run() {
             kind = items.front().kind;
         }
         const auto start = std::chrono::steady_clock::now();
+        if (frameSteps) FrameSteps::Counters::AddNs(FrameSteps::Global().fifoEmptyNs, std::chrono::duration_cast<std::chrono::nanoseconds>(start - emptyStart).count());
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -173,6 +184,7 @@ void DrawPipeline::run() {
         const auto releaseStart = std::chrono::steady_clock::now();
         if (commit != nullptr) *commit = nullptr;
         const auto released = elapsedNs(releaseStart);
+        if (frameSteps) noteFrameStepCommit(kind, spent, released);
         std::lock_guard lock(mutex);
         items.pop_front();
         ++commits;
@@ -185,6 +197,15 @@ void DrawPipeline::run() {
         outstanding.fetch_sub(1, std::memory_order_release);
         if (idleWaiters != 0) idle.notify_all();
     }
+}
+
+void DrawPipeline::noteFrameStepCommit(CommitKind kind, std::uint64_t spentNs, std::uint64_t releasedNs) {
+    auto& counters = FrameSteps::Global();
+    FrameSteps::Counters::Add(counters.spineBusyNs, spentNs + releasedNs);
+    FrameSteps::Counters::Add(counters.spineCommits, 1);
+    if (kind != CommitKind::Draw) return;
+    FrameSteps::Counters::Add(counters.drawCommits, 1);
+    FrameSteps::Counters::Add(counters.drawCommitNs, spentNs);
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
@@ -201,7 +222,9 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    const auto waited = elapsedNs(start);
+    drainWaitNs[index] += waited;
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().fifoDrainNs, waited);
     rethrowFailure();
 }
 

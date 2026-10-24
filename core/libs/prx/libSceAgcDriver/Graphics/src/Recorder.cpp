@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -1968,7 +1969,7 @@ std::vector<std::pair<Recorder::PassTarget, Recorder::PassTotals>> Recorder::Pas
 }
 
 bool Recorder::BatchStampsEnabled() {
-    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
+    return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || FrameSteps::Enabled();
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -3884,6 +3885,11 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    if (FrameSteps::Enabled()) {
+        auto& counters = FrameSteps::Global();
+        FrameSteps::Counters::Add(counters.vkSubmits, 1);
+        FrameSteps::Counters::AddNs(counters.vkSubmitNs, std::chrono::duration_cast<std::chrono::nanoseconds>(batch->submittedAt - submitStart).count());
+    }
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
         ++submitCount;

@@ -99,6 +99,8 @@ private:
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
+    void noteFrameStepSubmit(std::int64_t entryNs, std::int64_t throttleNs, bool flips);
+    static void noteFrameStepDequeue(const Submission& submission, std::int64_t waitStartNs, std::int64_t& dequeuedNs);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
     static bool& completionDeferred();
@@ -110,6 +112,7 @@ private:
     bool orderReleased(std::uint32_t queue, std::uint64_t received) const;
     void noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool blocked);
     void reportPresents(double waitedMs, std::size_t inFlight);
+    void reportFrameSteps(std::int64_t nowNs);
     static bool stampValidate();
     static bool dataHits();
     static bool verifyDataHits();

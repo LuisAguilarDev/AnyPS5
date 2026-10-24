@@ -191,6 +191,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/LockProfile.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameSteps.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -368,6 +369,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_profile_output PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_profile_output PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_frame_steps_tests tests/FrameSteps.cpp Execution/src/FrameSteps.cpp)
+    target_include_directories(agc_frame_steps_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_frame_steps_tests PRIVATE libc)
+    configure_windows_unwind(agc_frame_steps_tests)
+    add_test(NAME agc_frame_steps COMMAND agc_frame_steps_tests)
+    set_tests_properties(agc_frame_steps PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_frame_steps PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

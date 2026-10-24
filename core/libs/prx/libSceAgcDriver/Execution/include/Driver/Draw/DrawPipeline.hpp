@@ -58,6 +58,7 @@ private:
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
+    static void noteFrameStepCommit(CommitKind kind, std::uint64_t spentNs, std::uint64_t releasedNs);
 
     std::mutex mutex;
     std::condition_variable wake;

@@ -154,8 +154,10 @@ std::string Counts(const AgcDriver::DriverDetail::DrawEntryCounters& counters) {
     return std::to_string(counters.lookups) + " lookups, " + std::to_string(counters.hits) + " hits, " + std::to_string(counters.registerKeyHits) + " register-key hits; generation gate: " + std::to_string(counters.generationSkips) + " skips, " + std::to_string(counters.generationCompares) + " compares, " + std::to_string(counters.generationVerified) + " verified";
 }
 
-void Draw(std::uintptr_t color, const std::uint32_t* table, float word) {
-    auto commands = Setup(color);
+void Draw(std::uintptr_t color, const std::uint32_t* table, float word, const std::vector<std::uint32_t>& stores = {}) {
+    auto commands = stores;
+    const auto setup = Setup(color);
+    commands.insert(commands.end(), setup.begin(), setup.end());
     const auto address = reinterpret_cast<std::uintptr_t>(table);
     Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(address)});
     Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(address >> 32u)});
@@ -186,9 +188,9 @@ struct Mode {
     bool verify = false;
 };
 
-unsigned DrawRead(const std::uint32_t* table, float word) {
+unsigned DrawRead(const std::uint32_t* table, float word, const std::vector<std::uint32_t>& stores = {}) {
     ColorMemory.fill(std::byte{0});
-    Draw(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), table, word);
+    Draw(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), table, word, stores);
     return BrightestColorByte();
 }
 
@@ -256,6 +258,49 @@ void GpuWritesCompare(const Mode& mode, WatchedBlocks& blocks) {
     RequireCompared(mode, before, after, "the draw after a GPU write into its block");
 }
 
+void RequireNotSkipped(const Mode& mode, const AgcDriver::DriverDetail::DrawEntryCounters& before, const AgcDriver::DriverDetail::DrawEntryCounters& after, const std::string& what) {
+    if (mode.off) return;
+    Require(after.generationSkips == before.generationSkips && after.generationVerified == before.generationVerified, what + " took the generation gate: " + Counts(after) + " (before: " + Counts(before) + ")");
+}
+
+void WarmUntilGated(const Mode& mode, const std::uint32_t* table, float loaded, const std::string& what) {
+    for (int warm = 0; warm < 5; ++warm) {
+        const auto value = DrawRead(table, 0.25f);
+        Require(CloseTo(value, Expected(loaded, 0.25f)), "a warm-up draw loading " + std::to_string(loaded) + " wrote " + std::to_string(value) + ": " + Counts(Counters()));
+    }
+    const auto before = Counters();
+    const auto value = DrawRead(table, 0.25f);
+    Require(CloseTo(value, Expected(loaded, 0.25f)), "a repeated draw loading " + std::to_string(loaded) + " wrote " + std::to_string(value));
+    RequireGateEngaged(mode, before, Counters(), what);
+}
+
+void StoreThenDraw(const Mode& mode, const std::uint32_t* table, const std::vector<std::uint32_t>& stores, float stored, const std::string& what) {
+    const auto before = Counters();
+    const auto value = DrawRead(table, 0.25f, stores);
+    const auto after = Counters();
+    Require(CloseTo(value, Expected(stored, 0.25f)), "after " + what + " of " + std::to_string(stored) + " into the loaded dword, earlier in the draw's own submission, the cached draw wrote " + std::to_string(value) + ", expected " + std::to_string(Expected(stored, 0.25f)) + ": " + Counts(after));
+    RequireNotSkipped(mode, before, after, "the draw after " + what + " in its own submission");
+}
+
+void PacketStoresInTheSameSubmissionCompare(const Mode& mode, WatchedBlocks& blocks) {
+    auto* table = blocks.Words(3);
+    table[0] = std::bit_cast<std::uint32_t>(0.25f);
+    const auto destination = reinterpret_cast<std::uintptr_t>(table);
+    WarmUntilGated(mode, table, 0.25f, "a repeated draw before a WRITE_DATA");
+    std::vector<std::uint32_t> written;
+    Append(written, 0x37, {0x00100500u, static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u), std::bit_cast<std::uint32_t>(0.5f)});
+    StoreThenDraw(mode, table, written, 0.5f, "a WRITE_DATA");
+
+    table[0] = std::bit_cast<std::uint32_t>(0.25f);
+    WarmUntilGated(mode, table, 0.25f, "a repeated draw before a DMA_DATA");
+    auto* source = blocks.Words(4);
+    source[0] = std::bit_cast<std::uint32_t>(0.625f);
+    const auto from = reinterpret_cast<std::uintptr_t>(source);
+    std::vector<std::uint32_t> copied;
+    Append(copied, 0x50, {0, static_cast<std::uint32_t>(from), static_cast<std::uint32_t>(from >> 32u), static_cast<std::uint32_t>(destination), static_cast<std::uint32_t>(destination >> 32u), 4});
+    StoreThenDraw(mode, table, copied, 0.625f, "a DMA_DATA copy");
+}
+
 }
 
 int main() {
@@ -275,9 +320,10 @@ int main() {
         Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Registered(PixelHeader, ArithmeticPixelCode.data(), sizeof(ArithmeticPixelCode), 1);
         {
-            WatchedBlocks blocks(3 * BlockBytes);
+            WatchedBlocks blocks(5 * BlockBytes);
             UnchangedMemorySkipsAndCpuStoresCompare(mode, blocks);
             GpuWritesCompare(mode, blocks);
+            PacketStoresInTheSameSubmissionCompare(mode, blocks);
         }
         AgcDriverShutdown_nid_postfix();
         std::cout << "Draw hit validation " << (mode.off ? "compared every hit" : mode.verify ? "verified the generation gate against the compare" : "skipped compares over unchanged write generations") << "\n";

@@ -6,6 +6,8 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +20,7 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <x86intrin.h>
 
@@ -204,7 +207,33 @@ static void TraceSleep(const void* caller, std::uint64_t microseconds) {
     std::fprintf(stderr, "\n");
 }
 
+namespace {
+
+constexpr std::array<std::string_view, 7> FrameWaitKinds{"equeue", "sleep", "vblank", "evf", "sema", "cond", "addr"};
+std::array<std::atomic<std::uint64_t>, FrameWaitKinds.size()> frameWaitNanos{};
+thread_local bool frameWaitThread = false;
+
+void NoteFrameWait(std::string_view kind, std::uint64_t waitedNanos) {
+    if (!frameWaitThread) return;
+    for (std::size_t i = 0; i < FrameWaitKinds.size(); ++i) {
+        if (FrameWaitKinds[i] != kind) continue;
+        frameWaitNanos[i].fetch_add(waitedNanos, std::memory_order_relaxed);
+        return;
+    }
+}
+
+}
+
+void KernelMarkFrameWaitThread_nid_postfix() {
+    frameWaitThread = true;
+}
+
+void KernelFrameWaitNanos_nid_postfix(std::uint64_t* nanos, std::size_t count) {
+    for (std::size_t i = 0; i < count; ++i) nanos[i] = i < frameWaitNanos.size() ? frameWaitNanos[i].load(std::memory_order_relaxed) : 0;
+}
+
 void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut) {
+    NoteFrameWait(kind, waitedNanos);
     static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
     if (!enabled) return;
     struct Site { std::uint64_t calls = 0; std::uint64_t timeouts = 0; std::uint64_t nanos = 0; std::uint64_t longest = 0; unsigned long lastThread = 0; };
@@ -244,7 +273,9 @@ void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint
 
 static void CancellableSleep(std::uint64_t nanos) {
     ThreadCancel::Check();
+    const auto start = frameWaitThread ? GetMonotonicNanos() : 0;
     TimedWait::SleepNanos(nanos);
+    if (frameWaitThread) NoteFrameWait("sleep", GetMonotonicNanos() - start);
     ThreadCancel::Check();
 }
 

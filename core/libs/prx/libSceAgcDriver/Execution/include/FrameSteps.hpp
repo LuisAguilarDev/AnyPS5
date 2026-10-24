@@ -19,6 +19,7 @@ inline constexpr std::size_t LockRoles = 5;
 inline constexpr std::size_t SampleCapacity = 4096;
 inline constexpr std::size_t FlipQueueCapacity = 64;
 inline constexpr std::int64_t ReportWindowNs = 10'000'000'000;
+inline constexpr std::size_t WaitEqueue = 0, WaitSleep = 1, WaitVblank = 2, WaitEventFlag = 3, WaitSemaphore = 4, WaitCond = 5, WaitAddress = 6, KernelWaitKinds = 7;
 
 inline bool Enabled() {
     static const bool enabled = std::getenv("APS5_PROFILE_FRAME") != nullptr;
@@ -112,7 +113,8 @@ private:
 };
 
 struct Totals {
-    std::uint64_t submits = 0, submitNs = 0, flipSubmits = 0, flipSubmitNs = 0, throttleNs = 0, eopReserves = 0, eopReserveNs = 0;
+    std::uint64_t submits = 0, submitNs = 0, flipSubmits = 0, flipSubmitNs = 0, eopReserves = 0, eopReserveNs = 0;
+    std::uint64_t flipRoomNs = 0, flipHoldNs = 0, registrationNs = 0, renderWaitNs = 0;
     std::uint64_t dwords = 0, packets = 0, draws = 0;
     std::uint64_t queueLatencyNs = 0, queueLatencies = 0;
     std::uint64_t packetBusyNs = 0, packetIdleNs = 0, packetPackets = 0, packetSubmissions = 0, packetPoolWaitNs = 0;
@@ -131,6 +133,7 @@ struct Window {
     std::uint64_t frames = 0;
     std::uint64_t presents = 0;
     double gpuBusyMs = 0;
+    std::array<std::uint64_t, KernelWaitKinds> kernelWaitNs{};
     Spread gapMs, spanMs, insideMs, intervalMs, flipToPresentMs;
 };
 
@@ -149,7 +152,10 @@ public:
         totals.submitNs = take(submitNs);
         totals.flipSubmits = take(flipSubmits);
         totals.flipSubmitNs = take(flipSubmitNs);
-        totals.throttleNs = take(throttleNs);
+        totals.flipRoomNs = take(flipRoomNs);
+        totals.flipHoldNs = take(flipHoldNs);
+        totals.registrationNs = take(registrationNs);
+        totals.renderWaitNs = take(renderWaitNs);
         totals.eopReserves = take(eopReserves);
         totals.eopReserveNs = take(eopReserveNs);
         totals.dwords = take(dwords);
@@ -188,7 +194,8 @@ public:
         return totals;
     }
 
-    Counter submits{0}, submitNs{0}, flipSubmits{0}, flipSubmitNs{0}, throttleNs{0}, eopReserves{0}, eopReserveNs{0};
+    Counter submits{0}, submitNs{0}, flipSubmits{0}, flipSubmitNs{0}, eopReserves{0}, eopReserveNs{0};
+    Counter flipRoomNs{0}, flipHoldNs{0}, registrationNs{0}, renderWaitNs{0};
     Counter dwords{0}, packets{0}, draws{0};
     Counter queueLatencyNs{0}, queueLatencies{0};
     Counter packetBusyNs{0}, packetIdleNs{0}, packetPackets{0}, packetSubmissions{0}, packetPoolWaitNs{0};

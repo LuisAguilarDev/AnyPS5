@@ -99,7 +99,7 @@ private:
     void executeRewindTail(const Submission& stalled);
     void enqueue(Submission submission);
     void noteHeldAtSubmit(Submission& submission, std::size_t cursor);
-    void noteFrameStepSubmit(std::int64_t entryNs, std::int64_t throttleNs, bool flips);
+    void noteFrameStepSubmit(std::int64_t entryNs, const std::array<std::int64_t, 4>& waitedAt, bool flips);
     static void noteFrameStepDequeue(const Submission& submission, std::int64_t waitStartNs, std::int64_t& dequeuedNs);
     static void forgetUnfinishedWrites(QueueWorker& worker, const Submission& submission);
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);

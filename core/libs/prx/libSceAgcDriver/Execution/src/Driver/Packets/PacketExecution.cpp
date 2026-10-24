@@ -289,7 +289,9 @@ void Driver::execute(const Submission& submission) {
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
+            const auto renderWaitStartNs = FrameSteps::Enabled() ? FrameSteps::NowNs() : 0;
             timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            if (renderWaitStartNs != 0 && submission.queue == 0) FrameSteps::Counters::AddNs(FrameSteps::Global().renderWaitNs, FrameSteps::NowNs() - renderWaitStartNs);
         } else if (submission.flips.contains(cursor)) {
             if (opcode == 0x49) {
                 if (!wroteOnGpu) {

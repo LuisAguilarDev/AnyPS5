@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBKERNEL_TIME_INCLUDE_TIME_HPP
 #define CORE_LIBS_PRX_LIBKERNEL_TIME_INCLUDE_TIME_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
@@ -21,6 +22,8 @@ extern "C" {
     // variables, event queues) per guest call site and prints the sites that wait longest every 3 s,
     // with their timeout rate; a site that times out once per frame is a lost wake-up.
     void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut);
+    void KernelMarkFrameWaitThread_nid_postfix();
+    void KernelFrameWaitNanos_nid_postfix(std::uint64_t* nanos, std::size_t count);
 
 }
 

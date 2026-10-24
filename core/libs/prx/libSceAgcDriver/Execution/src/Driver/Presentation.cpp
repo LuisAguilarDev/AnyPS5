@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -16,6 +17,8 @@ std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
         std::int64_t startNs;
         ~Timed() {
             if (startNs == 0) return;
+            static thread_local bool marked = false;
+            if (!std::exchange(marked, true)) KernelMarkFrameWaitThread_nid_postfix();
             auto& counters = FrameSteps::Global();
             FrameSteps::Counters::Add(counters.eopReserves, 1);
             FrameSteps::Counters::AddNs(counters.eopReserveNs, FrameSteps::NowNs() - startNs);
@@ -198,10 +201,12 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
 void Driver::reportFrameSteps(std::int64_t nowNs) {
     static bool started = false;
     static double previousGpuBusyMs = 0;
+    static std::array<std::uint64_t, FrameSteps::KernelWaitKinds> previousWaits{};
     if (!started) {
         started = true;
         FrameSteps::Global().Take();
         previousGpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
+        KernelFrameWaitNanos_nid_postfix(previousWaits.data(), previousWaits.size());
     }
     auto& frames = FrameSteps::GlobalFrames();
     if (!frames.Present(nowNs)) return;
@@ -209,6 +214,10 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     const auto gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
     window.gpuBusyMs = gpuBusyMs - previousGpuBusyMs;
     previousGpuBusyMs = gpuBusyMs;
+    std::array<std::uint64_t, FrameSteps::KernelWaitKinds> waits{};
+    KernelFrameWaitNanos_nid_postfix(waits.data(), waits.size());
+    for (std::size_t i = 0; i < waits.size(); ++i) window.kernelWaitNs[i] = waits[i] - previousWaits[i];
+    previousWaits = waits;
     const auto totals = FrameSteps::Global().Take();
     auto& output = ProfileOutput_nid_no_patch();
     output.Write(FrameSteps::FormatGuest(totals, window));

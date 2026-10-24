@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
@@ -344,11 +345,14 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
-    const auto throttleStartNs = frameSteps ? FrameSteps::NowNs() : 0;
+    std::array<std::int64_t, 4> waitedAt{};
+    if (frameSteps) waitedAt[0] = FrameSteps::NowNs();
     waitForFlipRoom(submission);
+    if (frameSteps) waitedAt[1] = FrameSteps::NowNs();
     holdFlipBehindWorker(submission);
+    if (frameSteps) waitedAt[2] = FrameSteps::NowNs();
     AwaitRegistrationPreparation();
-    const auto throttleNs = frameSteps ? FrameSteps::NowNs() - throttleStartNs : 0;
+    if (frameSteps) waitedAt[3] = FrameSteps::NowNs();
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
@@ -386,15 +390,19 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     }
     changed.notify_all();
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
-    if (frameSteps) noteFrameStepSubmit(entryNs, throttleNs, flips);
+    if (frameSteps) noteFrameStepSubmit(entryNs, waitedAt, flips);
 }
 
-void Driver::noteFrameStepSubmit(std::int64_t entryNs, std::int64_t throttleNs, bool flips) {
+void Driver::noteFrameStepSubmit(std::int64_t entryNs, const std::array<std::int64_t, 4>& waitedAt, bool flips) {
+    static thread_local bool marked = false;
+    if (!std::exchange(marked, true)) KernelMarkFrameWaitThread_nid_postfix();
     const auto exitNs = FrameSteps::NowNs();
     auto& counters = FrameSteps::Global();
     FrameSteps::Counters::Add(counters.submits, 1);
     FrameSteps::Counters::AddNs(counters.submitNs, exitNs - entryNs);
-    FrameSteps::Counters::AddNs(counters.throttleNs, throttleNs);
+    FrameSteps::Counters::AddNs(counters.flipRoomNs, waitedAt[1] - waitedAt[0]);
+    FrameSteps::Counters::AddNs(counters.flipHoldNs, waitedAt[2] - waitedAt[1]);
+    FrameSteps::Counters::AddNs(counters.registrationNs, waitedAt[3] - waitedAt[2]);
     if (flips) {
         FrameSteps::Counters::Add(counters.flipSubmits, 1);
         FrameSteps::Counters::AddNs(counters.flipSubmitNs, exitNs - entryNs);

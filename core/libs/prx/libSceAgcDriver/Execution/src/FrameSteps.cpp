@@ -54,19 +54,29 @@ std::string FormatGuest(const Totals& totals, const Window& window) {
     const auto kbPerFrame = PerFrame(static_cast<double>(totals.dwords) * sizeof(std::uint32_t) / BytesPerKb, frames);
     const auto frameMs = window.gapMs.mean + window.spanMs.mean;
     const auto outsideMs = std::max(0.0, frameMs - window.insideMs.mean);
-    char text[2048];
+    const auto waitMs = [&](std::uint64_t ns) { return PerFrame(Ms(ns), frames); };
+    const auto kernelMs = [&](std::size_t kind) { return waitMs(window.kernelWaitNs[kind]); };
+    const auto backpressureMs = waitMs(totals.flipRoomNs) + waitMs(totals.flipHoldNs) + waitMs(totals.registrationNs) + kernelMs(WaitEqueue) + kernelMs(WaitSleep) + kernelMs(WaitVblank);
+    const auto guestSyncMs = kernelMs(WaitEventFlag) + kernelMs(WaitSemaphore) + kernelMs(WaitCond) + kernelMs(WaitAddress);
+    char text[4096];
     const auto length = std::snprintf(text, sizeof(text),
-        "[frame-steps-guest] window_s=%.1f frames=%llu submits/f=%.1f submit_us/call=%.1f submit_ms/f=%.2f flip_submits/f=%.2f flip_submit_us/call=%.1f flip_throttle_ms/f=%.2f eop_reserves/f=%.2f eop_reserve_us/call=%.1f "
+        "[frame-steps-guest] window_s=%.1f frames=%llu submits/f=%.1f submit_us/call=%.1f submit_ms/f=%.2f flip_submits/f=%.2f flip_submit_us/call=%.1f eop_reserves/f=%.2f eop_reserve_us/call=%.1f "
         "dwords/f=%.0f kb/f=%.1f packets/f=%.0f draws/f=%.0f "
         "gap_ms(p50/p95/mean)=%.2f/%.2f/%.2f span_ms(p50/p95/mean)=%.2f/%.2f/%.2f inside_calls_ms(p50/p95/mean)=%.2f/%.2f/%.2f outside_calls_ms/f=%.2f "
-        "pm4_kb_per_ms_span=%.2f pm4_kb_per_ms_frame=%.2f q0_enqueue_to_packet_us=%.1f",
+        "pm4_kb_per_ms_span=%.2f pm4_kb_per_ms_frame=%.2f q0_enqueue_to_packet_us=%.1f frame_ms=%.2f "
+        "wait_flip_room_ms/f=%.2f wait_flip_hold_ms/f=%.2f wait_registration_ms/f=%.2f wait_equeue_ms/f=%.2f wait_sleep_ms/f=%.2f wait_vblank_ms/f=%.2f "
+        "wait_evf_ms/f=%.2f wait_sema_ms/f=%.2f wait_cond_ms/f=%.2f wait_addr_ms/f=%.2f q0_render_wait_ms/f=%.2f "
+        "backpressure_wait_ms/f=%.2f build_ms/f(proxy)=%.2f build_min_ms/f(proxy)=%.2f",
         window.seconds, static_cast<unsigned long long>(frames), PerFrame(static_cast<double>(totals.submits), frames), PerItem(Us(totals.submitNs), totals.submits), PerFrame(Ms(totals.submitNs), frames),
-        PerFrame(static_cast<double>(totals.flipSubmits), frames), PerItem(Us(totals.flipSubmitNs), totals.flipSubmits), PerFrame(Ms(totals.throttleNs), frames),
+        PerFrame(static_cast<double>(totals.flipSubmits), frames), PerItem(Us(totals.flipSubmitNs), totals.flipSubmits),
         PerFrame(static_cast<double>(totals.eopReserves), frames), PerItem(Us(totals.eopReserveNs), totals.eopReserves),
         PerFrame(static_cast<double>(totals.dwords), frames), kbPerFrame, PerFrame(static_cast<double>(totals.packets), frames), PerFrame(static_cast<double>(totals.draws), frames),
         window.gapMs.p50, window.gapMs.p95, window.gapMs.mean, window.spanMs.p50, window.spanMs.p95, window.spanMs.mean,
         window.insideMs.p50, window.insideMs.p95, window.insideMs.mean, outsideMs,
-        window.spanMs.mean > 0 ? kbPerFrame / window.spanMs.mean : 0.0, frameMs > 0 ? kbPerFrame / frameMs : 0.0, PerItem(Us(totals.queueLatencyNs), totals.queueLatencies));
+        window.spanMs.mean > 0 ? kbPerFrame / window.spanMs.mean : 0.0, frameMs > 0 ? kbPerFrame / frameMs : 0.0, PerItem(Us(totals.queueLatencyNs), totals.queueLatencies), frameMs,
+        waitMs(totals.flipRoomNs), waitMs(totals.flipHoldNs), waitMs(totals.registrationNs), kernelMs(WaitEqueue), kernelMs(WaitSleep), kernelMs(WaitVblank),
+        kernelMs(WaitEventFlag), kernelMs(WaitSemaphore), kernelMs(WaitCond), kernelMs(WaitAddress), waitMs(totals.renderWaitNs),
+        backpressureMs, std::max(0.0, frameMs - backpressureMs), std::max(0.0, frameMs - backpressureMs - guestSyncMs));
     return Finish(text, length);
 }
 

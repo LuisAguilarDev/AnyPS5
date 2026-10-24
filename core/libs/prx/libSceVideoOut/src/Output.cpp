@@ -1,3 +1,5 @@
+#include "prx/libkernel/Time/include/Time.hpp"
+#include <chrono>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -244,7 +246,9 @@ int APS5_VABI sceVideoOutWaitVblank(int handle) try {
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     const uint64_t count = cfg->vblankStatus.count;
+    const auto waitStart = std::chrono::steady_clock::now();
     cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return !cfg->opened || cfg->closing || cfg->failure || cfg->vblankStatus.count != count; });
+    KernelTraceWait_nid_postfix("vblank", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), false);
     cfg->Check();
     return 0;
 } catch (const ProcessShutdown&) {

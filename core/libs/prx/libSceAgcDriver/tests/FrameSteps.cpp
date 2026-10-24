@@ -129,6 +129,11 @@ void CheckFormatting() {
     window.spanMs.mean = 8.0;
     window.gapMs.count = 1;
     window.gapMs.mean = 2.0;
+    totals.flipRoomNs = static_cast<std::uint64_t>(2 * Ms);
+    totals.renderWaitNs = static_cast<std::uint64_t>(6 * Ms);
+    window.kernelWaitNs[FrameSteps::WaitEqueue] = static_cast<std::uint64_t>(4 * Ms);
+    window.kernelWaitNs[FrameSteps::WaitSleep] = static_cast<std::uint64_t>(2 * Ms);
+    window.kernelWaitNs[FrameSteps::WaitCond] = static_cast<std::uint64_t>(2 * Ms);
     const auto guest = FrameSteps::FormatGuest(totals, window);
     Contains(guest, "[frame-steps-guest] ");
     Contains(guest, "frames=2 ");
@@ -141,6 +146,12 @@ void CheckFormatting() {
     Contains(guest, "draws/f=1500 ");
     Contains(guest, "pm4_kb_per_ms_span=97.68 ");
     Contains(guest, "pm4_kb_per_ms_frame=78.14");
+    Contains(guest, "frame_ms=10.00 ");
+    Contains(guest, "wait_flip_room_ms/f=1.00 wait_flip_hold_ms/f=0.00 wait_registration_ms/f=0.00 ");
+    Contains(guest, "wait_equeue_ms/f=2.00 wait_sleep_ms/f=1.00 wait_vblank_ms/f=0.00 ");
+    Contains(guest, "wait_evf_ms/f=0.00 wait_sema_ms/f=0.00 wait_cond_ms/f=1.00 wait_addr_ms/f=0.00 ");
+    Contains(guest, "q0_render_wait_ms/f=3.00 ");
+    Contains(guest, "backpressure_wait_ms/f=4.00 build_ms/f(proxy)=6.00 build_min_ms/f(proxy)=5.00");
     Require(guest.back() == '\n', "the guest line does not end the line");
     const auto lanes = FrameSteps::FormatLanes(totals, window);
     Contains(lanes, "[frame-steps] ");

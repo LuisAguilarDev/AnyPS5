@@ -1470,7 +1470,7 @@ void Recorder::endOpenRenderPass(bool barrier) {
 }
 
 void Recorder::QueueKeyStore(VkBuffer buffer, VkDeviceSize first, VkDeviceSize last, std::shared_ptr<void> seed, std::uint64_t begin, std::uint64_t end) {
-    ensureOpen();
+    ensureOpenForNotes();
     // A queued label store over the keys lands first (program order: the key store is later).
     FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
     keyStoreCount.fetch_add(1, std::memory_order_relaxed);
@@ -1540,6 +1540,25 @@ void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     // Whatever the spine records next follows the open chunk's draws: no later draw joins it.
     if (joinable != nullptr && !keepingChunk) SealChunk();
+    openBatch();
+}
+
+void Recorder::ensureOpenForNotes() {
+    if (!ChunkRideAlong()) {
+        ensureOpen();
+        return;
+    }
+    GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    openBatch();
+}
+
+void Recorder::sealForSpineCommands() {
+    if (joinable == nullptr) return;
+    if (keepingChunk) ++commandRequests;
+    else SealChunk();
+}
+
+void Recorder::openBatch() {
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -1581,7 +1600,8 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
-    ensureOpen();
+    if (LabelRunsPerBatch()) ensureOpenForNotes();
+    else ensureOpen();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -1678,6 +1698,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         run.queued.clear();
         open->queuedDumps = 0;
         if (stores.empty()) return false;
+        sealForSpineCommands();
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
@@ -2672,7 +2693,7 @@ std::size_t Recorder::UnsignaledBatches() const {
 }
 
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
-    ensureOpen();
+    ensureOpenForNotes();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
 }
@@ -2693,7 +2714,7 @@ void Recorder::dropStaleHoldKept() {
 
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
-    ensureOpen();
+    ensureOpenForNotes();
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
@@ -3073,6 +3094,11 @@ std::size_t Recorder::ChunkDraws() {
     return draws;
 }
 
+bool Recorder::ChunkRideAlong() {
+    static const bool rideAlong = std::getenv("APS5_NO_CHUNK_RIDE_ALONG") == nullptr;
+    return rideAlong;
+}
+
 DrawRecorders* Recorder::Recorders() {
     if (!recordersMade) {
         recordersMade = true;
@@ -3194,7 +3220,7 @@ bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, Snaps
 void Recorder::KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest) { mainContext->KeepHighestIndex(address, bytes, use, generation, registryGeneration, highest); }
 
 void Recorder::OnComplete(std::function<void()> action) {
-    ensureOpen();
+    ensureOpenForNotes();
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
@@ -3203,7 +3229,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
-    ensureOpen();
+    ensureOpenForNotes();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
@@ -3410,14 +3436,14 @@ bool Recorder::ReadTracking() {
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
-    ensureOpen();
+    ensureOpenForNotes();
     open->reads.push_back({address, address + bytes, kind});
     readsNoted.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
     if (ranges.empty() || !ReadTrackingEnabled()) return;
-    ensureOpen();
+    ensureOpenForNotes();
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) open->reads.push_back({begin, end, kind});
@@ -3439,7 +3465,7 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
         NotePendingReads(*ranges, kind);
         return;
     }
-    ensureOpen();
+    ensureOpenForNotes();
     readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
     for (const auto& note : open->readLists) {
         if (note.ranges == ranges && note.kind == kind) return;
@@ -3585,7 +3611,7 @@ void Recorder::markBehindCompletion(const Batch& batch, std::uint64_t begin, std
 }
 
 void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
-    ensureOpen();
+    ensureOpenForNotes();
     // The table entry before the write note: the note bumps the write generation a poller
     // watches, and a poller that sees the bump then finds the label without the GPU mutex.
     const bool tabled = bytes.size() <= LabelTableBytes;

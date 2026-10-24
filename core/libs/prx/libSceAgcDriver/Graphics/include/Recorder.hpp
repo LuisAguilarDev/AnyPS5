@@ -180,8 +180,12 @@ public:
     // next draw joins: the open one while nothing else was recorded into the batch since its last
     // draw and it holds fewer than ChunkDraws draws, else a new one (the spine's command buffer so
     // far ends behind its open pass, and a fresh one takes what the spine records after the
-    // chunk). Anything else that records into the batch (ensureOpen, outside a ChunkKeepScope)
-    // seals the open chunk; Submit seals it, waits for every chunk of the batch, adds their kept
+    // chunk). Anything else that records commands into the batch (ensureOpen, outside a
+    // ChunkKeepScope) seals the open chunk. What only takes effect at the batch's submission or
+    // completion leaves it open (ensureOpenForNotes: kept objects, completion actions, read, write
+    // and label notes, a label store queued for the batch's store run, a queued key store); the
+    // queued stores seal it when they are recorded (sealForSpineCommands). With
+    // APS5_NO_CHUNK_RIDE_ALONG=1 those seal it too, as before. Submit seals it, waits for every chunk of the batch, adds their kept
     // objects and submits all command buffers in order. A recorder thread's failure is rethrown by
     // the next JoinChunk (the spine's draw commit fails, which stops the committer); Submit leaves a
     // failed chunk's commands out. Null threads: APS5_DRAW_RECORD_THREADS unset or 0, GPU timing
@@ -211,6 +215,7 @@ public:
     // OneRecordingStream) and APS5_DRAW_CHUNK_DRAWS (32): the most draws one chunk holds.
     static std::size_t DrawRecordThreads();
     static std::size_t ChunkDraws();
+    static bool ChunkRideAlong();
     static constexpr std::size_t MaxDrawRecordThreads = 16;
     // The recorder threads for `usable` processors with `reserved` of them left to the guest: the
     // rest less the packet thread and the spine, 1 to MaxDrawRecordThreads.
@@ -903,6 +908,12 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    // ensureOpen for what records no commands: the open chunk stays open (see JoinChunk).
+    void ensureOpenForNotes();
+    void openBatch();
+    // Before the spine records into its command buffer without Commands(): seals the open chunk,
+    // or, in a ChunkKeepScope, has the chunked draw seal it after its record half is queued.
+    void sealForSpineCommands();
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();

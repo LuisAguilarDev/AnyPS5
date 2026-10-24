@@ -5,8 +5,10 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
@@ -95,7 +97,17 @@ bool Driver::vouchedValidation() {
     return enabled;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+bool Driver::drawValidationGenerations() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_VALIDATION_GENERATIONS") == nullptr;
+    return enabled;
+}
+
+bool Driver::verifyDrawValidationGenerations() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_VALIDATION_GENERATIONS") != nullptr;
+    return verify;
+}
+
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, GenerationGateCounts* gate) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& steps = validateSteps();
     auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -174,16 +186,47 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         }
     }
 
-    pending.Load();
     step(&ValidateSteps::gatesNs);
-    bool unmapped = false;
-    const bool same = validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr, vouched);
-    step(&ValidateSteps::compareNs);
-    if (!same) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    const bool considered = gate != nullptr && drawValidationGenerations() && !variant.runs.empty();
+    bool gated = considered;
+    std::uint64_t collected = 0;
+    for (std::size_t index = 0; gated && index < variant.runs.size(); ++index) {
+        const auto [begin, end] = variant.runs[index];
+        const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        gated = generation != 0;
+        collected = std::max(collected, generation);
+    }
+    pending.Load();
+    gated = gated && std::none_of(variant.runs.begin(), variant.runs.end(), [&](const auto& run) { return pending.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); });
+    const auto proof = gated ? variant.proof.load(std::memory_order_acquire) : 0;
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    if (proof != 0) {
+        for (const auto& [begin, end] : variant.runs) queries.push_back({begin, static_cast<std::size_t>(end - begin), proof});
+    }
+    const bool unchanged = proof != 0 && GuestMemory::UnchangedSinceAll(queries);
+    const bool verify = unchanged && verifyDrawValidationGenerations();
+    if (unchanged && !verify) {
+        ++gate->skips;
+    } else {
+        if (considered) ++(verify ? gate->verified : gate->compares);
+        bool unmapped = false;
+        const bool same = validateCaptured(program, queue, regions, *variant.compiled, true, pending, &unmapped, &sampling, masked ? &mask : nullptr, vouched);
+        step(&ValidateSteps::compareNs);
+        if (verify && (!same || (masked && !live->empty()))) {
+            char message[256];
+            std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_VALIDATION_GENERATIONS: program 0x%llx's %zu captured runs are unchanged since generation %llu but the compare %s", static_cast<unsigned long long>(program), variant.runs.size(), static_cast<unsigned long long>(proof), !same ? (unmapped ? "found them unmapped" : "differs") : "found live data words");
+            throw std::runtime_error(message);
+        }
+        if (!same) return unmapped ? EntryOutcome::Inaccessible : EntryOutcome::Differing;
+    }
     if (Graphics::Recorder::PublishGeneration() != publish) return EntryOutcome::PublishMoved;
     if (Graphics::StorageTexture::PendingSerial() != pendingSerial) return EntryOutcome::PendingMoved;
     if (GuestMemory::ForgetSerial() != forget) return EntryOutcome::ForgetMoved;
-    return masked && !live->empty() ? EntryOutcome::EqualData : EntryOutcome::Equal;
+    const bool data = masked && !live->empty();
+    if (gated && !unchanged && !data && vouched.empty()) variant.proof.store(collected, std::memory_order_release);
+    return data ? EntryOutcome::EqualData : EntryOutcome::Equal;
 }
 
 }

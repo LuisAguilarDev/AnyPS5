@@ -202,7 +202,7 @@ private:
     static std::vector<std::pair<std::uint64_t, std::int32_t>> vertexFetchReads(const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const Graphics::DecodeRead> decodeReads, std::span<const std::uint32_t> userData, std::uint32_t hiddenWords);
     static std::shared_ptr<DispatchVariant> copyVariant(const DispatchVariant& variant);
     static void rebaseVariantWord(DispatchVariant& copy, std::uint32_t index, std::uint32_t from, std::uint32_t to);
-    std::shared_ptr<DispatchVariant> dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters);
+    std::shared_ptr<DispatchVariant> dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters, GenerationGateCounts* gate = nullptr);
     static void applyShaderDataPatches(DispatchVariant& variant);
     void learnPendingRelocation();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
@@ -271,6 +271,8 @@ private:
     static ShaderMemory::HookWaitCounter hookWaitCounter();
     static bool validateSkipEnabled();
     static bool vouchedValidation();
+    static bool drawValidationGenerations();
+    static bool verifyDrawValidationGenerations();
     static bool validateLegacy();
     static bool gateRetry();
     static bool validateSkipVerify();
@@ -311,7 +313,7 @@ private:
     static std::shared_ptr<const ShaderRecompiler::RecompileResult> patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words);
     bool syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling, std::span<const VouchedRegions> skipped = {});
     static ValidateSteps& validateSteps();
-    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr);
+    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr, GenerationGateCounts* gate = nullptr);
     static int waitTimeoutMs();
     static bool pollReapAll();
     static bool pollTryEach();

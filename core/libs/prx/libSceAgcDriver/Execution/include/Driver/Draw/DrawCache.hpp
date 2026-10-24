@@ -123,6 +123,7 @@ struct DrawEntryCounters {
     ValidateSteps validateSteps;
     std::map<std::uint64_t, std::uint64_t> refusedByProgramWord;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
+    std::uint64_t generationSkips = 0, generationCompares = 0, generationVerified = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

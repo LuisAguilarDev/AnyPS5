@@ -58,6 +58,11 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    mutable std::atomic<std::uint64_t> proof{0};
+};
+
+struct GenerationGateCounts {
+    std::uint64_t skips = 0, compares = 0, verified = 0;
 };
 
 struct DispatchEntry {

@@ -9,7 +9,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters) {
+std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<DispatchVariant>& variant, const DrawProgram& now, const DrawProgram& was, std::uint32_t queue, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, DrawCandidateCounters& counters, GenerationGateCounts* gate) {
     std::uint64_t moved = 0;
     bool movedBeyond = false;
     for (std::size_t w = 0; w < now.userData.size(); ++w) {
@@ -67,8 +67,8 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
     auto* live = candidateDataWords() ? &liveData : nullptr;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     appendEntryRegions(*candidate, regions);
-    auto result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live);
-    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live);
+    auto result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live, gate);
+    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live, gate);
     if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
         ++(rebased ? counters.differingRebased : counters.differingEqual);
         return nullptr;
@@ -193,6 +193,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             auto* live = drawStageDataHits() ? &liveData : nullptr;
+            GenerationGateCounts generations;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -219,8 +220,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         regions.clear();
                         appendEntryRegions(*variant, regions);
                         ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, &generations);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, &generations);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
@@ -268,6 +269,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 add(counters.stageValidations, stageValidations);
                 add(counters.stageEqual, stageEqual);
                 add(counters.variantsCompared, compared);
+                add(counters.generationSkips, generations.skips);
+                add(counters.generationCompares, generations.compares);
+                add(counters.generationVerified, generations.verified);
                 const auto steps = validateSteps().Since(stepsBefore);
                 for (const auto field : {&ValidateSteps::calls, &ValidateSteps::runs, &ValidateSteps::bytes, &ValidateSteps::pipelineNs, &ValidateSteps::syncNs, &ValidateSteps::gatesNs, &ValidateSteps::compareNs}) add(counters.validateSteps.*field, steps.*field);
                 if (drawHit) {
@@ -325,6 +329,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
         } else if (dataEntry != nullptr && graphics.stages.path == Graphics::ShaderPath::Vertex && dataEntry->stages.size() == programs.size() && dataEntry->decode->programs.size() == programs.size()) {
             std::uint64_t imagesFlushed = 0, runsSynced = 0;
             DrawCandidateCounters tally;
+            GenerationGateCounts generations;
             const auto stepsBefore = validateSteps();
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
@@ -335,7 +340,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     auto& candidates = dataCandidates[i];
                     for (const auto& variant : dataEntry->stages[i]) {
                         if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
-                        auto candidate = dataCandidate(variant, programs[i], was, submission.queue, imagesFlushed, runsSynced, sampling, tally);
+                        auto candidate = dataCandidate(variant, programs[i], was, submission.queue, imagesFlushed, runsSynced, sampling, tally, &generations);
                         if (candidate == nullptr) continue;
                         std::vector<ShaderRecompiler::MemoryRegion> regions;
                         appendEntryRegions(*candidate, regions);
@@ -345,6 +350,9 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             }
             std::lock_guard cacheLock(drawCacheMutex);
             drawEntryCounters.candidates += tally;
+            drawEntryCounters.generationSkips += generations.skips;
+            drawEntryCounters.generationCompares += generations.compares;
+            drawEntryCounters.generationVerified += generations.verified;
             for (const auto word : tally.refusedWords) ++drawEntryCounters.refusedByProgramWord[word];
             drawEntryCounters.validateSteps += validateSteps().Since(stepsBefore);
         }

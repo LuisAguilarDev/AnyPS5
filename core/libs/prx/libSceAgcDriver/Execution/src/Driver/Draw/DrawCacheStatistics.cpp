@@ -82,6 +82,7 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     const auto& steps = counters.validateSteps;
     const auto perCall = [&](std::uint64_t ns) { return steps.calls != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(steps.calls) : 0.0; };
     append("[draw-cache] variant validations (10 s): %llu, %.1f runs (%.0f bytes) each; us each: pipeline overlap checks %.2f (prep-pool waits included), pending-write syncs %.2f, image/shadow/label gates %.2f, compare %.2f\n", count(steps.calls), steps.calls != 0 ? static_cast<double>(steps.runs) / static_cast<double>(steps.calls) : 0.0, steps.calls != 0 ? static_cast<double>(steps.bytes) / static_cast<double>(steps.calls) : 0.0, perCall(steps.pipelineNs), perCall(steps.syncNs), perCall(steps.gatesNs), perCall(steps.compareNs));
+    append("[draw-cache] validation generations (10 s): %llu hits skipped the compare over unchanged write generations, %llu compared, %llu verified against the compare\n", count(counters.generationSkips), count(counters.generationCompares), count(counters.generationVerified));
     append("[draw-cache] stage data hits (10 s): %llu stages (%llu words refreshed), verified %llu; stage inserts with data positions %llu (%.1f positions each)\n", count(counters.stageDataHits), count(counters.stageDataWords), count(counters.stageDataVerified), count(counters.stageDataInserts), counters.stageDataInserts != 0 ? static_cast<double>(counters.stageDataPositions) / static_cast<double>(counters.stageDataInserts) : 0.0);
     return text;
 }

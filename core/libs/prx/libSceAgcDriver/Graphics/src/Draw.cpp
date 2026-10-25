@@ -622,8 +622,8 @@ struct DrawOutcome {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     double walkUs = 0;
-    // Resident target lookups a memo of the previous draw's answered (residentTargetMemo).
     std::uint64_t targetMemoHits = 0;
+    std::uint64_t drawInputMemoHits = 0;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -661,6 +661,7 @@ struct DrawProfile {
     double lookupUs = 0;
     double walkUs = 0;
     std::uint64_t targetMemoHits = 0;
+    std::uint64_t drawInputMemoHits = 0;
     std::array<double, PhaseCount> totalsUs{};
     std::array<double, LookupPartCount> lookupPartsUs{};
     std::array<double, VertexPartCount> vertexPartsUs{};
@@ -945,6 +946,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.lookupUs += outcome.lookupUs;
     profile.walkUs += outcome.walkUs;
     profile.targetMemoHits += outcome.targetMemoHits;
+    profile.drawInputMemoHits += outcome.drawInputMemoHits;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -970,7 +972,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
         if (i == PhaseVertex && room()) {
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
             for (std::size_t part = 0; part < VertexPartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", part == 0 ? "" : ", ", VertexPartNames[part], profile.vertexPartsUs[part] / 1000.0);
-            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; %llu snapshot lookups answered by the memo)", static_cast<unsigned long long>(profile.drawInputMemoHits));
         }
         if (i == PhaseLookup && room()) {
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
@@ -1028,6 +1030,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = profile.walkUs = 0;
     profile.targetMemoHits = 0;
+    profile.drawInputMemoHits = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -1688,6 +1691,78 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
 
 namespace {
 
+struct TargetMemoToken {
+    std::uint64_t epoch = 0;
+    std::uint64_t proofs = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t depthSurfaces = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t allocations = 0;
+    std::uint64_t presents = 0;
+    bool operator==(const TargetMemoToken&) const = default;
+};
+
+TargetMemoToken currentTargetMemoToken() {
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), DepthSurfacesSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), Recorder::Presents()};
+}
+
+struct DrawInputMemo {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t alignment = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+    const Recorder* recorder = nullptr;
+    std::weak_ptr<Buffer> buffer;
+    std::uint32_t derived = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t registryGeneration = 0;
+    TargetMemoToken token;
+};
+
+constexpr std::size_t DrawInputMemoSlots = 128;
+std::atomic<std::uint64_t> drawInputMemoHits{0};
+
+bool drawInputMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_INPUT_MEMO") == nullptr;
+    return enabled;
+}
+
+DrawInputMemo& drawInputMemo(std::uint64_t address, std::size_t bytes) {
+    thread_local std::array<DrawInputMemo, DrawInputMemoSlots> memos;
+    const auto hash = (address >> 4u) ^ (address >> 13u) ^ static_cast<std::uint64_t>(bytes) * 0x9e3779b97f4a7c15ull;
+    return memos[(hash ^ (hash >> 29u)) % DrawInputMemoSlots];
+}
+
+DrawInputCopy copyDrawInputMemo(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::uint64_t& hits) {
+    if (!drawInputMemoEnabled() || recorder == nullptr || bytes == 0 || DeviceLocalDrawBuffers(context)) return CopyDrawInput(context, recorder, address, bytes, alignment, use);
+    auto& memo = drawInputMemo(address, bytes);
+    const auto before = currentTargetMemoToken();
+    if (before.epoch != 0 && memo.token == before && memo.address == address && memo.bytes == bytes && memo.alignment == alignment && memo.use == use && memo.recorder == recorder) {
+        if (auto buffer = memo.buffer.lock(); buffer != nullptr) {
+            static const bool verify = std::getenv("APS5_VERIFY_DRAW_INPUT_MEMO") != nullptr;
+            if (verify) {
+                const auto checked = CopyDrawInput(context, recorder, address, bytes, alignment, use);
+                Require(checked.reused && checked.buffer == buffer && checked.derived == memo.derived, "the draw input memo answered another snapshot than the lookup");
+            } else if (DrawInputsProfiled()) {
+                drawInputCounters().copies[static_cast<std::size_t>(Recorder::DrawInputOutcome::Reused)].fetch_add(1, std::memory_order_relaxed);
+            }
+            DrawInputCopy copy;
+            copy.buffer = std::move(buffer);
+            copy.reused = true;
+            copy.hostReadable = true;
+            copy.derived = memo.derived;
+            copy.generation = memo.generation;
+            copy.registryGeneration = memo.registryGeneration;
+            drawInputMemoHits.fetch_add(1, std::memory_order_relaxed);
+            ++hits;
+            return copy;
+        }
+    }
+    auto copy = CopyDrawInput(context, recorder, address, bytes, alignment, use);
+    if (copy.reused && before.epoch != 0 && currentTargetMemoToken() == before) memo = {address, bytes, alignment, use, recorder, copy.buffer, copy.derived, copy.generation, copy.registryGeneration, before};
+    else memo.token = {};
+    return copy;
+}
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
 // buffer copy with its highest index, the vertex buffer copies and their layout, the fragment
 // outputs and the pipeline stages.
@@ -1891,7 +1966,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        if (import == nullptr) copy = copyDrawInputMemo(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, outcome.drawInputMemoHits);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
@@ -2018,7 +2093,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+        auto copy = copyDrawInputMemo(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, outcome.drawInputMemoHits);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
@@ -2053,27 +2128,6 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     return inputs;
 }
 
-// The resident target memo: the previous draw's answer for a color slot stands while the target
-// is the same and nothing its lookup reads has moved since: the collect epoch (the write-watch
-// walks repeat its first), the proof serial (guest stores, GPU holds off the committer, every
-// non-draw commit), the pending registry, depth surfaces, unwatched and reallocated memory and
-// presents, and the image is still cached. A lookup that moved any of them (an upload, a flush,
-// a clear materialized, an image made) is not memoized. APS5_NO_TARGET_MEMO=1 looks up every
-// draw's targets; APS5_VERIFY_TARGET_MEMO=1 also looks up on a hit and aborts on another image.
-struct TargetMemoToken {
-    std::uint64_t epoch = 0;
-    std::uint64_t proofs = 0;
-    std::uint64_t pending = 0;
-    std::uint64_t depthSurfaces = 0;
-    std::uint64_t unwatched = 0;
-    std::uint64_t allocations = 0;
-    std::uint64_t presents = 0;
-    bool operator==(const TargetMemoToken&) const = default;
-};
-
-TargetMemoToken currentTargetMemoToken() {
-    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), DepthSurfacesSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), Recorder::Presents()};
-}
 
 bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
     return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.slot == b.slot && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.coverageSamples == b.coverageSamples && a.dccControl == b.dccControl && a.fmaskAddress == b.fmaskAddress && a.fmaskPipeBankXor == b.fmaskPipeBankXor && a.partialWriteMask == b.partialWriteMask;
@@ -2082,7 +2136,6 @@ bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
 struct ResidentTargetMemo {
     VkDevice device = VK_NULL_HANDLE;
     ColorTarget color{};
-    // Weak: the memo must not keep an evicted image alive past the device.
     std::weak_ptr<StorageTexture> resident;
     TargetMemoToken token;
 };
@@ -2102,7 +2155,6 @@ std::array<ResidentTargetMemo, TargetMemoSlots>& residentTargetMemos() {
 
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup);
 
-// refreshResidentTarget through the memo of the color slot `index`.
 std::shared_ptr<StorageTexture> residentTargetMemo(const Context& context, const State& state, std::size_t index, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto& color = state.colors[index];
     if (!targetMemoEnabled() || index >= TargetMemoSlots) return refreshResidentTarget(context, state, color, outcome, profile, lookup);
@@ -4196,6 +4248,10 @@ bool CommitTrims() {
 
 std::uint64_t ResidentTargetMemoHits() {
     return targetMemoHits.load(std::memory_order_relaxed);
+}
+
+std::uint64_t DrawInputMemoHits() {
+    return drawInputMemoHits.load(std::memory_order_relaxed);
 }
 
 }

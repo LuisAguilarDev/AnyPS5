@@ -35,7 +35,6 @@
 // checks that the draws hit; `--benchmark hits|data|moved|rings|buffers|textures [seconds]` submits
 // one kind for the given time
 // (default 21 s) so the APS5_PROFILE_DRAW=1 lines ([draws], [spine]) cover two whole 10 s windows.
-// `--target-memo` checks the resident target memo instead (CheckTargetMemo).
 
 namespace {
 
@@ -121,6 +120,30 @@ struct TargetBlock {
     std::byte* data = nullptr;
 };
 
+constexpr std::size_t IndexBytes = 0x10000;
+
+struct IndexBlock {
+    IndexBlock() {
+#ifdef _WIN32
+        data = static_cast<std::uint16_t*>(GuestArena::GuestArenaAllocate_nid_postfix(IndexBytes, IndexBytes));
+        Require(data != nullptr, "cannot allocate the indices");
+        GuestArena::GuestArenaCommit_nid_postfix(data, IndexBytes, PAGE_READWRITE, IndexBytes);
+        data[0] = 0;
+        data[1] = 1;
+        data[2] = 2;
+        GuestAllocations::Mutation().Add(data, IndexBytes, true, true, true);
+#endif
+    }
+    ~IndexBlock() {
+#ifdef _WIN32
+        if (data == nullptr) return;
+        GuestAllocations::Mutation().Remove(data);
+        GuestArena::GuestArenaReset_nid_postfix(data, IndexBytes);
+        GuestArena::GuestArenaRelease_nid_postfix(data, IndexBytes);
+#endif
+    }
+    std::uint16_t* data = nullptr;
+};
 // The ring as guest memory, so its buffer descriptors are guest buffers.
 struct RingBlock {
     RingBlock() { GuestAllocations::Mutation().Add(Ring.data(), RingBytes, true, true, true); }
@@ -213,7 +236,7 @@ struct PixelStage {
 };
 
 // The state of DrawCacheReuse's draws, then one draw per stage.userWords words of pixelWords.
-std::vector<std::uint32_t> Draws(PixelStage stage, const std::vector<std::uint32_t>& pixelWords) {
+std::vector<std::uint32_t> Draws(PixelStage stage, const std::vector<std::uint32_t>& pixelWords, std::uintptr_t indices = 0) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorTarget);
     const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
     const auto pixel = reinterpret_cast<std::uintptr_t>(stage.code);
@@ -250,9 +273,11 @@ std::vector<std::uint32_t> Draws(PixelStage stage, const std::vector<std::uint32
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
+    if (indices != 0) Append(commands, 0x2a, {0});
     for (std::size_t first = 0; first + stage.userWords <= pixelWords.size(); first += stage.userWords) {
         for (std::uint32_t word = 0; word < stage.userWords; ++word) Append(commands, 0x76, {0x00c + word, pixelWords[first + word]});
-        Append(commands, 0x2d, {3, 2});
+        if (indices != 0) Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), 3, 0});
+        else Append(commands, 0x2d, {3, 2});
     }
     return commands;
 }
@@ -351,10 +376,6 @@ void CheckEpochGate() {
     }
 }
 
-// The resident target memo (`--target-memo`, under the draw pipeline): a stream of hits into the
-// resident target looks the target up on its first draws and answers the others from the memo,
-// and a CPU write to the target before the next submission makes its first draw look it up again.
-// APS5_NO_TARGET_MEMO=1 answers none from the memo.
 void CheckTargetMemo() {
     Require(ColorTarget != ColorMemory.data(), "the target memo check needs the resident target of a write-watched arena block");
     constexpr std::size_t draws = 64;
@@ -366,6 +387,23 @@ void CheckTargetMemo() {
         const auto hits = AgcDriver::Graphics::ResidentTargetMemoHits() - before;
         if (!memo) Require(hits == 0, "a stream of " + std::to_string(draws) + " draws answered " + std::to_string(hits) + " target lookups from the memo with the memo off");
         else Require(hits + 4u >= draws && hits < draws, "a stream of " + std::to_string(draws) + " draws after a CPU write to the target answered " + std::to_string(hits) + " target lookups from the memo");
+    }
+}
+
+void CheckDrawInputMemo(std::uint16_t* indices) {
+    Require(indices != nullptr, "the draw input memo check needs the indices in a guest arena block");
+    constexpr std::size_t draws = 64;
+    const bool memo = std::getenv("APS5_NO_DRAW_INPUT_MEMO") == nullptr;
+    const std::vector<std::uint32_t> words(draws, std::bit_cast<std::uint32_t>(1.0f));
+    const auto commands = Draws({PixelCode.data(), 1}, words, reinterpret_cast<std::uintptr_t>(indices));
+    static_cast<void>(Submit(commands));
+    for (const std::uint16_t value : {std::uint16_t{0x10}, std::uint16_t{0x20}}) {
+        indices[IndexBytes / 2u - 1u] = value;
+        const auto before = AgcDriver::Graphics::DrawInputMemoHits();
+        static_cast<void>(Submit(commands));
+        const auto hits = AgcDriver::Graphics::DrawInputMemoHits() - before;
+        if (!memo) Require(hits == 0, "a stream of " + std::to_string(draws) + " indexed draws answered " + std::to_string(hits) + " snapshot lookups from the memo with the memo off");
+        else Require(hits + 4u >= draws && hits < draws, "a stream of " + std::to_string(draws) + " indexed draws after a CPU write to the indices answered " + std::to_string(hits) + " snapshot lookups from the memo");
     }
 }
 
@@ -413,7 +451,11 @@ int main(int argc, char** argv) {
         Register(RingPixelHeader, RingPixelCode.data(), sizeof(RingPixelCode), 1);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         Register(TexturePixelHeader, TexturePixelCode.data(), sizeof(TexturePixelCode), 1);
-        if (argc >= 2 && std::string_view(argv[1]) == "--target-memo") {
+        if (argc >= 2 && std::string_view(argv[1]) == "--draw-input-memo") {
+            const IndexBlock indices;
+            CheckDrawInputMemo(indices.data);
+            std::cout << "the draw input memo answered the repeated lookups\n";
+        } else if (argc >= 2 && std::string_view(argv[1]) == "--target-memo") {
             static_cast<void>(Submit(Stream(Kind::Hits, 64, 0)));
             CheckTargetMemo();
             std::cout << "the resident target memo answered the repeated lookups\n";

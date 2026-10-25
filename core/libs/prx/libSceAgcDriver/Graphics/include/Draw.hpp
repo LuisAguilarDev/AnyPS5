@@ -175,8 +175,8 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
 bool CommitTrims();
-// Resident color target lookups answered by the previous draw's memo since the start.
 std::uint64_t ResidentTargetMemoHits();
+std::uint64_t DrawInputMemoHits();
 
 }
 

@@ -421,6 +421,29 @@ void DifferingInlineBaseCandidatesStayUnpatched(const Modes& modes) {
     else Require(after.candidates.patchedDiffering > before.candidates.patchedDiffering, "late patching off: the differing candidate was not patched before its validation: " + CandidateCounts(after.candidates));
 }
 
+void AlwaysCaptureRendersEveryDraw() {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ArithmeticPixelHeader, ArithmeticPixelCode.data(), sizeof(ArithmeticPixelCode), 1);
+    PixelConstant[0] = 0.25f;
+    auto* table = reinterpret_cast<std::uint32_t*>(PixelConstant.data());
+    const auto draw = [&](float word, bool setup) {
+        auto commands = setup ? Setup(true) : std::vector<std::uint32_t>{};
+        PixelUserData(commands, table, std::bit_cast<std::uint32_t>(word));
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto first = draw(0.25f, true);
+    const auto repeated = draw(0.25f, false);
+    const auto changed = draw(0.5f, false);
+    const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(withinTwo(first, 128) && withinTwo(repeated, 128), "always capture: the repeated draw adding user word 2 (0.25) to a loaded 0.25 wrote " + std::to_string(first) + " and " + std::to_string(repeated) + ", expected 128");
+    Require(withinTwo(changed, 191), "always capture: the draw whose user word 2 changed to 0.5 wrote " + std::to_string(changed) + ", expected 191");
+    Require(after.hits == before.hits && after.dataHits == before.dataHits && after.inserts == before.inserts && after.lookups - before.lookups == after.absent - before.absent, "always capture: a draw found, reused or inserted draw cache stages (its register-key lookups must all miss): " + Counts(after));
+}
+
 int main() {    try {
         bool libraries = false;
         {
@@ -429,6 +452,12 @@ int main() {    try {
             libraries = device->GraphicsPipelineLibraries();
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+        if (std::getenv("APS5_DRAW_ALWAYS_CAPTURE") != nullptr) {
+            AlwaysCaptureRendersEveryDraw();
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "Always capture rendered every draw without draw cache stages\n";
+            return 0;
+        }
         Modes modes;
         modes.verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr || std::getenv("APS5_VERIFY_DRAW_REBASE") != nullptr;
         modes.rebase = std::getenv("APS5_NO_DRAW_REBASE") == nullptr;

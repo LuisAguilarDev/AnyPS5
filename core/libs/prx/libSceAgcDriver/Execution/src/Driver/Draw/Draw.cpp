@@ -669,7 +669,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     stageData.resize(programs.size());
     auto& drawHit = tail.drawHit;
     auto& verifyHit = tail.verifyHit;
-    tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
+    tail.stageEntries = useDrawEntries && !alwaysCaptureStages() && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
     static const bool prepPool = DrawPrepPool::Threads() != 0;
     static const bool poolDataHits = std::getenv("APS5_POOL_DATA_HITS") != nullptr;

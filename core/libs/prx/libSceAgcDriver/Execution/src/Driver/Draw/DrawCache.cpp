@@ -31,6 +31,11 @@ bool Driver::drawDataHits() {
     return hits;
 }
 
+bool Driver::alwaysCaptureStages() {
+    static const bool always = std::getenv("APS5_DRAW_ALWAYS_CAPTURE") != nullptr;
+    return always;
+}
+
 bool Driver::drawStageDataHits() {
     static const bool hits = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr && !stampValidate();
     return hits;

@@ -171,6 +171,7 @@ private:
     static bool drawDataHits();
     static bool verifyDrawDataHits();
     static bool drawStageDataHits();
+    static bool alwaysCaptureStages();
     static bool verifyDrawEntries();
     static bool registerKeyEnabled();
     static bool verifyDrawRecipe();

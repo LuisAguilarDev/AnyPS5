@@ -74,6 +74,9 @@ public:
     // The most work items any thread had queued at once since start-up (the flood test's cap check).
     std::size_t MaxQueued() const { return maxQueued.load(std::memory_order_relaxed); }
     static constexpr std::size_t QueueDepth = 256;
+    // A sleeping recorder thread is woken once this many draws wait for it, or at its chunk's seal,
+    // not for every draw: the wake is a system call on the spine (APS5_NO_BATCHED_RECORD_HANDOFF=1
+    // wakes it for every item, as before).
     static constexpr std::size_t HandoffDraws = 8;
     // Wakes of the recorder threads since the start (test aid).
     static std::uint64_t Wakes();
@@ -92,6 +95,8 @@ private:
         std::condition_variable room;
         std::deque<Item> items;
         bool stopping = false;
+        // Whether the thread waits for items (under `mutex`).
+        bool sleeping = false;
         VkCommandPool pool = VK_NULL_HANDLE;
         std::unique_ptr<RecordingContext> recording;
         // Command buffers of completed batches, returned by RecordedChunk::recycle (any thread).

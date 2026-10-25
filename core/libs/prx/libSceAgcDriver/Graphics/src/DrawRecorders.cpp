@@ -19,6 +19,11 @@ std::atomic<std::uint64_t> failAtDraw{0};
 std::atomic<std::uint64_t> recordedDraws{0};
 std::atomic<std::uint64_t> wakes{0};
 
+bool BatchedHandoff() {
+    static const bool batched = std::getenv("APS5_NO_BATCHED_RECORD_HANDOFF") == nullptr;
+    return batched;
+}
+
 std::int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -82,11 +87,18 @@ void DrawRecorders::push(Worker& worker, Item item) {
     // Bounded: the spine waits for room (the recorder thread never takes the GPU mutex, so it
     // always makes progress while the spine holds it).
     worker.room.wait(lock, [&] { return worker.items.size() < QueueDepth; });
+    const bool seal = item.seal;
     worker.items.push_back(std::move(item));
     const auto queued = worker.items.size();
+    // A thread still recording takes the item without a wake; a sleeping one is woken once a few
+    // draws, or the seal every wait for a chunk follows, are queued.
+    const bool wake = !BatchedHandoff() || (worker.sleeping && (seal || queued >= HandoffDraws));
+    if (wake) worker.sleeping = false;
     lock.unlock();
-    wakes.fetch_add(1, std::memory_order_relaxed);
-    worker.wake.notify_one();
+    if (wake) {
+        wakes.fetch_add(1, std::memory_order_relaxed);
+        worker.wake.notify_one();
+    }
     auto seen = maxQueued.load(std::memory_order_relaxed);
     while (queued > seen && !maxQueued.compare_exchange_weak(seen, queued, std::memory_order_relaxed)) {
     }
@@ -212,7 +224,16 @@ void DrawRecorders::run(Worker& worker) {
         {
             std::unique_lock lock(worker.mutex);
             const auto idleStart = profiled ? nowNs() : 0;
-            worker.wake.wait(lock, [&] { return worker.stopping || !worker.items.empty(); });
+            if (BatchedHandoff()) {
+                // Queued items short of a wake are taken without one; the thread sleeps only on an
+                // empty queue, until a push wakes it (sleeping cleared under the mutex).
+                if (worker.items.empty() && !worker.stopping) {
+                    worker.sleeping = true;
+                    worker.wake.wait(lock, [&] { return worker.stopping || !worker.sleeping; });
+                }
+            } else {
+                worker.wake.wait(lock, [&] { return worker.stopping || !worker.items.empty(); });
+            }
             if (profiled) worker.idleNs.fetch_add(static_cast<std::uint64_t>(nowNs() - idleStart), std::memory_order_relaxed);
             if (worker.items.empty()) return;
             item = std::move(worker.items.front());

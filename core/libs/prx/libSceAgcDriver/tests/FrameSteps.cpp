@@ -81,6 +81,77 @@ void CheckExecutedCount() {
     Require(totals.packetPackets == 3, "queue 0 packets were not counted for the packet thread");
 }
 
+std::int64_t FakeNowNs = 0;
+
+std::int64_t FakeClock() {
+    return FakeNowNs;
+}
+
+void CheckPacketSteps() {
+    FrameSteps::Counters counters;
+    FakeNowNs = 1000;
+    {
+        FrameSteps::PacketStep step(counters, 0x76, false, FakeClock);
+        FakeNowNs += 100;
+        step.Mark(FrameSteps::PhaseFlush);
+        FakeNowNs += 300;
+        step.Mark(FrameSteps::PhaseBody);
+        FakeNowNs += 600;
+    }
+    {
+        FrameSteps::PacketStep step(counters, 0x2d, true, FakeClock);
+        FakeNowNs += 50;
+        step.Mark(FrameSteps::PhasePrepare);
+        FakeNowNs += 2000;
+    }
+    {
+        FrameSteps::PacketStep idle(counters, 0x10, false, nullptr);
+        FakeNowNs += 5000;
+        idle.Mark(FrameSteps::PhaseBody);
+    }
+    const auto totals = counters.Take();
+    Require(totals.slotPackets[0x76] == 1 && totals.slotNs[0x76] == 1000, "a SET_SH_REG step did not count its packet and time");
+    Require(totals.slotPackets[0x2d] == 1 && totals.slotNs[0x2d] == 2050, "a draw step did not count its packet and time");
+    Require(totals.slotPackets[0x10] == 0 && totals.slotNs[0x10] == 0, "a step without a clock counted");
+    Require(totals.otherPhaseNs[FrameSteps::PhaseGate] == 100 && totals.otherPhaseNs[FrameSteps::PhaseFlush] == 300 && totals.otherPhaseNs[FrameSteps::PhaseBody] == 600, "the phases of a non-draw packet are not the time between its marks");
+    Require(totals.drawPhaseNs[FrameSteps::PhaseGate] == 50 && totals.drawPhaseNs[FrameSteps::PhasePrepare] == 2000, "the phases of a draw are not the time between its marks");
+    Require(totals.phasePackets[0] == 1 && totals.phasePackets[1] == 1, "the draw and non-draw steps were not counted apart");
+    Require(counters.Take().slotPackets[0x76] == 0, "taking the counters did not reset the packet slots");
+}
+
+void CheckPacketFormatting() {
+    FrameSteps::Totals totals;
+    totals.packetBusyNs = static_cast<std::uint64_t>(30 * Ms);
+    totals.executeNs = static_cast<std::uint64_t>(26 * Ms);
+    totals.slotPackets[0x76] = 8000;
+    totals.slotNs[0x76] = static_cast<std::uint64_t>(8 * Ms);
+    totals.slotPackets[0x2d] = 1000;
+    totals.slotNs[0x2d] = static_cast<std::uint64_t>(12 * Ms);
+    totals.slotPackets[FrameSteps::FlipSlot] = 2;
+    totals.slotNs[FrameSteps::FlipSlot] = static_cast<std::uint64_t>(2 * Ms);
+    totals.phasePackets[0] = 9002;
+    totals.phasePackets[1] = 1000;
+    totals.otherPhaseNs[FrameSteps::PhaseFlush] = static_cast<std::uint64_t>(9 * Ms);
+    totals.drawPhaseNs[FrameSteps::PhaseBody] = static_cast<std::uint64_t>(10 * Ms);
+    FrameSteps::Window window;
+    window.seconds = 10.0;
+    window.frames = 2;
+    const auto line = FrameSteps::FormatPackets(totals, window, [](std::size_t slot) { return slot == 0x76 ? std::string("SET_SH_REG") : std::string(); });
+    Contains(line, "[frame-steps-packets] ");
+    Contains(line, "loop_packets/f=4501 ");
+    Contains(line, "loop_ms/f=11.00 ");
+    Contains(line, "us/loop_packet=2.44 ");
+    Contains(line, "execute_outside_loop_ms/f=2.00 ");
+    Contains(line, "busy_outside_execute_ms/f=2.00 ");
+    Contains(line, "other_us/packet(gate/drain/lock/flush/prepare/body)=0.00/0.00/0.00/1.00/0.00/0.00 ");
+    Contains(line, "draw_us/packet(gate/drain/lock/flush/prepare/body)=0.00/0.00/0.00/0.00/0.00/10.00 ");
+    Contains(line, "top=0x2d:500/f:12.00us:6.00ms/f,SET_SH_REG:4000/f:1.00us:4.00ms/f,FLIP:1/f:1000.00us:1.00ms/f");
+    Require(line.back() == '\n', "the packets line does not end the line");
+    const auto quiet = FrameSteps::FormatPackets(FrameSteps::Totals{}, FrameSteps::Window{}, nullptr);
+    Contains(quiet, "loop_packets/f=0 ");
+    Contains(quiet, "top=-");
+}
+
 void CheckPresentPairing() {
     FrameSteps::Frames frames;
     frames.Submit(0, 1 * Ms, false);
@@ -178,6 +249,8 @@ int main() {
         CheckSampleWindow();
         CheckCountersReset();
         CheckExecutedCount();
+        CheckPacketSteps();
+        CheckPacketFormatting();
         CheckPresentPairing();
         CheckFormatting();
         std::cout << "frame steps tests passed\n";

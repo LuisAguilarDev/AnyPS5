@@ -48,6 +48,7 @@ public:
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    static std::uint64_t EnqueuedOfKind(CommitKind kind);
     bool Busy() const;
     bool BusyOrPreparing() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
@@ -112,6 +113,7 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindEnqueued{};
     std::array<std::uint64_t, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::uint64_t, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
     // The committer's destruction of finished commits' closures (a draw's captured decode,

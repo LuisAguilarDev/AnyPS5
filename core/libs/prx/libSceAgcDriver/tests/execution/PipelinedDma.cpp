@@ -74,10 +74,8 @@ void ExpectNoDrain(std::uint32_t opcode, std::uint64_t before, const char* what)
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
-    _putenv_s("APS5_PIPELINE_DMA", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
-    setenv("APS5_PIPELINE_DMA", "1", 1);
 #endif
     try {
         alignas(256) static std::array<std::uint32_t, 1024> first{};
@@ -100,6 +98,13 @@ int main() {
         AgcDriverWaitIdle_nid_postfix();
         for (const auto word : first) check(word == 0x5eed1234u, "the immediate fill did not land");
         for (std::size_t i = 0; i < second.size(); ++i) check(second[i] == (i < 128 ? 0x5eed1234u : 0u), "the copy did not see the fill before it, or wrote past its bytes");
+        if (std::getenv("APS5_NO_PIPELINE_DMA") != nullptr) {
+            check(DrawPipeline::EnqueuedOfKind(DrawPipeline::CommitKind::Dma) == 0, "APS5_NO_PIPELINE_DMA still queued a DMA_DATA packet");
+            LibcRunShutdown_nid_postfix();
+            std::puts("inline DMA tests passed");
+            return 0;
+        }
+        check(DrawPipeline::EnqueuedOfKind(DrawPipeline::CommitKind::Dma) == 2, "the DMA_DATA packets were not queued by default");
         const auto stores = storesOnCpu.load() + storesOnGpu.load() + storesBehindCompletions.load() - cpuBefore;
         check(stores == 2, "the DMA_DATA packets were not committed (" + std::to_string(stores) + " committed stores)");
         check(storesDrained.load() == drainedBefore, "a DMA_DATA packet still drained");

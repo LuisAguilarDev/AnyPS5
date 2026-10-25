@@ -37,10 +37,8 @@ void Submit(std::vector<std::uint32_t>& words) {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
-    _putenv_s("APS5_PIPELINE_DMA", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
-    setenv("APS5_PIPELINE_DMA", "1", 1);
 #endif
     try {
         alignas(256) static std::array<std::uint32_t, 1024> source{};

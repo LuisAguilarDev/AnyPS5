@@ -50,7 +50,7 @@ bool commutesWithPreparedDraws(std::span<const std::uint32_t> packet, std::uint3
 }
 
 bool pipelineDma() {
-    static const bool enabled = std::getenv("APS5_PIPELINE_DMA") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_DMA") == nullptr;
     return enabled;
 }
 

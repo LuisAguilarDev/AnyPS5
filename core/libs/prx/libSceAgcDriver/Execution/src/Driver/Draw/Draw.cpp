@@ -288,11 +288,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     static const bool prepPool = DrawPrepPool::Threads() != 0;
     static const bool poolDataHits = std::getenv("APS5_POOL_DATA_HITS") != nullptr;
+    static const bool poolDataHitsV2 = std::getenv("APS5_NO_POOL_DATA_HITS_V2") == nullptr;
     const bool poolEligible = prepPool && pipelined && !drawParameters.indirect && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !lockedPrepare && !verifyDrawDataHits() && !verifyDrawRecipe() && !traceCapSync();
     // A draw the pool will take whatever the lookup finds leaves the lookup, its hit validation and
-    // what follows from them to the job (APS5_NO_POOL_LOOKUP=1 keeps them here). Without a data entry
-    // the lookup cannot produce data candidates, the only lookup outcome that keeps a draw off the pool.
-    const bool poolLookup = poolEligible && dataEntry == nullptr && DrawPrepPool::Lookup();
+    // what follows from them to the job (APS5_NO_POOL_LOOKUP=1 keeps them here).
+    const bool poolLookup = poolEligible && (dataEntry == nullptr || (poolDataHitsV2 && !verifyDataCandidates())) && DrawPrepPool::Lookup();
     if (!poolLookup) lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
     for (auto& variant : matched) {
         if (variant != nullptr) applyShaderDataPatches(*variant);
@@ -340,11 +340,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (prepPool && pipelined) {
         static std::array<std::atomic<std::uint64_t>, 8> poolMiss{};
         static std::atomic<std::uint64_t> poolSeen{0};
-        const int reason = drawParameters.indirect ? 1 : !deferredLabels().labels.empty() ? 2 : (dumpTarget != 0 || dumpSlot1 != 0) ? 3 : lockedPrepare ? 4 : dataEntry != nullptr ? 5 : !std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); }) ? 6 : (verifyDrawDataHits() || verifyDrawRecipe() || traceCapSync()) ? 7 : 0;
+        const int reason = drawParameters.indirect ? 1 : !deferredLabels().labels.empty() ? 2 : (dumpTarget != 0 || dumpSlot1 != 0) ? 3 : lockedPrepare ? 4 : dataEntry != nullptr && !poolLookup ? 5 : !std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); }) ? 6 : (verifyDrawDataHits() || verifyDrawRecipe() || traceCapSync()) ? 7 : 0;
         poolMiss[reason].fetch_add(1, std::memory_order_relaxed);
         if (poolSeen.fetch_add(1, std::memory_order_relaxed) % 100000 == 99999) std::fprintf(stderr, "[prep-pool-gate] eligible %llu, indirect %llu, labels %llu, dump %llu, locked %llu, data entry %llu, candidates %llu, verify %llu\n", static_cast<unsigned long long>(poolMiss[0].load()), static_cast<unsigned long long>(poolMiss[1].load()), static_cast<unsigned long long>(poolMiss[2].load()), static_cast<unsigned long long>(poolMiss[3].load()), static_cast<unsigned long long>(poolMiss[4].load()), static_cast<unsigned long long>(poolMiss[5].load()), static_cast<unsigned long long>(poolMiss[6].load()), static_cast<unsigned long long>(poolMiss[7].load()));
     }
-    if (poolEligible && (dataEntry == nullptr || poolDataHits) && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); })) {
+    if (poolEligible && (dataEntry == nullptr || poolDataHits || poolLookup) && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); })) {
         struct Pooled {
             std::shared_ptr<VulkanDevice> localDevice;
             std::shared_ptr<const DrawDecode> decode;
@@ -379,6 +379,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::vector<DrawUserPatch> userPatches;
             std::uint64_t drawIdentity;
             std::uint32_t vsOutControl;
+            DrawDataCandidates candidates;
         };
         std::optional<std::vector<DrawPrepPool::Range>> writeBound;
         if (drawHit && DrawPrepPool::WriteBounds()) {
@@ -390,7 +391,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto ranges = drawWriteRanges(graphics, boundStages);
             writeBound.emplace(ranges.begin(), ranges.end());
         }
-        auto pooledDraw = std::make_shared<Pooled>(Pooled{std::move(localDevice), std::move(decode), pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, std::move(stageData), patchedStages, std::move(dataEntry), poolLookup, stageEntries, std::move(entry), relocatedDecode, poolLookup ? std::move(userPatches) : std::vector<DrawUserPatch>{}, drawIdentity, vsOutControl});
+        auto pooledDraw = std::make_shared<Pooled>(Pooled{std::move(localDevice), std::move(decode), pixel, std::move(programs), drawParameters, std::move(vertexInfos), std::move(decodeReads), std::move(memory), std::move(linked), std::move(matched), std::move(matchedRegions), entry, drawHit, verifyHit, useDrawEntries, registerKey, drawKey, shapeKey, DrawPipeline::EpochToken().load(std::memory_order_relaxed), submission.queue, (packet[0] >> 8u) & 0xffu, std::move(stageData), patchedStages, std::move(dataEntry), poolLookup, stageEntries, std::move(entry), relocatedDecode, poolLookup ? std::move(userPatches) : std::vector<DrawUserPatch>{}, drawIdentity, vsOutControl, DrawDataCandidates{}});
         const Submission* pooledSubmission = &submission;
         DrawPrepPool::Get().Submit([this, pooledDraw, pooledSubmission](std::uint64_t seq) {
             auto& pool = DrawPrepPool::Get();
@@ -440,11 +441,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     P.vertexInfos.assign(count, std::nullopt);
                     P.decodeReads.assign(count, {});
                 }
-                DrawDataCandidates candidates(count);
+                P.candidates.assign(count, {});
                 std::array<double, DrawDriverPhaseCount> lookupMs{};
                 auto lookupLap = start;
                 DrawPhaseTiming lookupTiming{profile, lookupMs, lookupLap};
-                lookupDraw(*pooledSubmission, P.localDevice, graphics, P.pixel, P.programs, roles, P.vertexInfos, P.lookupEntries, P.registerKey, profile, P.drawKey, P.entry, P.matched, P.matchedRegions, P.drawHit, P.verifyHit, lookupTiming, lookupMs, P.dataEntry, candidates, P.stageData);
+                lookupDraw(*pooledSubmission, P.localDevice, graphics, P.pixel, P.programs, roles, P.vertexInfos, P.lookupEntries, P.registerKey, profile, P.drawKey, P.entry, P.matched, P.matchedRegions, P.drawHit, P.verifyHit, lookupTiming, lookupMs, P.dataEntry, P.candidates, P.stageData);
                 for (auto& variant : P.matched) {
                     if (variant != nullptr) applyShaderDataPatches(*variant);
                 }
@@ -460,10 +461,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                             if (P.matched[i]->vertexInfo != nullptr) P.vertexInfos[i] = *P.matched[i]->vertexInfo;
                             continue;
                         }
+                        if (!P.candidates[i].empty()) {
+                            if (const auto& info = P.candidates[i].front().first->vertexInfo; info != nullptr) P.vertexInfos[i] = *info;
+                            continue;
+                        }
                         decodeDrawVertexInfo(P.programs[i], roles[i], P.vsOutControl, graphics, P.vertexInfos[i], P.decodeReads[i]);
                     }
                 }
                 pool.NoteLookup(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+            };
+            const auto reusableCandidate = [&](std::size_t i, std::uint32_t pushOffset) -> const std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>* {
+                if (P.drawHit || i >= P.candidates.size()) return nullptr;
+                const auto found = std::find_if(P.candidates[i].begin(), P.candidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushOffset; });
+                return found == P.candidates[i].end() ? nullptr : &*found;
             };
             const auto attempt = [&](Work& w) {
                 if (P.poolLookup) lookup();
@@ -491,10 +501,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     if (roles[i] == Role::GeometryBack) continue;
                     const auto& program = P.programs[i];
                     pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, P.localDevice->GraphicsPipelineLibraries());
+                    const auto* candidate = reusableCandidate(i, pushCursorBytes);
                     if (P.drawHit) {
                         w.programResults[i] = P.stageData[i].compiled != nullptr ? P.stageData[i].compiled.get() : w.matched[i]->compiled.get();
                         w.memory.insert(w.memory.end(), w.matchedRegions[i].begin(), w.matchedRegions[i].end());
+                    } else if (candidate != nullptr) {
+                        w.matched[i] = candidate->first;
+                        w.matchedRegions[i] = candidate->second;
+                        w.reused[i] = true;
+                        w.programResults[i] = P.stageData[i].compiled != nullptr ? P.stageData[i].compiled.get() : w.matched[i]->compiled.get();
+                        w.memory.insert(w.memory.end(), w.matchedRegions[i].begin(), w.matchedRegions[i].end());
                     } else {
+                        if (i < P.candidates.size() && !P.candidates[i].empty()) decodeDrawVertexInfo(P.programs[i], roles[i], P.vsOutControl, graphics, P.vertexInfos[i], P.decodeReads[i]);
                         if (program.binary.stage == Stage::Fragment) {
                             for (auto previous = i; previous-- > 0;) {
                                 if (w.programResults[previous] == nullptr) continue;
@@ -576,6 +594,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 return;
             }
             auto& w = *work;
+            if (P.poolLookup && P.dataEntry != nullptr && !P.drawHit) {
+                std::uint64_t stagesReused = 0, stagesCompiled = 0;
+                for (std::size_t i = 0; i < P.programs.size(); ++i) {
+                    if (roles[i] != Role::GeometryBack) ++(w.reused[i] ? stagesReused : stagesCompiled);
+                }
+                std::lock_guard cacheLock(drawCacheMutex);
+                drawEntryCounters.dataStagesReused += stagesReused;
+                drawEntryCounters.dataStagesCompiled += stagesCompiled;
+                if (stagesReused != 0 && stagesCompiled == 0) ++drawEntryCounters.dataDrawsReused;
+            }
             std::optional<Graphics::IndirectDrawPath> noIndirect;
             cacheDrawStages(P.useDrawEntries, P.drawHit, w.drawParameters, noIndirect, P.programs, w.stageCaptures, P.vertexInfos, P.decodeReads, P.verifyHit, w.matched, w.fresh, P.drawKey, P.registerKey, P.decode, quiet, w.reused, P.entry, P.shapeKey);
             for (const auto& stageReads : P.decodeReads) {

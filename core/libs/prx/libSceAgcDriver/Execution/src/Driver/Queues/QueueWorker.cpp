@@ -72,22 +72,32 @@ void Driver::deferCompletion(const Submission& submission) {
         queue0Uncommitted.push_back(received);
     }
     completionDeferred() = true;
-    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Completion, [this, serial = submission.serial, received, labelWrites = submission.labelWrites] {
-        completeSubmission(serial, received, labelWrites);
+    DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Completion, [this, serial = submission.serial, received, labelWrites = submission.labelWrites, progress = submission.progress] {
+        completeSubmission(serial, received, labelWrites, progress);
     }, {});
 }
 
-void Driver::submitOpenWork() {
-    if (deferredLabels().labels.empty() && !Graphics::Recorder::PendingLabelSince().has_value() && Graphics::Recorder::RecordedWorkSinceSubmit() == 0) return;
+void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {
+    const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    if (!work && !progress) return;
     ++submissionCosts(0).endSubmits;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
-    recordDeferredLabels(localDevice.get(), 0);
-    if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+    if (work) {
+        recordDeferredLabels(localDevice.get(), 0);
+        if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+    }
+    if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);
 }
 
-void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites) {
+void Driver::wakeQueueZeroForCompletions() {
+    if (!completionsPending()) return;
+    std::lock_guard lock(mutex);
+    changed.notify_all();
+}
+
+void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites, const std::shared_ptr<SubmissionProgress>& progress) {
     struct Complete {
         Driver& driver;
         std::uint64_t serial, received;
@@ -100,12 +110,12 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
                 driver.forgetUnfinishedWrites(driver.workers.at(0), labelWrites);
                 const auto found = std::find(driver.queue0Uncommitted.begin(), driver.queue0Uncommitted.end(), received);
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
-                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0;
+                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || completionsPending();
             }
             if (notify) driver.changed.notify_all();
         }
     } complete{*this, serial, received, labelWrites};
-    submitOpenWork();
+    submitOpenWork(progress);
 }
 
 const std::atomic<std::uint64_t>*& Driver::workerQueued() {
@@ -230,9 +240,9 @@ void Driver::run(std::uint32_t id) noexcept {
                             && ((!storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
-                        changed.wait(lock, [&] { return ready() || (id == 0 && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait); });
+                        changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
-                        if (id == 0 && !ready() && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait) continue;
+                        if (id == 0 && !ready() && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())) continue;
                         break;
                     }
                     if (poll(ready)) break;
@@ -272,6 +282,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             execute(submission);
+            if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             PerformanceContext completionContext(id == 0 ? frameTiming() : FrameTiming::Async());

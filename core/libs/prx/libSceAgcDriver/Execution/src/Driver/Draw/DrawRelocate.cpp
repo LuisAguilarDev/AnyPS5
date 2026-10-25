@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -196,7 +197,7 @@ std::vector<std::pair<std::uint64_t, std::int32_t>> Driver::vertexFetchReads(con
     return reads;
 }
 
-void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::pair<std::uint64_t, std::int32_t>> fetchReads) {
+void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied, std::span<const std::pair<std::uint64_t, std::int32_t>> fetchReads) {
     std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::uint64_t rebase = drawRebaseEnabled() && hiddenWords == 0 ? use.asBase & ~use.asValue : 0;
@@ -233,12 +234,14 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
     };
     variant.relocatableWords = relocatable;
     variant.rebaseWords = rebase;
-    for (const auto& region : regions) {
+    for (std::size_t index = 0; index < regions.size(); ++index) {
+        const auto& region = regions[index];
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         const auto offset = variant.words.size();
         variant.words.resize(offset + count);
         std::memcpy(variant.words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
         if ((relocatable | rebase) == 0) {
+            AppendSharedWords(variant.shared, variant.runs.size(), offset, region.bytes, supplied);
             variant.runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
             continue;
         }
@@ -247,6 +250,7 @@ void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderReco
         for (std::size_t word = 1; word <= count; ++word) {
             const auto next = word < count ? origin(region.guestAddress + word * sizeof(std::uint32_t)) : std::int8_t {-2};
             if (next == current) continue;
+            AppendSharedWords(variant.shared, variant.runs.size(), offset + start, region.bytes.subspan(start * sizeof(std::uint32_t), (word - start) * sizeof(std::uint32_t)), supplied);
             variant.runs.emplace_back(region.guestAddress + start * sizeof(std::uint32_t), region.guestAddress + word * sizeof(std::uint32_t));
             variant.runBases.push_back(current);
             start = word;
@@ -319,15 +323,21 @@ void Driver::learnPendingRelocation() {
     }
     if (pending.alias == 0) return;
     if (drawAliases.size() >= MaxAliases) drawRelocationCounters.evicted += dropEveryOther(drawAliases);
-    drawAliases[pending.alias] = inserted->second;
+    drawAliases[pending.alias] = pending.key;
 }
 
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
     const auto found = drawAliases.find(alias);
-    if (found == drawAliases.end() || found->second->decode == nullptr) return;
-    const auto donor = found->second;
+    if (found == drawAliases.end()) return;
+    const auto cached = drawCache.find(found->second);
+    if (cached == drawCache.end()) {
+        drawAliases.erase(found);
+        return;
+    }
+    if (cached->second->decode == nullptr) return;
+    const auto donor = cached->second;
     const auto& programs = donor->decode->programs;
     if (donor->stages.size() != programs.size()) return;
     struct Move {
@@ -367,6 +377,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
+            copy->meshIndexDescriptor = variant->meshIndexDescriptor;
             copy->shader = variant->shader;
             copy->dataPositions = variant->dataPositions;
             copy->dataSlots = variant->dataSlots;

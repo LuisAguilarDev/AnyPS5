@@ -52,6 +52,12 @@ std::array<IrU32, 2> TranslationContext::readF64Bits(const RdnaOperand& operand)
     return bits;
 }
 
+std::array<IrU32, 2> TranslationContext::flushF64Bits(const std::array<IrU32, 2>& bits, std::uint32_t keepBit) {
+    if (!floatMode.has_value() || (floatMode->floatMode & keepBit) != 0u) return bits;
+    const IrU1 tiny(ir.IEqual(ir.BitwiseAnd(bits[1].Value(), ir.Constant(0x7ff00000u)), ir.Constant(0u)));
+    return {IrU32(ir.Select(tiny.Value(), ir.Constant(0u), bits[0].Value())), IrU32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits[1].Value(), ir.Constant(0x80000000u)), bits[1].Value()))};
+}
+
 std::array<IrU32, 2> TranslationContext::extractU64(IrU64 value) {
     return {IrU32(ir.CompositeExtract(value.Value(), 0u)), IrU32(ir.CompositeExtract(value.Value(), 1u))};
 }
@@ -117,7 +123,7 @@ IrF32 TranslationContext::readMixF32(const RdnaOperand& operand) {
     if (!operand.opSelHi) {
         return IrF32(*readOperand(operand, IrType::F32));
     }
-    return readF16LaneAsF32(operand, operand.opSel, false);
+    return flushF16InputValue(readF16LaneAsF32(operand, operand.opSel, false));
 }
 
 IrU32 TranslationContext::readF16LaneBits(const RdnaOperand& operand, bool highLane) {
@@ -184,8 +190,12 @@ IrU32 TranslationContext::flushF16Result(IrU32 bits) {
 
 IrF32 TranslationContext::flushF16InputValue(IrF32 value) {
     if (!floatMode.has_value() || (floatMode->floatMode & 0x40u) != 0u) return value;
+    return flushTinyF16Value(value, 0x38800000u);
+}
+
+IrF32 TranslationContext::flushTinyF16Value(IrF32 value, std::uint32_t threshold) {
     const IrU32 bits(ir.BitCastU32(value.Value()));
-    const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x38800000u)));
+    const IrU1 tiny(ir.ULessThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(threshold)));
     return IrF32(ir.BitCastF32(ir.Select(tiny.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), bits.Value())));
 }
 
@@ -244,10 +254,15 @@ void TranslationContext::writeF16Conversion(const RdnaOperand& operand, IrF32 va
     write16Bits(operand, flushTinyF16Conversion(modified, convertF32ToF16Bits(modified, sources)));
 }
 
-void TranslationContext::writeF16(const RdnaOperand& operand, IrF32 value, std::initializer_list<IrValue*> sources) {
+void TranslationContext::writeF16(const RdnaOperand& operand, IrF32 value, std::initializer_list<IrValue*> sources, IrValue* invalid) {
     const IrF16 half(ir.Emit(IrOpcode::ConvertF16F32, IrType::F16, {&applyF16ResultModifiers(operand, clampF16Overflow(value, sources)).Value()}));
     const IrU16 bits(ir.Emit(IrOpcode::BitCastU16F16, IrType::U16, {&half.Value()}));
-    write16Bits(operand, IrU32(ir.Emit(IrOpcode::ConvertU32U16, IrType::U32, {&bits.Value()})));
+    IrU32 word(ir.Emit(IrOpcode::ConvertU32U16, IrType::U32, {&bits.Value()}));
+    if (invalid != nullptr) {
+        const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(word.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
+        word = IrU32(ir.Select(ir.LogicalAnd(nan.Value(), *invalid), ir.Constant(0xfe00u), word.Value()));
+    }
+    write16Bits(operand, word);
 }
 
 }

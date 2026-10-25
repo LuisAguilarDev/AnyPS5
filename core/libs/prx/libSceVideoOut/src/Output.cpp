@@ -1,3 +1,4 @@
+#include "prx/libSceVideoOut/include/VideoOut.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include <chrono>
 #include <algorithm>
@@ -22,7 +23,7 @@ static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
 
 static VideoOutOutputStatus outputStatus(const auto& cfg) {
     VideoOutOutputStatus status{};
-    status.resolution = (cfg.width >= 3840 || cfg.height >= 2160) ? 2u : 1u;
+    status.resolution = VideoOutDriver::Get().GetDisplayResolution();
     const bool hdr = AgcDriver::CurrentHostHdr().available;
     status.dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
     status.refreshRate = (cfg.outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
@@ -83,6 +84,7 @@ static void validateOpenParam(const void* param) {
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
+    if (busType == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) return VIDEO_OUT_ERROR_INVALID_VALUE;
     Xv2Force1080p::ApplyToRunningTitleOnce();
     validateOpenParam(param);
     if (userId != 255 && userId != 0) {
@@ -340,6 +342,48 @@ int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* se
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
     }
     // Output gamma is accepted but not yet applied to presentation.
+    return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+int APS5_VABI sceVideoOutColorSpaceConversionSettingsSetDefaultSdrToHdrConversion(VideoOutColorSpaceConversionSettings* settings) {
+    if (settings == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+    }
+    std::memset(settings, 0, sizeof(VideoOutColorSpaceConversionSettings));
+    return 0;
+}
+
+int APS5_VABI sceVideoOutColorSpaceConversionSettingsSetSdrToHdrConversion(VideoOutColorSpaceConversionSettings* settings, float lumaScale, uint32_t option) {
+    if (settings == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+    }
+    (void)lumaScale;
+    (void)option;
+    return 0;
+}
+
+int APS5_VABI sceVideoOutAdjustColorSpaceConversion(int handle, const VideoOutColorSpaceConversionSettings* settings) try {
+    if (settings == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
+    }
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    if (cfg == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
+    }
+    return 0;
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+int APS5_VABI sceVideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option) try {
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    if (cfg == nullptr) {
+        throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_HANDLE");
+    }
+    (void)space;
+    (void)option;
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

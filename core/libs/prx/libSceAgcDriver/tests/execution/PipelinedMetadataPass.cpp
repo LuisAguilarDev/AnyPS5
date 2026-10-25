@@ -1,95 +1,118 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
-#include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/Shutdown.hpp"
+#include <algorithm>
+#include <array>
 #include <atomic>
-#include <bit>
 #include <chrono>
+#include <thread>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <future>
-#include <initializer_list>
+#include <cstring>
 #include <iostream>
 #include <mutex>
+#include <span>
+#include <stdexcept>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
-using AgcDriver::Graphics::Require;
-using AgcDriver::DriverDetail::DrawPipeline;
+constexpr std::uint32_t Width = 64;
+constexpr std::uint32_t Height = 4;
+constexpr std::uint32_t Stale = 0x5a5a5a5au;
+constexpr std::uint32_t Clear = 0x11223344u;
 
-constexpr std::uint32_t DrawIndexAuto = 0x2d;
+constexpr std::size_t MemoryBytes = 65536;
 
-void Registers(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::uint32_t first, std::initializer_list<std::uint32_t> values) {
-    words.push_back(0xc0000000u | (static_cast<std::uint32_t>(values.size()) << 16u) | (opcode << 8u));
-    words.push_back(first);
-    words.insert(words.end(), values.begin(), values.end());
+std::byte* allocateMemory() {
+#ifdef _WIN32
+    auto* memory = static_cast<std::byte*>(VirtualAlloc(nullptr, MemoryBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    auto* memory = static_cast<std::byte*>(std::aligned_alloc(MemoryBytes, MemoryBytes));
+#endif
+    if (memory == nullptr) throw std::runtime_error("pipelined metadata pass: cannot allocate the surface memory");
+    std::memset(memory, 0, MemoryBytes);
+    return memory;
 }
 
-std::vector<std::uint32_t> EliminateFastClearWithoutTargets() {
-    std::vector<std::uint32_t> words;
-    constexpr std::uint32_t context = 0x69, userConfig = 0x79;
-    Registers(words, context, 0x202, {0x00cc0020u});
-    Registers(words, context, 0x010, {0, 0});
-    Registers(words, context, 0x2f8, {0});
-    Registers(words, context, 0x080, {0});
-    Registers(words, context, 0x206, {0x43fu});
-    Registers(words, context, 0x10f, {std::bit_cast<std::uint32_t>(64.0f), std::bit_cast<std::uint32_t>(64.0f), std::bit_cast<std::uint32_t>(64.0f), std::bit_cast<std::uint32_t>(64.0f)});
-    Registers(words, context, 0x00c, {0, 0x40004000u});
-    Registers(words, context, 0x081, {0, 0x40004000u});
-    Registers(words, context, 0x090, {0, 0x40004000u});
-    Registers(words, context, 0x292, {0});
-    Registers(words, context, 0x08e, {0});
-    Registers(words, userConfig, 0x24a, {0});
-    words.insert(words.end(), {0xc0002f00u, 1});
-    words.insert(words.end(), {0xc0012d00u, 3, 2});
-    return words;
+std::byte* const Memory = allocateMemory();
+const std::span<std::uint32_t, Width * Height> Surface{reinterpret_cast<std::uint32_t*>(Memory), Width * Height};
+const std::span<std::uint8_t, 4096> Cmask{reinterpret_cast<std::uint8_t*>(Memory + 4096), 4096};
+
+void check(bool condition, const std::string& what) {
+    if (!condition) throw std::runtime_error("pipelined metadata pass: " + what);
 }
 
-struct Blocker {
-    std::atomic<bool> release{false};
-    void Enqueue() {
-        DrawPipeline::Queue0().Enqueue([this] {
-            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }, {});
-    }
-};
-
-void Finish() {
-    auto idle = std::async(std::launch::async, [] { AgcDriverWaitIdle_nid_postfix(); });
-    if (idle.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
-        std::fputs("pipelined metadata pass: the queue worker and the draw pipeline deadlocked\n", stderr);
-        std::fflush(stderr);
-        std::_Exit(1);
-    }
-    idle.get();
+void setContext(std::vector<std::uint32_t>& words, std::uint32_t offset, std::uint32_t value) {
+    words.insert(words.end(), {0xc0016900u, offset, value});
 }
 
-void MetadataPassBehindQueuedWork() {
-    const auto drainsBefore = DrawPipeline::DrainRequestsByOpcode(DrawIndexAuto);
-    Blocker blocker;
-    blocker.Enqueue();
-    auto words = EliminateFastClearWithoutTargets();
+void dmaFill(std::vector<std::uint32_t>& words, std::uint32_t data, const void* destination, std::uint32_t bytes) {
+    const auto address = reinterpret_cast<std::uintptr_t>(destination);
+    words.insert(words.end(), {0xc0055000u, 2u << 29u, data, 0u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), bytes});
+}
+
+void eliminate(std::vector<std::uint32_t>& words) {
+    const auto surface = reinterpret_cast<std::uintptr_t>(Surface.data());
+    const auto cmask = reinterpret_cast<std::uintptr_t>(Cmask.data());
+    words.insert(words.end(), {0xc0017900u, 0x242u, 4u});
+    words.insert(words.end(), {0xc0017600u, 0x008u, 0x100u, 0xc0017600u, 0x009u, 0u});
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+        {0x2d5, 0x2000}, {0x1b6, 0}, {0x1b8, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
+        {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
+        {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0020},
+        {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028u | 0x2000u},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
+        {0x3b8, 0x9000000u | (0x18u << 19u) | 0x4000000u}, {0x1e0, 0},
+        {0xc, 0}, {0xd, 0x40040},
+        {0x81, 0x80000000}, {0x82, 0x40040},
+        {0x90, 0x80000000}, {0x91, 0x40040},
+        {0x94, 0x80000000}, {0x95, 0x40040},
+        {0x318, static_cast<std::uint32_t>(surface >> 8u)}, {0x390, static_cast<std::uint32_t>(surface >> 40u)},
+        {0x31f, static_cast<std::uint32_t>(cmask >> 8u)}, {0x398, static_cast<std::uint32_t>(cmask >> 40u)},
+        {0x323, Clear}, {0x324, 0},
+        {0x0, 0}, {0xb4, 0},
+        {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
+        {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
+        {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
+    };
+    for (const auto& [offset, value] : context) setContext(words, offset, value);
+    words.insert(words.end(), {0xc0002f00u, 1u});
+    words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+}
+
+void submit(std::vector<std::uint32_t>& words) {
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
-    AgcDriver::Submit(&packet, 0);
-    const auto start = std::chrono::steady_clock::now();
-    bool queued = false;
-    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-        if (DrawPipeline::DrainRequestsByOpcode(DrawIndexAuto) != drainsBefore) break;
-        if (DrawPipeline::Queue0().Outstanding() >= 2) {
-            queued = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
+void expectEliminated(const std::string& what) {
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(Surface.data()), Surface.size_bytes(), nullptr, "test");
     }
-    blocker.release = true;
-    Finish();
-    Require(DrawPipeline::DrainRequestsByOpcode(DrawIndexAuto) == drainsBefore, "a CB metadata pass drained the draw pipeline");
-    Require(queued, "the CB metadata pass was not queued behind the pending item");
+    for (std::size_t i = 0; i < Surface.size(); ++i) check(Surface[i] == Clear, what + ": texel " + std::to_string(i) + " holds " + std::to_string(Surface[i]));
+    const auto cmaskBytes = AgcDriver::Graphics::CmaskLayout(Width, Height).Bytes();
+    for (std::size_t i = 0; i < cmaskBytes; ++i) check(Cmask[i] == 0xffu, what + ": the CMASK was not left expanded");
 }
 
 }
@@ -97,21 +120,54 @@ void MetadataPassBehindQueuedWork() {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
+    _putenv_s("APS5_PIPELINE_DMA", "1");
+    _putenv_s("APS5_DRAW_PIPELINE", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
+    setenv("APS5_PIPELINE_DMA", "1", 1);
+    setenv("APS5_DRAW_PIPELINE", "1", 1);
 #endif
     try {
         {
-            const auto device = OpenVulkanTestDevice();
-            if (!device) return VulkanTestSkipped;
+            GuestAllocations::Mutation mutation;
+            mutation.Add(Surface.data(), Surface.size_bytes(), true, true, true);
+            mutation.Add(Cmask.data(), Cmask.size(), true, true, true);
         }
-        MetadataPassBehindQueuedWork();
-        AgcDriverShutdown_nid_postfix();
+        using AgcDriver::DriverDetail::DrawPipeline;
+        std::fill(Surface.begin(), Surface.end(), Stale);
+        std::fill(Cmask.begin(), Cmask.end(), std::uint8_t{0});
+        std::vector<std::uint32_t> first;
+        eliminate(first);
+        submit(first);
+        expectEliminated("the first eliminate");
+        const auto before = DrawPipeline::PipelinedMetadataPasses();
+        std::vector<std::uint32_t> second;
+        std::atomic<bool> release{false};
+        DrawPipeline::Queue0().Enqueue([&release] {
+            while (!release.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }, {});
+        std::thread releaser([&release] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            release.store(true, std::memory_order_release);
+        });
+        dmaFill(second, Stale, Surface.data(), static_cast<std::uint32_t>(Surface.size_bytes()));
+        dmaFill(second, 0, Cmask.data(), static_cast<std::uint32_t>(Cmask.size()));
+        eliminate(second);
+        submit(second);
+        releaser.join();
+        check(DrawPipeline::PipelinedMetadataPasses() == before + 1u, "the second eliminate was not ordered with the commits (" + std::to_string(DrawPipeline::PipelinedMetadataPasses() - before) + " pipelined)");
+        expectEliminated("the eliminate after the queued stores");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(Surface.data());
+            mutation.Remove(Cmask.data());
+        }
+        LibcRunShutdown_nid_postfix();
         std::puts("pipelined metadata pass tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
-        AgcDriverShutdown_nid_postfix();
+        try { LibcRunShutdown_nid_postfix(); } catch (...) {}
         return 1;
     }
 }

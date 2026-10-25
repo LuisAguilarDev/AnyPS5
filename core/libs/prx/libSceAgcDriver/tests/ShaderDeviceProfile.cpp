@@ -169,6 +169,10 @@ void CheckHeaps() {
     const auto sixteenSamplers = allocate(image, 1u, 16u);
     Require(BindingAllocator{}.FindBinding(sixteenSamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 32u, "sixteen logical samplers must fit with both descriptor variants");
     Require(BindingAllocator{}.FindBinding(allocate(image, 1u, 17u).layout, DescriptorBindingKind::Samplers).resources.size() == 34u, "seventeen logical samplers must fit with both descriptor variants");
+    const auto twentySamplers = allocate(image, 1u, 20u);
+    Require(BindingAllocator{}.FindBinding(twentySamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 40u, "twenty logical samplers must fit with both descriptor variants");
+    const auto thirtyTwoSamplers = allocate(image, 1u, 32u);
+    Require(BindingAllocator{}.FindBinding(thirtyTwoSamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 64u, "thirty-two logical samplers must fit with both descriptor variants");
     const auto full = allocate(image, RuntimeAbi::SampledHeapCapacity, RuntimeAbi::SamplerHeapCapacity / 2u);
     Require(single.layout.ShaderDataDwords() == full.layout.ShaderDataDwords() && single.layout.memoryOffsetDword == full.layout.memoryOffsetDword && !full.layout.UsesPushData(), "runtime layout depends on resource count");
     Require(full.layout.memoryOffsetDword == 0u && full.layout.DispatchThreadLimitDword() == 0u && full.layout.ShaderDataDwords() == 0u, "direct image resources allocated runtime metadata");

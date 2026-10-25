@@ -540,6 +540,21 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     return plan;
 }
 
+namespace {
+
+bool SharedBindingMetadata() {
+    static const bool shared = std::getenv("APS5_NO_SHARED_BINDING_METADATA") == nullptr;
+    return shared;
+}
+
+void DetachBindingMetadata(DescriptorBinding& binding) {
+    const auto detach = [](auto&... vectors) { (vectors.Detach(), ...); };
+    detach(binding.samplerDepthCompare, binding.imageWritten, binding.imageDepthCompare, binding.imageAtomic, binding.imageAtomic64, binding.imageShapes, binding.bufferAtomic, binding.bufferWritten,
+           binding.samplerUnnormalized, binding.samplerIntegerBorder, binding.samplerCoordinatesIgnored, binding.imageUnnormalized, binding.imageUnnormalizedBaseLevel, binding.imageSamplers, binding.bufferRead, binding.bufferExtent);
+}
+
+}
+
 DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const {
     DescriptorBindingPlan selected;
     std::set<std::uint32_t> remaining(bindings.begin(), bindings.end());
@@ -553,7 +568,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     const bool hasSamplers = std::any_of(selected.bindings.begin(), selected.bindings.end(), [](const auto& binding) { return binding.descriptor.role == DescriptorRole::GuestSamplers; });
     if (!hasSamplers) {
         for (auto& binding : selected.bindings) {
-            std::fill(binding.descriptor.imageSamplers.begin(), binding.descriptor.imageSamplers.end(), 0u);
+            if (!binding.descriptor.imageSamplers.empty()) binding.descriptor.imageSamplers.assign(binding.descriptor.imageSamplers.size(), 0u);
             binding.tableSamplerMasks.clear();
         }
     }
@@ -578,6 +593,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
     std::size_t readOnlyHere = 0;
     for (const auto& entry : plan.bindings) {
         auto physical = entry.descriptor;
+        if (!SharedBindingMetadata()) DetachBindingMetadata(physical);
         switch (physical.role) {
         case DescriptorRole::GuestBuffers:
             physical.guestDescriptor = GuestBuffersDescriptor(entry.resources, snapshot);

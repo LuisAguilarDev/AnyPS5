@@ -1195,6 +1195,34 @@ void verifyResultMemoMissCauses() {
     require(released.evictedLastReferences - releasedBefore.evictedLastReferences == releases, "result memo misses: evicted results no caller holds were not counted as last references");
 }
 
+void verifySharedBindingMetadata() {
+    using namespace ShaderRecompiler;
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    alignas(16) static std::array<std::uint32_t, 4> other{};
+    alignas(16) static std::array<std::uint32_t, 4> first{};
+    alignas(16) static std::array<std::uint32_t, 4> second{};
+    first = memoTableBuffer(output);
+    second = memoTableBuffer(other);
+    const auto a = materializeMemoTable(first, true);
+    const auto b = materializeMemoTable(second, true);
+    require(a != b, "shared binding metadata: two snapshots returned one memoized result");
+    const auto buffers = [](const RecompileResult& result) -> const DescriptorBinding& {
+        const auto found = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::GuestBuffers; });
+        require(found != result.bindings.end(), "shared binding metadata: the stored buffer has no GuestBuffers binding");
+        return *found;
+    };
+    const auto& left = buffers(*a);
+    const auto& right = buffers(*b);
+    require(left.bufferWritten.size() == 1u && left.bufferWritten[0] && left.bufferWritten == right.bufferWritten, "shared binding metadata: the stored buffer is not marked written in both results");
+    require(left.guestDescriptor != right.guestDescriptor, "shared binding metadata: the two results bound the same V#");
+    const bool shared = std::getenv("APS5_NO_SHARED_BINDING_METADATA") == nullptr;
+    require(left.bufferWritten.SharesStorageWith(right.bufferWritten) == shared && left.bufferExtent.SharesStorageWith(right.bufferExtent) == shared,
+            shared ? "shared binding metadata: two results of one binding plan copied its metadata" : "shared binding metadata: APS5_NO_SHARED_BINDING_METADATA=1 still shared the metadata");
+    SharedVector<bool> copy = left.bufferWritten;
+    copy[0] = false;
+    require(left.bufferWritten[0] && !copy[0] && !copy.SharesStorageWith(left.bufferWritten), "shared binding metadata: a write through a copy changed the shared metadata");
+}
+
 void verifyResultMemoMovedTable() {
     using namespace ShaderRecompiler;
     alignas(16) static std::array<std::uint32_t, 4> output{};
@@ -8559,6 +8587,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-moved-table") {
             verifyResultMemoMovedTable();
             std::cout << "The result memo patches a result over a moved SRT with the same contents\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-binding-metadata") {
+            verifySharedBindingMetadata();
+            std::cout << "Results of one binding plan share its binding metadata until a copy writes it\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-miss-causes") {

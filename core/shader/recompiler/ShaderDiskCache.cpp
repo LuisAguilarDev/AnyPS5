@@ -467,7 +467,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
-    writer.List(binding.imageShapes, [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
+    writer.List(binding.imageShapes.Values(), [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
@@ -475,9 +475,9 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageUnnormalizedBaseLevel);
     writer.Flags(binding.samplerIntegerBorder);
     writer.Flags(binding.samplerCoordinatesIgnored);
-    writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
+    writer.Values(std::span<const std::uint32_t>(binding.imageSamplers.Values()));
     writer.Flags(binding.bufferRead);
-    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
+    writer.Values(std::span<const std::uint32_t>(binding.bufferExtent.Values()));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -491,22 +491,22 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     const bool hasShape = reader.Get<bool>();
     const auto shape = reader.Get<DescriptorImageShape>();
     binding.imageShape = hasShape ? std::optional(shape) : std::nullopt;
-    reader.Flags(binding.samplerDepthCompare);
-    reader.Flags(binding.imageWritten);
-    reader.Flags(binding.imageDepthCompare);
-    reader.Flags(binding.imageAtomic);
-    reader.Flags(binding.imageAtomic64);
-    reader.List(binding.imageShapes, 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
-    reader.Flags(binding.bufferAtomic);
-    reader.Flags(binding.bufferWritten);
-    reader.Flags(binding.samplerUnnormalized);
-    reader.Flags(binding.imageUnnormalized);
-    reader.Flags(binding.imageUnnormalizedBaseLevel);
-    reader.Flags(binding.samplerIntegerBorder);
-    reader.Flags(binding.samplerCoordinatesIgnored);
-    reader.Values(binding.imageSamplers);
-    reader.Flags(binding.bufferRead);
-    reader.Values(binding.bufferExtent);
+    reader.Flags(binding.samplerDepthCompare.Mutable());
+    reader.Flags(binding.imageWritten.Mutable());
+    reader.Flags(binding.imageDepthCompare.Mutable());
+    reader.Flags(binding.imageAtomic.Mutable());
+    reader.Flags(binding.imageAtomic64.Mutable());
+    reader.List(binding.imageShapes.Mutable(), 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
+    reader.Flags(binding.bufferAtomic.Mutable());
+    reader.Flags(binding.bufferWritten.Mutable());
+    reader.Flags(binding.samplerUnnormalized.Mutable());
+    reader.Flags(binding.imageUnnormalized.Mutable());
+    reader.Flags(binding.imageUnnormalizedBaseLevel.Mutable());
+    reader.Flags(binding.samplerIntegerBorder.Mutable());
+    reader.Flags(binding.samplerCoordinatesIgnored.Mutable());
+    reader.Values(binding.imageSamplers.Mutable());
+    reader.Flags(binding.bufferRead.Mutable());
+    reader.Values(binding.bufferExtent.Mutable());
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {

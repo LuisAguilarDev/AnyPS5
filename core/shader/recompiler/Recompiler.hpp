@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "SharedVector.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
@@ -497,31 +498,31 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> guestDescriptor;
     bool readOnly = false;
     std::optional<DescriptorImageShape> imageShape;
-    std::vector<bool> samplerDepthCompare;
+    SharedVector<bool> samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
-    std::vector<bool> imageWritten;
-    std::vector<bool> imageDepthCompare;
-    std::vector<bool> imageAtomic;
-    std::vector<bool> imageAtomic64;
-    std::vector<DescriptorImageShape> imageShapes;
+    SharedVector<bool> imageWritten;
+    SharedVector<bool> imageDepthCompare;
+    SharedVector<bool> imageAtomic;
+    SharedVector<bool> imageAtomic64;
+    SharedVector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
-    std::vector<bool> bufferAtomic;
+    SharedVector<bool> bufferAtomic;
     // Guest buffer elements the shader may store to through this V# (any store or atomic in the
     // program, whatever its offset), one entry per element of a GuestBuffers binding, empty
     // otherwise. A false entry is proved: every access of that element is a load. A driver may then
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
-    std::vector<bool> bufferWritten;
-    std::vector<bool> samplerUnnormalized;
-    std::vector<bool> samplerIntegerBorder;
-    std::vector<bool> samplerCoordinatesIgnored;
-    std::vector<bool> imageUnnormalized;
-    std::vector<bool> imageUnnormalizedBaseLevel;
-    std::vector<std::uint32_t> imageSamplers;
-    std::vector<bool> bufferRead;
-    std::vector<std::uint32_t> bufferExtent;
+    SharedVector<bool> bufferWritten;
+    SharedVector<bool> samplerUnnormalized;
+    SharedVector<bool> samplerIntegerBorder;
+    SharedVector<bool> samplerCoordinatesIgnored;
+    SharedVector<bool> imageUnnormalized;
+    SharedVector<bool> imageUnnormalizedBaseLevel;
+    SharedVector<std::uint32_t> imageSamplers;
+    SharedVector<bool> bufferRead;
+    SharedVector<std::uint32_t> bufferExtent;
 };
 
 struct ImageTableEntryPoison {

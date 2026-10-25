@@ -622,6 +622,8 @@ struct DrawOutcome {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     double walkUs = 0;
+    // Resident target lookups a memo of the previous draw's answered (residentTargetMemo).
+    std::uint64_t targetMemoHits = 0;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -658,6 +660,7 @@ struct DrawProfile {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     double walkUs = 0;
+    std::uint64_t targetMemoHits = 0;
     std::array<double, PhaseCount> totalsUs{};
     std::array<double, LookupPartCount> lookupPartsUs{};
     std::array<double, VertexPartCount> vertexPartsUs{};
@@ -941,6 +944,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
     profile.walkUs += outcome.walkUs;
+    profile.targetMemoHits += outcome.targetMemoHits;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -973,7 +977,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
             for (std::size_t part = 0; part < LookupPartCount && room(); ++part) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", part == 0 ? "" : ", ", LookupPartNames[part], profile.lookupPartsUs[part] / 1000.0);
             if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
         }
-        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, %.0f us of it in the write-watch walks)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.walkUs);
+        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, %.0f us of it in the write-watch walks; %llu answered by the previous draw's memo)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.walkUs, static_cast<unsigned long long>(profile.targetMemoHits));
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -1023,6 +1027,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const RecordSplit& spl
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = profile.walkUs = 0;
+    profile.targetMemoHits = 0;
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -2046,6 +2051,76 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     timer.vertex(VertexRanges);
     return inputs;
+}
+
+// The resident target memo: the previous draw's answer for a color slot stands while the target
+// is the same and nothing its lookup reads has moved since: the collect epoch (the write-watch
+// walks repeat its first), the proof serial (guest stores, GPU holds off the committer, every
+// non-draw commit), the pending registry, depth surfaces, unwatched and reallocated memory and
+// presents, and the image is still cached. A lookup that moved any of them (an upload, a flush,
+// a clear materialized, an image made) is not memoized. APS5_NO_TARGET_MEMO=1 looks up every
+// draw's targets; APS5_VERIFY_TARGET_MEMO=1 also looks up on a hit and aborts on another image.
+struct TargetMemoToken {
+    std::uint64_t epoch = 0;
+    std::uint64_t proofs = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t depthSurfaces = 0;
+    std::uint64_t unwatched = 0;
+    std::uint64_t allocations = 0;
+    std::uint64_t presents = 0;
+    bool operator==(const TargetMemoToken&) const = default;
+};
+
+TargetMemoToken currentTargetMemoToken() {
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), DepthSurfacesSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), Recorder::Presents()};
+}
+
+bool sameColorTarget(const ColorTarget& a, const ColorTarget& b) {
+    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.bytes == b.bytes && a.componentMapping == b.componentMapping && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.packing == b.packing && a.dccAddress == b.dccAddress && a.dccAlphaOnMsb == b.dccAlphaOnMsb && a.dccPipeAligned == b.dccPipeAligned && a.cmaskAddress == b.cmaskAddress && a.cmaskBytes == b.cmaskBytes && a.cmaskFastClear == b.cmaskFastClear && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.mipTail == b.mipTail && a.clearWords == b.clearWords && a.slot == b.slot && a.depth == b.depth && a.depthSlice == b.depthSlice && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.exportIndex == b.exportIndex && a.uintExport == b.uintExport && a.pipeBankXor == b.pipeBankXor && a.samples == b.samples && a.coverageSamples == b.coverageSamples && a.dccControl == b.dccControl && a.fmaskAddress == b.fmaskAddress && a.fmaskPipeBankXor == b.fmaskPipeBankXor && a.partialWriteMask == b.partialWriteMask;
+}
+
+struct ResidentTargetMemo {
+    VkDevice device = VK_NULL_HANDLE;
+    ColorTarget color{};
+    // Weak: the memo must not keep an evicted image alive past the device.
+    std::weak_ptr<StorageTexture> resident;
+    TargetMemoToken token;
+};
+
+constexpr std::size_t TargetMemoSlots = 8;
+std::atomic<std::uint64_t> targetMemoHits{0};
+
+bool targetMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_TARGET_MEMO") == nullptr;
+    return enabled;
+}
+
+std::array<ResidentTargetMemo, TargetMemoSlots>& residentTargetMemos() {
+    thread_local std::array<ResidentTargetMemo, TargetMemoSlots> memos;
+    return memos;
+}
+
+std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup);
+
+// refreshResidentTarget through the memo of the color slot `index`.
+std::shared_ptr<StorageTexture> residentTargetMemo(const Context& context, const State& state, std::size_t index, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+    const auto& color = state.colors[index];
+    if (!targetMemoEnabled() || index >= TargetMemoSlots) return refreshResidentTarget(context, state, color, outcome, profile, lookup);
+    auto& memo = residentTargetMemos()[index];
+    const auto before = currentTargetMemoToken();
+    if (before.epoch != 0 && memo.token == before && memo.device == context.device && sameColorTarget(memo.color, color)) {
+        if (auto memoized = memo.resident.lock(); memoized != nullptr && memoized->Cached()) {
+            static const bool verify = std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr;
+            if (verify) Require(refreshResidentTarget(context, state, color, outcome, profile, lookup) == memoized, "the resident target memo answered another image than the lookup");
+            targetMemoHits.fetch_add(1, std::memory_order_relaxed);
+            ++outcome.targetMemoHits;
+            return memoized;
+        }
+    }
+    auto resident = refreshResidentTarget(context, state, color, outcome, profile, lookup);
+    if (resident != nullptr && before.epoch != 0 && currentTargetMemoToken() == before) memo = {context.device, color, resident, before};
+    else memo.resident.reset();
+    return resident;
 }
 
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
@@ -3244,7 +3319,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = residentTargetMemo(context, state, index, outcome, profile, [&] {
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -4117,6 +4192,10 @@ bool DrawPipelineEnabled() {
 
 bool CommitTrims() {
     return DrawPipelineEnabled();
+}
+
+std::uint64_t ResidentTargetMemoHits() {
+    return targetMemoHits.load(std::memory_order_relaxed);
 }
 
 }

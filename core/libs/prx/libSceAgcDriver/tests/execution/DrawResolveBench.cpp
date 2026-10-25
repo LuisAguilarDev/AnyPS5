@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -34,6 +35,7 @@
 // checks that the draws hit; `--benchmark hits|data|moved|rings|buffers|textures [seconds]` submits
 // one kind for the given time
 // (default 21 s) so the APS5_PROFILE_DRAW=1 lines ([draws], [spine]) cover two whole 10 s windows.
+// `--target-memo` checks the resident target memo instead (CheckTargetMemo).
 
 namespace {
 
@@ -349,6 +351,24 @@ void CheckEpochGate() {
     }
 }
 
+// The resident target memo (`--target-memo`, under the draw pipeline): a stream of hits into the
+// resident target looks the target up on its first draws and answers the others from the memo,
+// and a CPU write to the target before the next submission makes its first draw look it up again.
+// APS5_NO_TARGET_MEMO=1 answers none from the memo.
+void CheckTargetMemo() {
+    Require(ColorTarget != ColorMemory.data(), "the target memo check needs the resident target of a write-watched arena block");
+    constexpr std::size_t draws = 64;
+    const bool memo = std::getenv("APS5_NO_TARGET_MEMO") == nullptr;
+    for (const std::uint8_t value : {std::uint8_t{0x10}, std::uint8_t{0x20}}) {
+        ColorTarget[TargetBytes - 1] = static_cast<std::byte>(value);
+        const auto before = AgcDriver::Graphics::ResidentTargetMemoHits();
+        static_cast<void>(Submit(Stream(Kind::Hits, draws, 0)));
+        const auto hits = AgcDriver::Graphics::ResidentTargetMemoHits() - before;
+        if (!memo) Require(hits == 0, "a stream of " + std::to_string(draws) + " draws answered " + std::to_string(hits) + " target lookups from the memo with the memo off");
+        else Require(hits + 4u >= draws && hits < draws, "a stream of " + std::to_string(draws) + " draws after a CPU write to the target answered " + std::to_string(hits) + " target lookups from the memo");
+    }
+}
+
 void Benchmark(Kind kind, double seconds) {
     constexpr std::size_t draws = 512;
     static_cast<void>(Submit(Stream(kind, draws, 0)));
@@ -393,7 +413,11 @@ int main(int argc, char** argv) {
         Register(RingPixelHeader, RingPixelCode.data(), sizeof(RingPixelCode), 1);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
         Register(TexturePixelHeader, TexturePixelCode.data(), sizeof(TexturePixelCode), 1);
-        if (argc >= 3 && std::string_view(argv[1]) == "--benchmark") {
+        if (argc >= 2 && std::string_view(argv[1]) == "--target-memo") {
+            static_cast<void>(Submit(Stream(Kind::Hits, 64, 0)));
+            CheckTargetMemo();
+            std::cout << "the resident target memo answered the repeated lookups\n";
+        } else if (argc >= 3 && std::string_view(argv[1]) == "--benchmark") {
             Benchmark(ParseKind(argv[2]), argc >= 4 ? std::strtod(argv[3], nullptr) : 21.0);
         } else {
             CheckStreams();

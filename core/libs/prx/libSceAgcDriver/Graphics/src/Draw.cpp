@@ -1599,7 +1599,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         bool stale = false;
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &stale);
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, &stale);
         const auto outcome = copy.buffer != nullptr ? Recorder::DrawInputOutcome::Reused : copy.generation == 0 ? Recorder::DrawInputOutcome::Untracked : stale ? Recorder::DrawInputOutcome::Stale : Recorder::DrawInputOutcome::Absent;
         if (DeviceLocalDrawBuffers(context)) recorder->NoteDrawInputCopy(address, outcome);
         if (DrawInputsProfiled()) drawInputCounters().copies[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);

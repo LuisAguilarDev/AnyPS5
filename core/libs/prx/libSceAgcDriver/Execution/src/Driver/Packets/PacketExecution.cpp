@@ -31,9 +31,9 @@ bool orderedFills() {
     return ordered;
 }
 
-bool keepsPipelineOverPrefetch(std::span<const std::uint32_t> packet) {
+bool prefetchKeepsPipeline() {
     static const bool keep = std::getenv("APS5_NO_PIPELINED_DMA_PREFETCH") == nullptr;
-    return keep && packet.size() == 7 && Pm4::DmaDestination(packet) == Pm4::DmaDestinationNowhere;
+    return keep;
 }
 
 bool commutesWithPreparedDraws(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
@@ -79,13 +79,12 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         case 0x11: case 0x12: case 0x13: case 0x20: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
         case 0x15: return orderedFills();
-        case 0x50: return keepsPipelineOverPrefetch(packet);
         case 0x63: case 0x64: case 0x9f:
             return packet.size() >= 5 && !DrawPipeline::Queue0().OverlapsQueued(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
         case 0x50: {
             if (packet.size() < 7) return false;
             const auto destination = Pm4::DmaDestination(packet);
-            if (destination == Pm4::DmaDestinationNowhere) return true;
+            if (destination == Pm4::DmaDestinationNowhere) return prefetchKeepsPipeline();
             if (!pipelineDma()) return false;
             if (destination == Pm4::DmaSelectGds) return true;
             const auto bytes = Pm4::DmaBytes(packet);

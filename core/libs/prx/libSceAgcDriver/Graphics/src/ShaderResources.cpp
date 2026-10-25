@@ -4234,12 +4234,12 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
 void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
     if (!TexturesReleased().exchange(false, std::memory_order_acq_rel)) return;
     for (auto it = entries.begin(); it != entries.end();) {
-        if (!it->second->HoldsReleasedTexture()) {
+        if (!it->resources->HoldsReleasedTexture()) {
             ++it;
             continue;
         }
-        if (evicted != nullptr) evicted->push_back(std::move(it->second));
-        index.erase(it->first);
+        if (evicted != nullptr) evicted->push_back(std::move(it->resources));
+        index.erase(it->key);
         it = entries.erase(it);
     }
 }

@@ -5433,7 +5433,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         if (data.has_value() && std::ranges::any_of(*moved, [&](const Graphics::ShaderResources::MovedBuffer& entry) { return entry.allocation == *data; })) moved.reset();
                     }
                     if (moved.has_value() && !moved->empty()) {
-                        overlay = cached->PrepareDrawBindings(*state->recorder, *moved, true);
+                        overlay = cached->PrepareDrawBindings(*state->recorder, *moved, nullptr, true);
                         if (overlay != nullptr && overlay->allocation.set == VK_NULL_HANDLE) overlay.reset();
                         if (overlay == nullptr) {
                             proof.refusal = Graphics::ShaderResources::MoveRefusal::Bindings;

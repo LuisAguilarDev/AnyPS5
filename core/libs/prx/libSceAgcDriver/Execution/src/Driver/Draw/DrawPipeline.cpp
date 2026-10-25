@@ -248,6 +248,14 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
     return std::nullopt;
 }
 
+bool DrawPipeline::CoversThisThread() {
+    return Active() || DrawPrepPool::InPoolThread();
+}
+
+bool DrawPipeline::BusyOrPreparing() const {
+    return Busy() || (DrawPrepPool::Threads() != 0 && !DrawPrepPool::InPoolThread() && DrawPrepPool::Get().Pending());
+}
+
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {
     if (DrawPrepPool::Threads() != 0 && DrawPrepPool::Get().Pending()) {
         auto& pool = DrawPrepPool::Get();

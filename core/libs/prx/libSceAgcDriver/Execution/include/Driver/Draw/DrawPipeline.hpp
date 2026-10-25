@@ -31,6 +31,7 @@ public:
     static std::size_t Depth();
     static std::size_t QueuedItems();
     static bool& Active();
+    static bool CoversThisThread();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
 
@@ -39,6 +40,7 @@ public:
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
+    bool BusyOrPreparing() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     static bool BatchedOverlaps();

@@ -71,6 +71,11 @@ bool Driver::drawForwardedWords() {
     return enabled;
 }
 
+bool Driver::patchAfterValidation() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_PATCH_AFTER_VALIDATION") == nullptr;
+    return enabled;
+}
+
 bool Driver::drawBufferBaseWords() {
     static const bool enabled = drawRebaseEnabled() && std::getenv("APS5_NO_DRAW_BUFFER_BASE_WORDS") == nullptr;
     return enabled;

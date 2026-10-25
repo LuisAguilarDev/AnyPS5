@@ -96,12 +96,12 @@ enum class DrawRefusedWord : std::size_t { Beyond, Value, BaseAndValue, BaseDrop
 
 struct DrawCandidateCounters {
     std::uint64_t tried = 0, equal = 0, equalData = 0, rebased = 0, rebasedData = 0, rebasedFetch = 0, forwarded = 0, bufferBases = 0;
-    std::uint64_t refusedUntagged = 0, refusedPointer = 0, refusedTail = 0, refusedOff = 0, differingEqual = 0, differingRebased = 0;
+    std::uint64_t refusedUntagged = 0, refusedPointer = 0, refusedTail = 0, refusedOff = 0, differingEqual = 0, differingRebased = 0, differingBasesOnly = 0, patchedDiffering = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrawRefusedWord::Count)> refusedBy{};
     std::vector<std::uint64_t> refusedWords;
 
     DrawCandidateCounters& operator+=(const DrawCandidateCounters& other) {
-        for (auto [total, part] : {std::pair{&tried, other.tried}, {&equal, other.equal}, {&equalData, other.equalData}, {&rebased, other.rebased}, {&rebasedData, other.rebasedData}, {&rebasedFetch, other.rebasedFetch}, {&forwarded, other.forwarded}, {&bufferBases, other.bufferBases}, {&refusedUntagged, other.refusedUntagged}, {&refusedPointer, other.refusedPointer}, {&refusedTail, other.refusedTail}, {&refusedOff, other.refusedOff}, {&differingEqual, other.differingEqual}, {&differingRebased, other.differingRebased}}) *total += part;
+        for (auto [total, part] : {std::pair{&tried, other.tried}, {&equal, other.equal}, {&equalData, other.equalData}, {&rebased, other.rebased}, {&rebasedData, other.rebasedData}, {&rebasedFetch, other.rebasedFetch}, {&forwarded, other.forwarded}, {&bufferBases, other.bufferBases}, {&refusedUntagged, other.refusedUntagged}, {&refusedPointer, other.refusedPointer}, {&refusedTail, other.refusedTail}, {&refusedOff, other.refusedOff}, {&differingEqual, other.differingEqual}, {&differingRebased, other.differingRebased}, {&differingBasesOnly, other.differingBasesOnly}, {&patchedDiffering, other.patchedDiffering}}) *total += part;
         for (std::size_t i = 0; i < refusedBy.size(); ++i) refusedBy[i] += other.refusedBy[i];
         return *this;
     }

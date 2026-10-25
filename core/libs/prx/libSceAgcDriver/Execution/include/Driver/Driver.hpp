@@ -191,6 +191,7 @@ private:
     static bool candidateDataWords();
     static bool drawForwardedWords();
     static bool drawBufferBaseWords();
+    static bool patchAfterValidation();
     static void tagBufferBaseWords(DispatchVariant& variant, const ShaderRecompiler::SrtUserDataUse& use, std::span<const std::uint32_t> userData, std::uint32_t hiddenWords);
     static std::shared_ptr<const ShaderRecompiler::RecompileResult> patchBufferBaseWords(const DispatchVariant& variant, std::uint64_t words, std::span<const std::uint32_t> userData);
     static std::uint64_t fetchTableWords(const ShaderRecompiler::ShaderVertexStageInfo& vertexInfo);

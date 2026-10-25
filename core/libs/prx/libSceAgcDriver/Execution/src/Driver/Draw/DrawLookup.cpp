@@ -19,6 +19,7 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
     }
     ++counters.tried;
     auto candidate = variant;
+    bool patched = false;
     const bool rebased = moved != 0 || movedBeyond;
     const auto based = drawBufferBaseWords() ? moved & variant->bufferBaseWords & ~variant->rebaseWords : 0;
     if (rebased) {
@@ -59,9 +60,16 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
             }
             rebaseVariantWord(*copy, index, from, to);
         }
-        if (based != 0) copy->compiled = patchBufferBaseWords(*copy, based, now.userData);
-        applyShaderDataPatches(*copy);
         candidate = std::move(copy);
+    }
+    const auto patch = [&] {
+        if (!rebased) return;
+        if (based != 0) candidate->compiled = patchBufferBaseWords(*candidate, based, now.userData);
+        applyShaderDataPatches(*candidate);
+    };
+    if (!patchAfterValidation()) {
+        patched = based != 0 || (rebased && !candidate->shaderDataPatches.empty());
+        patch();
     }
     std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
     auto* live = candidateDataWords() ? &liveData : nullptr;
@@ -71,8 +79,11 @@ std::shared_ptr<DispatchVariant> Driver::dataCandidate(const std::shared_ptr<Dis
     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(now.binary.codeAddress, queue, *candidate, regions, imagesFlushed, runsSynced, sampling, live, gate);
     if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) {
         ++(rebased ? counters.differingRebased : counters.differingEqual);
+        if (rebased && based != 0 && (moved & ~based) == 0 && !movedBeyond) ++counters.differingBasesOnly;
+        if (patched) ++counters.patchedDiffering;
         return nullptr;
     }
+    if (patchAfterValidation()) patch();
     const bool data = result == EntryOutcome::EqualData;
     if (data) {
         if (!rebased) candidate = copyVariant(*variant);

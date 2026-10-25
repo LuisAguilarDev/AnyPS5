@@ -36,6 +36,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
 alignas(256) constexpr std::array<std::uint32_t, 10> ArithmeticPixelCode{0xf4000100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x06000002u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> InlinePixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 10> InlineAndScalarPixelCode{0xf4000200u, 0xfa000000u, 0xe0300000u, 0x80000000u, 0xbf8c0070u, 0x7e020208u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 14> InlineAndTablePixelCode{0xf4080202u, 0xfa000000u, 0xbf8cc07fu, 0xe0300000u, 0x80000000u, 0xe0300000u, 0x80020100u, 0xbf8c3f70u, 0x06000300u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) std::array<float, 4> PixelConstant{};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 
@@ -51,6 +52,7 @@ alignas(8) Header PixelHeader{};
 alignas(8) Header ArithmeticPixelHeader{};
 alignas(8) Header InlinePixelHeader{};
 alignas(8) Header InlineAndScalarPixelHeader{};
+alignas(8) Header InlineAndTablePixelHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -88,7 +90,7 @@ void PixelUserData(std::vector<std::uint32_t>& commands, const std::uint32_t* po
 }
 
 struct Modes {
-    bool verify = false, rebase = true, forwarded = true, bufferBases = true;
+    bool verify = false, rebase = true, forwarded = true, bufferBases = true, patchLate = true;
 };
 
 std::vector<std::uint32_t> Setup(bool triangle = false, bool loadPixel = false, const std::uint32_t* pixelCode = nullptr, std::uint32_t pixelUserWords = 3) {
@@ -381,8 +383,45 @@ void InlineBasesTheWalkReadsStayExact(const Modes& modes) {
     if (modes.rebase) Require(after.candidates.refusedBy[both] > before.candidates.refusedBy[both], "an inline V# base the walk also reads through was not refused as a base and a value: " + CandidateCounts(after.candidates));
 }
 
-int main() {
-    try {
+void DifferingInlineBaseCandidatesStayUnpatched(const Modes& modes) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(InlineAndTablePixelHeader, InlineAndTablePixelCode.data(), sizeof(InlineAndTablePixelCode), 1);
+    auto* block = GuestBlock();
+    auto* dataA = block;
+    auto* dataB = block + 1024;
+    auto* tableA = block + 2048;
+    auto* tableB = block + 3072;
+    dataA[0] = std::bit_cast<std::uint32_t>(0.25f);
+    dataB[0] = std::bit_cast<std::uint32_t>(0.25f);
+    Describe(tableA, block + 4096, 0.0f);
+    Describe(tableB, block + 5120, 0.25f);
+    tableB[2] = 32;
+    const auto draw = [&](const std::uint32_t* data, const std::uint32_t* table, bool setup) {
+        auto commands = setup ? Setup(true, true, InlineAndTablePixelCode.data(), 6) : std::vector<std::uint32_t>{};
+        InlineDescriptor(commands, data, 16);
+        const auto address = reinterpret_cast<std::uintptr_t>(table);
+        Append(commands, 0x76, {0x010, static_cast<std::uint32_t>(address)});
+        Append(commands, 0x76, {0x011, static_cast<std::uint32_t>(address >> 32u)});
+        Append(commands, 0x2d, {3, 2});
+        Submit(std::move(commands));
+        return BrightestColorByte();
+    };
+    const auto withinTwo = [](unsigned value, unsigned expected) { return value + 2 >= expected && value <= expected + 2; };
+    const auto counters = [] { return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters(); };
+    draw(dataA, tableA, true);
+    const auto a = draw(dataA, tableA, false);
+    Require(withinTwo(a, 64), "the pixel stage adding 0.0 through table A to 0.25 through an inline V# at A wrote " + std::to_string(a) + ", expected 64");
+    const auto before = counters();
+    const auto b = draw(dataB, tableB, false);
+    const auto after = counters();
+    Require(withinTwo(b, 128), "the pixel stage adding 0.25 through table B to 0.25 through an inline V# at B wrote " + std::to_string(b) + ", expected 128 (" + CandidateCounts(after.candidates) + ")");
+    if (!modes.rebase || !modes.bufferBases || modes.verify) return;
+    Require(after.candidates.differingRebased > before.candidates.differingRebased, "a candidate whose moved table differs was not refused by validation: " + CandidateCounts(after.candidates));
+    if (modes.patchLate) Require(after.candidates.patchedDiffering == before.candidates.patchedDiffering, "a candidate that differed after validation was patched first: " + CandidateCounts(after.candidates));
+    else Require(after.candidates.patchedDiffering > before.candidates.patchedDiffering, "late patching off: the differing candidate was not patched before its validation: " + CandidateCounts(after.candidates));
+}
+
+int main() {    try {
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -395,11 +434,13 @@ int main() {
         modes.rebase = std::getenv("APS5_NO_DRAW_REBASE") == nullptr;
         modes.forwarded = std::getenv("APS5_NO_DRAW_FORWARDED_WORDS") == nullptr;
         modes.bufferBases = std::getenv("APS5_NO_DRAW_BUFFER_BASE_WORDS") == nullptr;
+        modes.patchLate = std::getenv("APS5_NO_DRAW_PATCH_AFTER_VALIDATION") == nullptr;
         UnreadUserWordsKeepTheStage(modes);
         ReadUserWordsChangeTheOutput(modes);
         MovedTablesRenderTheirBuffers(modes);
         InlineBufferBasesRenderTheirBuffers(modes);
         InlineBasesTheWalkReadsStayExact(modes);
+        DifferingInlineBaseCandidatesStayUnpatched(modes);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (modes.verify ? "verified" : "reused") << " the stages whose read user words did not change" << (modes.rebase ? " or whose tables only moved" : "") << '\n';
         return 0;

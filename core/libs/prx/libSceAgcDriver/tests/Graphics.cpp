@@ -6449,10 +6449,6 @@ void chunkDeterminismTests() {
     std::cout << "chunks record the same commands on one and on three recorder threads\n";
 }
 
-// A guest flush seals the write-only stores of a chunk's open pass as it seals the spine's
-// (Recorder::SealPassWriteOnly): two draws that write the same range only through write-only
-// bindings share the chunk's pass until such a flush, and the draw after it begins a new pass
-// behind a barrier.
 void chunkedWriteOnlySealTests() {
     using AgcDriver::Graphics::DrawRecorders;
     using AgcDriver::Graphics::PassAccess;

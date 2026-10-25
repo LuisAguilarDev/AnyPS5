@@ -22,13 +22,16 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -52,6 +55,9 @@ constexpr std::uint32_t LinearAttrib3 = 0x09000000u;
 constexpr std::uint32_t Float32AbgrExport = 9;
 constexpr std::uint32_t ZeroConstant = 0x80u;
 constexpr std::uint32_t OneConstant = 0xf2u;
+constexpr std::size_t SettledImportBytes = 0x100000;
+constexpr auto SettleTimeout = std::chrono::seconds(5);
+constexpr auto SettlePoll = std::chrono::milliseconds(1);
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
@@ -69,7 +75,6 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-// Exports (x, y, z, 1) with z an inline constant (0x80: 0.0, 0xf2: 1.0).
 std::span<const std::uint32_t> Program(std::uint32_t fixedVgpr, std::uint32_t depthConstant) {
     Require(programCount < Programs.size(), "too many test programs");
     auto& code = Programs[programCount++];
@@ -220,6 +225,19 @@ void Draw(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarge
 }
 
 
+bool SettledWatched(const AgcDriver::Graphics::Context& context, const Block& block) {
+    const auto deadline = std::chrono::steady_clock::now() + SettleTimeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) return false;
+            if (AgcDriver::GuestMemory::Watched(block.Address(), block.bytes)) return true;
+        }
+        std::this_thread::sleep_for(SettlePoll);
+    }
+    return false;
+}
+
 void Check(const std::vector<std::uint8_t>& stored, float depth, const std::string& what) {
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
@@ -235,15 +253,12 @@ bool Expect(AgcDriver::VulkanDevice& device) {
     using ShaderRecompiler::PixelInput;
     using ShaderRecompiler::PixelInputBit;
     constexpr std::size_t bytes = std::size_t{Width} * Height * 16u;
-    Block block(bytes);
+    Block block(SettledImportBytes);
     std::fill(block.data, block.data + bytes, std::uint8_t{0xff});
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    if (AgcDriver::Graphics::HostImportFor(context, block.Address(), bytes) == nullptr) return false;
+    if (!block.watched || !SettledWatched(context, block)) return false;
     const auto color = DecodeTarget(block, Rgba32FloatInfo);
     Require(color.tileMode == AgcDriver::Graphics::ColorTileMode::Linear && color.bytes == bytes, "the target is not a linear R32G32B32A32 target");
-    // Two draws into the target in one batch: the second one's keep stores the first one's results
-    // (FlushPending in keepRecordedDraw), which submits the batch, chunk included, before the
-    // second draw's record half is queued.
     Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, ZeroConstant));
     Draw(device, color, PixelInputBit(PixelInput::PositionFixedPoint), Program(0u, OneConstant));
     device.WaitIdle();
@@ -256,7 +271,6 @@ bool Expect(AgcDriver::VulkanDevice& device) {
 }
 
 int main() {
-    // Before the device exists: the recorder thread count is read once.
 #ifdef _WIN32
     _putenv_s("APS5_DRAW_RECORD_THREADS", "2");
     _putenv_s("APS5_DRAW_CHUNK_DRAWS", "8");
@@ -268,7 +282,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!Expect(*device)) {
-            std::puts("chunked linear target test skipped: no host import on this device");
+            std::puts("chunked linear target test skipped: no settled write-watched host import on this device");
             return VulkanTestSkipped;
         }
         std::puts("chunked linear target tests passed");

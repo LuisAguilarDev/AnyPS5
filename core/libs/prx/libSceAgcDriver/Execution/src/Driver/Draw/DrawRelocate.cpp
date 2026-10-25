@@ -191,8 +191,8 @@ std::vector<std::pair<std::uint64_t, std::int32_t>> Driver::vertexFetchReads(con
         const auto& read = decodeReads[i];
         if (word >= 63 || word + 1u >= userData.size() || userData[word] == 0) return {};
         const auto table = static_cast<std::uint64_t>(userData[word]) | (static_cast<std::uint64_t>(userData[word + 1u]) << 32u);
-        if (read.address < table || read.address - table >= MaxTableBytes || (read.address & 3u) != 0 || read.bytes.empty() || read.bytes.size() % sizeof(std::uint32_t) != 0) return {};
-        for (std::size_t at = 0; at < read.bytes.size(); at += sizeof(std::uint32_t)) reads.emplace_back(read.address + at, static_cast<std::int32_t>(word));
+        if (read.address < table || read.address - table >= MaxTableBytes || (read.address & 3u) != 0 || read.size == 0 || read.size % sizeof(std::uint32_t) != 0) return {};
+        for (std::size_t at = 0; at < read.size; at += sizeof(std::uint32_t)) reads.emplace_back(read.address + at, static_cast<std::int32_t>(word));
     }
     return reads;
 }

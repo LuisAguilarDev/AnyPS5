@@ -1527,6 +1527,7 @@ void Recorder::CountPassDraw(std::uint8_t fragmentFlags) {
 
 void Recorder::SealPassWriteOnly() {
     if (open != nullptr) open->passHazards.SealWriteOnly();
+    if (joinable != nullptr) recorders->Record(joinableThread, joinable, [](RecordingContext& recording, DrawRecorders::DrawStats&) { recording.SealPassWriteOnly(); });
 }
 
 void Recorder::endOpenRenderPass(bool barrier) {
@@ -3262,6 +3263,14 @@ void RecordingContext::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timi
     chunkPass.open = true;
     chunkPass.key = key;
     chunkHazards.Add(access);
+}
+
+void RecordingContext::SealPassWriteOnly() {
+    if (!chunked) {
+        owner.SealPassWriteOnly();
+        return;
+    }
+    chunkHazards.SealWriteOnly();
 }
 
 void RecordingContext::Keep(std::shared_ptr<void> object, std::size_t bytes) {

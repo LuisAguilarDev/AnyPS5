@@ -1099,6 +1099,7 @@ public:
     // The record calls (see the Recorder members of the same names).
     Recorder::DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    void SealPassWriteOnly();
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepBytes(const void* owner, std::size_t bytes);
     void PrepareSampleSlot();

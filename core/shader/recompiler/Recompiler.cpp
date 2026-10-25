@@ -1385,7 +1385,7 @@ std::atomic<std::uint64_t>& memoUserWordPatches() {
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0}, patched{0};
-    std::atomic<std::uint64_t> hashNanoseconds{0}, lookupWaitNanoseconds{0}, lookupHeldNanoseconds{0}, insertWaitNanoseconds{0}, insertHeldNanoseconds{0};
+    std::atomic<std::uint64_t> hashNanoseconds{0}, lookupWaitNanoseconds{0}, lookupHeldNanoseconds{0}, insertWaitNanoseconds{0}, insertHeldNanoseconds{0}, releaseNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1395,7 +1395,7 @@ ResultMemoCounters& resultMemoCounters() {
 }
 
 struct ResultMemoMissCounters {
-    std::atomic<std::uint64_t> firstSeen{0}, unchanged{0}, userDataOnly{0}, basesOnly{0}, basesAndSrtOnly{0};
+    std::atomic<std::uint64_t> firstSeen{0}, unchanged{0}, userDataOnly{0}, basesOnly{0}, basesAndSrtOnly{0}, vertexBasesOnly{0}, evictedReleases{0}, evictedLastReferences{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
 };
 
@@ -1451,10 +1451,21 @@ void classifyMemoMiss(SourceEntry& source, std::uint64_t variantId, const Snapsh
     constexpr auto bases = componentBit(ResultMemoMissComponent::BufferBase) | componentBit(ResultMemoMissComponent::ImageBase);
     constexpr auto userData = componentBit(ResultMemoMissComponent::UserData);
     constexpr auto srt = componentBit(ResultMemoMissComponent::FlattenedSrt);
+    constexpr auto vertexBases = componentBit(ResultMemoMissComponent::VertexBase);
     if (changed == 0) counters.unchanged.fetch_add(1, std::memory_order_relaxed);
     else if (changed == userData) counters.userDataOnly.fetch_add(1, std::memory_order_relaxed);
     else if ((changed & bases) != 0 && (changed & ~(bases | userData)) == 0) counters.basesOnly.fetch_add(1, std::memory_order_relaxed);
     else if ((changed & bases) != 0 && (changed & srt) != 0 && (changed & ~(bases | userData | srt)) == 0) counters.basesAndSrtOnly.fetch_add(1, std::memory_order_relaxed);
+    else if ((changed & vertexBases) != 0 && (changed & ~(bases | vertexBases | userData | srt)) == 0) counters.vertexBasesOnly.fetch_add(1, std::memory_order_relaxed);
+}
+
+void releaseEvicted(std::shared_ptr<const RecompileResult> evicted) {
+    auto& misses = resultMemoMissCounters();
+    misses.evictedReleases.fetch_add(1, std::memory_order_relaxed);
+    if (evicted.use_count() == 1) misses.evictedLastReferences.fetch_add(1, std::memory_order_relaxed);
+    const auto started = std::chrono::steady_clock::now();
+    evicted.reset();
+    resultMemoCounters().releaseNanoseconds.fetch_add(elapsedNanoseconds(started, std::chrono::steady_clock::now()), std::memory_order_relaxed);
 }
 
 void reportResultMemoSteps(std::uint64_t calls, std::uint64_t misses) {
@@ -1467,12 +1478,14 @@ void reportResultMemoSteps(std::uint64_t calls, std::uint64_t misses) {
     const auto lookupHeld = perCall(counters.lookupHeldNanoseconds, calls);
     const auto insertWait = perCall(counters.insertWaitNanoseconds, misses);
     const auto insertHeld = perCall(counters.insertHeldNanoseconds, misses);
+    const auto releases = now.evictedReleases - reported.evictedReleases;
+    const auto release = perCall(counters.releaseNanoseconds, releases);
     const auto delta = [&](std::size_t component) { return static_cast<unsigned long long>(now.byComponent[component] - reported.byComponent[component]); };
     using Component = ResultMemoMissComponent;
-    std::fprintf(stderr, "[recompile] result memo steps (10 s): us per call: hash %.2f, lookup lock wait %.2f / held %.2f; us per miss: insert lock wait %.2f / held %.2f (evictions included); misses against the newest snapshot of the variant: first seen %llu, unchanged (evicted) %llu, user data only %llu, descriptor bases only %llu, bases and flattened SRT only %llu; parts changed: buffer bases %llu, other buffer words %llu, image bases %llu, other image words %llu, samplers %llu, flattened SRT %llu, tables %llu, other %llu, user data %llu\n",
-        hash, lookupWait, lookupHeld, insertWait, insertHeld,
-        static_cast<unsigned long long>(now.firstSeen - reported.firstSeen), static_cast<unsigned long long>(now.unchanged - reported.unchanged), static_cast<unsigned long long>(now.userDataOnly - reported.userDataOnly), static_cast<unsigned long long>(now.basesOnly - reported.basesOnly), static_cast<unsigned long long>(now.basesAndSrtOnly - reported.basesAndSrtOnly),
-        delta(static_cast<std::size_t>(Component::BufferBase)), delta(static_cast<std::size_t>(Component::BufferOther)), delta(static_cast<std::size_t>(Component::ImageBase)), delta(static_cast<std::size_t>(Component::ImageOther)), delta(static_cast<std::size_t>(Component::Sampler)), delta(static_cast<std::size_t>(Component::FlattenedSrt)), delta(static_cast<std::size_t>(Component::Tables)), delta(static_cast<std::size_t>(Component::Other)), delta(static_cast<std::size_t>(Component::UserData)));
+    std::fprintf(stderr, "[recompile] result memo steps (10 s): us per call: hash %.2f, lookup lock wait %.2f / held %.2f; us per miss: insert lock wait %.2f / held %.2f; evicted results released after the lock %llu (%llu last references), %.2f us each; misses against the newest snapshot of the variant: first seen %llu, unchanged (evicted) %llu, user data only %llu, descriptor bases only %llu, bases and flattened SRT only %llu, vertex fetch bases with descriptor bases and flattened SRT only %llu; parts changed: buffer bases %llu, other buffer words %llu, image bases %llu, other image words %llu, samplers %llu, flattened SRT %llu, tables %llu, vertex fetch bases %llu, other vertex fetch words %llu, pixel and layout state %llu, other %llu, user data %llu\n",
+        hash, lookupWait, lookupHeld, insertWait, insertHeld, static_cast<unsigned long long>(releases), static_cast<unsigned long long>(now.evictedLastReferences - reported.evictedLastReferences), release,
+        static_cast<unsigned long long>(now.firstSeen - reported.firstSeen), static_cast<unsigned long long>(now.unchanged - reported.unchanged), static_cast<unsigned long long>(now.userDataOnly - reported.userDataOnly), static_cast<unsigned long long>(now.basesOnly - reported.basesOnly), static_cast<unsigned long long>(now.basesAndSrtOnly - reported.basesAndSrtOnly), static_cast<unsigned long long>(now.vertexBasesOnly - reported.vertexBasesOnly),
+        delta(static_cast<std::size_t>(Component::BufferBase)), delta(static_cast<std::size_t>(Component::BufferOther)), delta(static_cast<std::size_t>(Component::ImageBase)), delta(static_cast<std::size_t>(Component::ImageOther)), delta(static_cast<std::size_t>(Component::Sampler)), delta(static_cast<std::size_t>(Component::FlattenedSrt)), delta(static_cast<std::size_t>(Component::Tables)), delta(static_cast<std::size_t>(Component::VertexBase)), delta(static_cast<std::size_t>(Component::VertexOther)), delta(static_cast<std::size_t>(Component::PixelAndLayout)), delta(static_cast<std::size_t>(Component::Other)), delta(static_cast<std::size_t>(Component::UserData)));
     reported = now;
 }
 
@@ -1578,7 +1591,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(base);
         mix(size);
     }
-    current = Component::Other;
+    current = Component::PixelAndLayout;
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
@@ -1594,17 +1607,30 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(merge.samples);
         for (const auto word : merge.descriptor) mix(word);
     }
+    current = Component::VertexOther;
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;
         const auto count = std::min<std::uint32_t>(vertex.resourcesNum, ShaderVertexStageInfo::MaxResources);
         mix(count);
         for (std::uint32_t i = 0; i < count; ++i) {
-            for (const auto field : vertex.resources[i].fields) mix(field);
+            const auto& fields = vertex.resources[i].fields;
+            for (std::size_t f = 0; f < fields.size(); ++f) {
+                mixHash(fields[f]);
+                if (f == 0) {
+                    mixPart(Component::VertexBase, fields[f]);
+                } else if (f == 1) {
+                    mixPart(Component::VertexBase, fields[f] & BufferBaseHighMask);
+                    mixPart(Component::VertexOther, fields[f] & ~BufferBaseHighMask);
+                } else {
+                    mixPart(Component::VertexOther, fields[f]);
+                }
+            }
             mix(vertex.resourcesDst[i].fetchIndex);
         }
     } else {
         mix(1ull << 32u);
     }
+    current = Component::Other;
     mix(snapshot.srtPoison.size());
     mix(snapshot.nullRootReads);
     if (shape != nullptr) *shape = hash;
@@ -1686,6 +1712,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const RecompileResult> shared = std::move(result);
+    std::shared_ptr<const RecompileResult> evicted;
     {
         MemoLockSpan span(profile, counters.insertWaitNanoseconds, counters.insertHeldNanoseconds);
         std::lock_guard lock(source.mutex);
@@ -1708,6 +1735,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (!present) {
             if (victim->result != nullptr) {
                 counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                evicted = std::move(victim->result);
                 const auto staleShape = source.memoShapes.find((victim->variantId * 0xc2b2ae3d27d4eb4full) ^ victim->shape);
                 if (staleShape != source.memoShapes.end() && staleShape->second == victim) source.memoShapes.erase(staleShape);
             }
@@ -1715,6 +1743,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             if (patching) source.memoShapes[shapeIndex] = victim;
         }
     }
+    if (profile && evicted != nullptr) releaseEvicted(std::move(evicted));
     reportResultMemo();
     return shared;
 }
@@ -1987,6 +2016,9 @@ ResultMemoMissCauses ResultMemoMisses() {
     causes.userDataOnly = counters.userDataOnly.load(std::memory_order_relaxed);
     causes.basesOnly = counters.basesOnly.load(std::memory_order_relaxed);
     causes.basesAndSrtOnly = counters.basesAndSrtOnly.load(std::memory_order_relaxed);
+    causes.vertexBasesOnly = counters.vertexBasesOnly.load(std::memory_order_relaxed);
+    causes.evictedReleases = counters.evictedReleases.load(std::memory_order_relaxed);
+    causes.evictedLastReferences = counters.evictedLastReferences.load(std::memory_order_relaxed);
     for (std::size_t part = 0; part < causes.byComponent.size(); ++part) causes.byComponent[part] = counters.byComponent[part].load(std::memory_order_relaxed);
     return causes;
 }

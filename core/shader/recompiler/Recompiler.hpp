@@ -810,13 +810,16 @@ struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 [[nodiscard]] std::uint64_t ResultMemoUserWordPatches();
 
-enum class ResultMemoMissComponent : std::uint8_t { BufferBase, BufferOther, ImageBase, ImageOther, Sampler, FlattenedSrt, Tables, Other, UserData, Count };
+enum class ResultMemoMissComponent : std::uint8_t { BufferBase, BufferOther, ImageBase, ImageOther, Sampler, FlattenedSrt, Tables, VertexBase, VertexOther, PixelAndLayout, Other, UserData, Count };
 struct ResultMemoMissCauses {
     std::uint64_t firstSeen = 0;
     std::uint64_t unchanged = 0;
     std::uint64_t userDataOnly = 0;
     std::uint64_t basesOnly = 0;
     std::uint64_t basesAndSrtOnly = 0;
+    std::uint64_t vertexBasesOnly = 0;
+    std::uint64_t evictedReleases = 0;
+    std::uint64_t evictedLastReferences = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
 };
 [[nodiscard]] ResultMemoMissCauses ResultMemoMisses();

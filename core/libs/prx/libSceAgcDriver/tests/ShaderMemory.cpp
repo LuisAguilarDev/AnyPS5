@@ -1180,6 +1180,19 @@ void verifyResultMemoMissCauses() {
     require(rebased.basesOnly + rebased.basesAndSrtOnly - shifted.basesOnly - shifted.basesAndSrtOnly == 1u, "result memo misses: a V# that only moved its base was not counted as a descriptor base only miss");
     static_cast<void>(materializeMemoTable(retargeted, true));
     require(ResultMemoMisses().firstSeen == rebased.firstSeen && ResultMemoMisses().basesOnly == rebased.basesOnly, "result memo misses: a memo hit was classified as a miss");
+    require(at(ResultMemoMisses(), Component::VertexBase) == 0u && ResultMemoMisses().vertexBasesOnly == 0u, "result memo misses: a compute shader without vertex fetches was counted as a vertex base change");
+    constexpr std::size_t Distinct = 320;
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, Distinct> targets{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, Distinct> tables{};
+    const auto releasedBefore = ResultMemoMisses();
+    for (std::size_t i = 0; i < Distinct; ++i) {
+        tables[i] = memoTableBuffer(targets[i]);
+        static_cast<void>(materializeMemoTable(tables[i], true));
+    }
+    const auto released = ResultMemoMisses();
+    const auto releases = released.evictedReleases - releasedBefore.evictedReleases;
+    require(releases != 0u, "result memo misses: filling the memo past its capacity released no evicted result");
+    require(released.evictedLastReferences - releasedBefore.evictedLastReferences == releases, "result memo misses: evicted results no caller holds were not counted as last references");
 }
 
 void verifyResultMemoMovedTable() {

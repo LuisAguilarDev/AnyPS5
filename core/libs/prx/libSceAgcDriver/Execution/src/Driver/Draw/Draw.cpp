@@ -972,7 +972,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 for (const auto& region : work->memory) reads.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
                 if (!P.poolLookup) return reads;
                 for (const auto& stageReads : P.decodeReads) {
-                    for (const auto& read : stageReads) reads.emplace_back(read.address, read.address + read.bytes.size());
+                    for (const auto& read : stageReads) reads.emplace_back(read.address, read.address + read.size);
                 }
                 return reads;
             };
@@ -985,7 +985,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
                 std::vector<DrawPrepPool::Range> frontReads;
                 for (const auto& stageReads : P.decodeReads) {
-                    for (const auto& read : stageReads) frontReads.emplace_back(read.address, read.address + read.bytes.size());
+                    for (const auto& read : stageReads) frontReads.emplace_back(read.address, read.address + read.size);
                 }
                 if (!frontReads.empty() && pool.WrittenBetween(startMark, seq, frontReads)) pool.NoteFrontReadConflict();
             }
@@ -1022,9 +1022,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (stagesReused != 0 && stagesCompiled == 0) ++drawEntryCounters.dataDrawsReused;
             }
             std::optional<Graphics::IndirectDrawPath> noIndirect;
-            cacheDrawStages(P.useDrawEntries, P.drawHit, w.drawParameters, noIndirect, P.programs, w.stageCaptures, P.vertexInfos, P.decodeReads, P.verifyHit, w.matched, w.fresh, P.drawKey, P.registerKey, P.decode, quiet, w.reused, P.entry, P.shapeKey);
+            cacheDrawStages(P.useDrawEntries, P.drawHit, w.drawParameters, noIndirect, P.programs, w.stageCaptures, P.vertexInfos, P.decodeReads, P.verifyHit, w.matched, P.stageData, w.fresh, P.drawKey, P.registerKey, P.decode, quiet, w.reused, P.entry, P.shapeKey);
             for (const auto& stageReads : P.decodeReads) {
-                for (const auto& read : stageReads) w.memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+                for (const auto& read : stageReads) w.memory.push_back({read.address, read.Bytes()});
             }
             if (graphics.rectList) {
                 require(P.programs.size() == 2 && w.programResults[0] != nullptr && w.programResults[1] != nullptr && w.stages.size() == 2, "rect-list requires vertex and fragment programs");

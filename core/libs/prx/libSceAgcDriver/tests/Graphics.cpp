@@ -6449,6 +6449,66 @@ void chunkDeterminismTests() {
     std::cout << "chunks record the same commands on one and on three recorder threads\n";
 }
 
+// A guest flush seals the write-only stores of a chunk's open pass as it seals the spine's
+// (Recorder::SealPassWriteOnly): two draws that write the same range only through write-only
+// bindings share the chunk's pass until such a flush, and the draw after it begins a new pass
+// behind a barrier.
+void chunkedWriteOnlySealTests() {
+    using AgcDriver::Graphics::DrawRecorders;
+    using AgcDriver::Graphics::PassAccess;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::RecordedChunk;
+    using AgcDriver::Graphics::RecordingContext;
+    mock = MockVulkan{};
+    mock.logCommands = true;
+    serializeMock = true;
+    const auto context = mockContext();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> written{{{0x10000, 0x10100}}};
+    std::vector<std::string> log;
+    {
+        Recorder recorder(context);
+        std::shared_ptr<RecordedChunk> chunk;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(recorder.Recorders() != nullptr, "the write-only seal test runs without recorder threads");
+            const auto draw = [&](std::uint32_t id) {
+                const Recorder::ChunkKeepScope scope(recorder);
+                const auto join = recorder.JoinChunk();
+                Require(chunk == nullptr || join.chunk == chunk, "a draw left the open chunk");
+                chunk = join.chunk;
+                recorder.Recorders()->Record(join.thread, join.chunk, [&written, id](RecordingContext& recording, DrawRecorders::DrawStats&) {
+                    PassAccess access{};
+                    access.writeOnly = written;
+                    const auto start = recording.StartDrawPass(1, false, false, access);
+                    const std::array<std::uint32_t, 3> ids{id, start.continued ? 1u : 0u, 0u};
+                    SerializedMock<mockCmdPushConstants>::Call(start.commands, VK_NULL_HANDLE, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(ids), ids.data());
+                    recording.LeaveRenderPassOpen(1, 0, false, access);
+                });
+            };
+            draw(0);
+            draw(1);
+            recorder.SealPassWriteOnly();
+            draw(2);
+            recorder.SealChunk();
+        }
+        DrawRecorders::Wait(*chunk);
+        Require(chunk->failure == nullptr, "a recorder thread failed the chunk");
+        {
+            std::lock_guard lock(mockCallMutex);
+            log = mock.commandLog[chunk->commands];
+        }
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    serializeMock = false;
+    const std::vector<std::string> expected{"push 0 0 0", "push 1 1 0", "end pass", "barrier", "push 2 0 0", "end pass", "barrier"};
+    std::string recorded;
+    for (const auto& command : log) recorded += " [" + command + "]";
+    Require(log == expected, "a write-only store after a guest flush continued the chunk's pass:" + recorded);
+    Require(mock.live == 0, "the write-only seal test leaked Vulkan objects");
+    std::cout << "a guest flush seals a chunk's write-only stores\n";
+}
+
 // The resource caches keep their use order with LruStamp (a hit stamps its entry, an eviction
 // orders the list first) or, with APS5_NO_LRU_STAMPS=1, by splicing on every hit: either way the
 // order an eviction sees is exactly the order of the last uses. This mode sets a ResourceCache bound
@@ -12306,6 +12366,15 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-write-only-seal") {
+#ifdef _WIN32
+            _putenv_s("APS5_DRAW_RECORD_THREADS", "2");
+#else
+            setenv("APS5_DRAW_RECORD_THREADS", "2", 1);
+#endif
+            chunkedWriteOnlySealTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {
             descriptorCacheTests();
             return 0;

@@ -338,6 +338,8 @@ public:
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
     bool ProveCurrent(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(shader, report); }
+    // Proofs of Revalidate the epoch gate skipped since the start.
+    static std::uint64_t GatedProofs();
     // FNV over the ShaderData/FlattenedSrt words, in binding order: of this object's data buffers
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
     // compiled shader's descriptors. A recipe hit refreshes the template iff the two differ.

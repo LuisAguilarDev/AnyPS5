@@ -2899,6 +2899,8 @@ RevalidateProfile& Revalidations() {
     return profile;
 }
 
+std::atomic<std::uint64_t> gatedProofs{0};
+
 // Charges the time since the last lap to a part (APS5_PROFILE_DRAW only).
 class RevalidateLap {
 public:
@@ -3498,6 +3500,10 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
     if (!report) return;
     if (count % 262144u == 0u || (count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-proofs] resource proofs: %llu reused the epoch's, %llu proved; verify: %llu checked, %llu failed; storage refreshes reused %llu\n", static_cast<unsigned long long>(reuses.load()), static_cast<unsigned long long>(proofs.load()), static_cast<unsigned long long>(checks.load()), static_cast<unsigned long long>(failures.load()), static_cast<unsigned long long>(StorageTexture::epochRefreshes.load()));
 }
+}
+
+std::uint64_t ShaderResources::GatedProofs() {
+    return gatedProofs.load(std::memory_order_relaxed);
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {

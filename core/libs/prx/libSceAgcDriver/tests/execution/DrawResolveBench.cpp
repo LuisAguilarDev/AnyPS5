@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -7,6 +8,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
@@ -16,6 +18,7 @@
 #include <exception>
 #include <initializer_list>
 #include <iostream>
+#include <new>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,9 +28,11 @@
 // frames: `hits` repeats one draw (draw-cache hits), `data` changes a pixel user word on every draw
 // (data-only hits of one template), `moved` points a pixel stage that loads its color through a
 // user-data pointer at another table on every draw (template hits whose data buffer moved, the
-// MovedReadOnlyBuffers path), `rings` moves six such pointers per draw and `buffers` four guest
-// buffer descriptors. The default run submits a short stream of each and checks that the draws hit;
-// `--benchmark hits|data|moved|rings|buffers [seconds]` submits one kind for the given time
+// MovedReadOnlyBuffers path), `rings` moves six such pointers per draw, `buffers` four guest
+// buffer descriptors and `textures` samples four guest textures through one table pointer (template
+// hits whose revalidation proves textures). The default run submits a short stream of each and
+// checks that the draws hit; `--benchmark hits|data|moved|rings|buffers|textures [seconds]` submits
+// one kind for the given time
 // (default 21 s) so the APS5_PROFILE_DRAW=1 lines ([draws], [spine]) cover two whole 10 s windows.
 
 namespace {
@@ -54,6 +59,24 @@ alignas(256) constexpr std::array<std::uint32_t, 20> BufferPixelCode{
     0xe0300000u, 0x80000000u, 0xe0300000u, 0x80010100u, 0xe0300000u, 0x80020200u, 0xe0300000u, 0x80030300u,
     0xbf8c3f70u, 0x06000101u, 0x06000102u, 0x06000103u,
     0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+// s_load_dwordx8 s[16:23], s[24:31], s[32:39], s[40:47] (four T#s) and s_load_dwordx4 s[48:51] (an
+// S#) from the table at user words 0-1, then image_sample_lz of texel (0, 0) through each T# into
+// v[0:3], v[6:9], v[10:13], v[14:17] and exports v0 + v6 + v10 + v14, v1, v2, v3: a stage sampling
+// four textures, as a game's material draws do.
+constexpr std::uint32_t TextureCount = 4;
+alignas(256) constexpr std::array<std::uint32_t, 34> TexturePixelCode{
+    0xf40c0400u, 0xfa000000u, 0xf40c0600u, 0xfa000020u, 0xf40c0800u, 0xfa000040u, 0xf40c0a00u, 0xfa000060u,
+    0xf4080c00u, 0xfa000080u, 0xbf8cc07fu,
+    0x7e0802ffu, 0x3c000000u, 0x7e0a02ffu, 0x3d000000u,
+    0xf09c0f08u, 0x01840004u, 0xf09c0f08u, 0x01860604u, 0xf09c0f08u, 0x01880a04u, 0xf09c0f08u, 0x018a0e04u,
+    0xbf8c3f70u, 0x06000106u, 0x0600010au, 0x0600010eu,
+    0xf800180fu, 0x03020100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
+// The textures a `textures` stream samples: 128x128 8_8_8_8 UNORM in the R 64 KiB swizzle, one
+// 64 KiB block each, and the table of their T#s and a point S# its draws point at.
+constexpr std::uint32_t TextureSide = 128;
+constexpr std::size_t TextureBytes = 65536;
+alignas(256) std::array<std::uint32_t, TextureCount * 8u + 4u> TextureTable{};
+std::byte* Texels = nullptr;
 // The guest ring a `buffers` stream's descriptors point into, in slices of SliceBytes.
 constexpr std::size_t RingBytes = 65536;
 constexpr std::size_t SliceBytes = 256;
@@ -102,6 +125,56 @@ struct RingBlock {
     ~RingBlock() { GuestAllocations::Mutation().Remove(Ring.data()); }
 };
 
+// The `textures` stream's texels as guest memory, and the table of their descriptors. The texels
+// are a write-watched guest arena block where there is one (Windows), so their revalidation is the
+// stamp proof a game's textures get; else host memory, whose proof is the full walk.
+struct TextureBlock {
+    TextureBlock() {
+#ifdef _WIN32
+        if (AgcDriver::GuestMemory::WriteWatched()) {
+            arena = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(TextureCount * TextureBytes, TextureBytes));
+            Require(arena != nullptr, "cannot allocate the textures");
+            GuestArena::GuestArenaCommit_nid_postfix(arena, TextureCount * TextureBytes, PAGE_READWRITE, TextureBytes);
+        }
+#endif
+        data = arena != nullptr ? arena : static_cast<std::byte*>(::operator new(TextureCount * TextureBytes, std::align_val_t{TextureBytes}));
+        for (std::uint32_t texture = 0; texture < TextureCount; ++texture) {
+            auto* texels = data + texture * TextureBytes;
+            std::fill(texels, texels + TextureBytes, static_cast<std::byte>(0x10u * (texture + 1u)));
+            const auto address = reinterpret_cast<std::uintptr_t>(texels);
+            constexpr std::uint32_t format8888Unorm = 56;
+            constexpr std::uint32_t tileR64KBX = 27;
+            constexpr std::uint32_t type2D = 9;
+            const std::array<std::uint32_t, 8> descriptor{
+                static_cast<std::uint32_t>(address >> 8u),
+                static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (format8888Unorm << 20u) | (((TextureSide - 1u) & 3u) << 30u),
+                ((TextureSide - 1u) >> 2u) | ((TextureSide - 1u) << 14u),
+                0xfacu | (tileR64KBX << 20u) | (type2D << 28u),
+                0u, 0u, 0u, 0u};
+            std::copy(descriptor.begin(), descriptor.end(), TextureTable.begin() + texture * 8u);
+        }
+        const std::array<std::uint32_t, 4> pointSampler{0x00000092u, 0x00fff000u, 0u, 0u};
+        std::copy(pointSampler.begin(), pointSampler.end(), TextureTable.begin() + TextureCount * 8u);
+        GuestAllocations::Mutation().Add(data, TextureCount * TextureBytes, true, true, true);
+        Texels = data;
+        GuestAllocations::Mutation().Add(TextureTable.data(), sizeof(TextureTable), true, true, true);
+    }
+    ~TextureBlock() {
+        GuestAllocations::Mutation().Remove(TextureTable.data());
+        GuestAllocations::Mutation().Remove(data);
+#ifdef _WIN32
+        if (arena != nullptr) {
+            GuestArena::GuestArenaReset_nid_postfix(arena, TextureCount * TextureBytes);
+            GuestArena::GuestArenaRelease_nid_postfix(arena, TextureCount * TextureBytes);
+            return;
+        }
+#endif
+        ::operator delete(data, std::align_val_t{TextureBytes});
+    }
+    std::byte* arena = nullptr;
+    std::byte* data = nullptr;
+};
+
 struct Header {
     Shader shader{};
     ShaderUserData userData{};
@@ -112,6 +185,7 @@ alignas(8) Header PixelHeader{};
 alignas(8) Header LoadingPixelHeader{};
 alignas(8) Header RingPixelHeader{};
 alignas(8) Header BufferPixelHeader{};
+alignas(8) Header TexturePixelHeader{};
 
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -181,7 +255,7 @@ std::vector<std::uint32_t> Draws(PixelStage stage, const std::vector<std::uint32
     return commands;
 }
 
-enum class Kind { Hits, Data, Moved, Rings, Buffers };
+enum class Kind { Hits, Data, Moved, Rings, Buffers, Textures };
 
 // Appends the two user words of a pointer to the table `index` (modulo the table count).
 void AppendTable(std::vector<std::uint32_t>& words, std::size_t index) {
@@ -201,6 +275,11 @@ void AppendSlice(std::vector<std::uint32_t>& words, std::size_t index) {
 // between streams.
 std::vector<std::uint32_t> Stream(Kind kind, std::size_t draws, std::uint32_t round) {
     std::vector<std::uint32_t> words;
+    if (kind == Kind::Textures) {
+        const auto table = reinterpret_cast<std::uintptr_t>(TextureTable.data());
+        for (std::size_t draw = 0; draw < draws; ++draw) words.insert(words.end(), {static_cast<std::uint32_t>(table), static_cast<std::uint32_t>(table >> 32u)});
+        return Draws({TexturePixelCode.data(), 2}, words);
+    }
     if (kind == Kind::Buffers) {
         words.reserve(draws * BufferCount * 4u);
         for (std::size_t draw = 0; draw < draws; ++draw) {
@@ -247,6 +326,27 @@ void CheckStreams() {
     const auto buffers = Submit(Stream(Kind::Buffers, draws, 0));
     const auto buffersAgain = Submit(Stream(Kind::Buffers, draws, 1));
     Require(buffersAgain.lookups - buffers.lookups == draws, "a stream moving four buffer descriptors made " + std::to_string(buffersAgain.lookups - buffers.lookups) + " draw-cache lookups of " + std::to_string(draws));
+    const auto textures = Submit(Stream(Kind::Textures, draws, 0));
+    const auto texturesAgain = Submit(Stream(Kind::Textures, draws, 1));
+    Require(texturesAgain.hits - textures.hits >= draws - 1, "a repeated stream sampling four textures made " + std::to_string(texturesAgain.hits - textures.hits) + " draw-cache hits of " + std::to_string(draws));
+}
+
+// The epoch gate of ShaderResources::Revalidate: the proofs of a stream of template hits in one
+// submission are skipped after its first, and a CPU write to a texture between two submissions (an
+// ordering point) makes the first draw of the next one prove again. APS5_VERIFY_RESCACHE_EPOCH_GATE=1
+// proves the skipped ones too and aborts on a disagreement; APS5_NO_RESCACHE_EPOCH_GATE=1 proves
+// every draw.
+void CheckEpochGate() {
+    constexpr std::size_t draws = 64;
+    const bool gate = std::getenv("APS5_NO_RESCACHE_EPOCH_GATE") == nullptr;
+    for (const std::uint8_t value : {std::uint8_t{0x10}, std::uint8_t{0x20}}) {
+        std::fill(Texels, Texels + TextureBytes, static_cast<std::byte>(value));
+        const auto before = AgcDriver::Graphics::ShaderResources::GatedProofs();
+        static_cast<void>(Submit(Stream(Kind::Textures, draws, 0)));
+        const auto gated = AgcDriver::Graphics::ShaderResources::GatedProofs() - before;
+        if (!gate) Require(gated == 0, "a stream of template hits skipped " + std::to_string(gated) + " proofs with the gate off");
+        else Require(gated + 4u >= draws && gated < draws, "a stream of " + std::to_string(draws) + " template hits after a CPU write skipped " + std::to_string(gated) + " proofs");
+    }
 }
 
 void Benchmark(Kind kind, double seconds) {
@@ -261,7 +361,7 @@ void Benchmark(Kind kind, double seconds) {
     // The draw cache's counters restart with each 10 s profile window: the [draw-cache] and
     // [spine] lines give the hits.
     const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    constexpr std::array<const char*, 5> names{"hits", "data", "moved", "rings", "buffers"};
+    constexpr std::array<const char*, 6> names{"hits", "data", "moved", "rings", "buffers", "textures"};
     std::cout << "[resolve-bench] " << names[static_cast<std::size_t>(kind)] << ": " << submitted << " draws in " << elapsed << " s (" << elapsed * 1e6 / static_cast<double>(submitted) << " us/draw wall)\n";
 }
 
@@ -270,6 +370,7 @@ Kind ParseKind(std::string_view name) {
     if (name == "moved") return Kind::Moved;
     if (name == "rings") return Kind::Rings;
     if (name == "buffers") return Kind::Buffers;
+    if (name == "textures") return Kind::Textures;
     return Kind::Hits;
 }
 
@@ -283,6 +384,7 @@ int main(int argc, char** argv) {
         }
         TargetBlock target;
         const RingBlock ring;
+        const TextureBlock textures;
         for (std::size_t slice = 0; slice < RingBytes / SliceBytes; ++slice) Ring[slice * SliceBytes / 4] = std::bit_cast<std::uint32_t>(static_cast<float>(slice % 64u) / 256.0f);
         for (std::size_t i = 0; i < TableCount; ++i) Tables[i] = {0.25f + static_cast<float>(i) / 128.0f, 0.0f, 0.0f, 0.0f};
         Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
@@ -290,10 +392,12 @@ int main(int argc, char** argv) {
         Register(LoadingPixelHeader, LoadingPixelCode.data(), sizeof(LoadingPixelCode), 1);
         Register(RingPixelHeader, RingPixelCode.data(), sizeof(RingPixelCode), 1);
         Register(BufferPixelHeader, BufferPixelCode.data(), sizeof(BufferPixelCode), 1);
+        Register(TexturePixelHeader, TexturePixelCode.data(), sizeof(TexturePixelCode), 1);
         if (argc >= 3 && std::string_view(argv[1]) == "--benchmark") {
             Benchmark(ParseKind(argv[2]), argc >= 4 ? std::strtod(argv[3], nullptr) : 21.0);
         } else {
             CheckStreams();
+            CheckEpochGate();
             std::cout << "draw streams of cache hits hit\n";
         }
         AgcDriverShutdown_nid_postfix();

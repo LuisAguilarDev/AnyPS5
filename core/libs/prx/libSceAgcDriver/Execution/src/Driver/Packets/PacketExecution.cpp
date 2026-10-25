@@ -165,6 +165,8 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 
 void Driver::execute(const Submission& submission) {
     if (FrameSteps::Enabled() && !submission.suspend) FrameSteps::NoteExecuted(submission.commands, submission.queue == 0);
+    const bool packetSteps = FrameSteps::Enabled() && !submission.suspend && submission.queue == 0;
+    const FrameSteps::ScopedNs executeSpan(packetSteps ? &FrameSteps::Global().executeNs : nullptr);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -283,6 +285,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        FrameSteps::PacketStep step(FrameSteps::Global(), header == FlipPacketHeader ? FrameSteps::FlipSlot : header == RenderingWaitPacketHeader ? FrameSteps::RenderWaitSlot : opcode, Pm4::DrawOpcode(opcode), packetSteps ? FrameSteps::NowNs : nullptr);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
@@ -326,9 +329,11 @@ void Driver::execute(const Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
+        step.Mark(FrameSteps::PhaseDrain);
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
+        step.Mark(FrameSteps::PhaseLock);
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
         if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
 
@@ -348,9 +353,11 @@ void Driver::execute(const Submission& submission) {
             continue;
         }
 
+        step.Mark(FrameSteps::PhaseFlush);
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
         timing.Mark("flush_between_packets");
+        step.Mark(FrameSteps::PhasePrepare);
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
 
         if (profilePackets) {
@@ -390,6 +397,7 @@ void Driver::execute(const Submission& submission) {
         const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
         traceLabel(packet, submission.queue);
         timing.Mark("prepare_memory");
+        step.Mark(FrameSteps::PhaseBody);
 
         const bool waitPacket = opcode == 0x3c || opcode == 0x93 || header == RenderingWaitPacketHeader;
         struct Progress {

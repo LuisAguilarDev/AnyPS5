@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
@@ -145,6 +146,7 @@ std::string_view TrimmedReason(std::string_view reason) {
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
     bool profile = false;
+    bool frameSteps = false;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
     std::chrono::steady_clock::time_point phaseLap{};
@@ -334,14 +336,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
-    phaseLap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    tail.frameSteps = FrameSteps::Enabled() && submission.queue == 0;
+    phaseLap = profile || tail.frameSteps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     tail.profile = profile;
-    tail.phaseTiming.profile = profile;
+    tail.phaseTiming.profile = profile || tail.frameSteps;
     auto& phaseTiming = tail.phaseTiming;
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[DrawRowPrologue] = std::chrono::duration<double, std::milli>(phaseLap - packetStartedAt()).count();
 
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);
+        if (tail.frameSteps) FrameSteps::NoteDrawSteps(FrameSteps::Global(), phaseMs);
         if (!profile) return DrawVerdict::Drawn;
         auto& pending = pendingDrawPhases();
         pending.phases = true;
@@ -1181,6 +1185,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const QueueState& queue = tail.queue != nullptr ? *tail.queue : noQueue;
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);
+        if (tail.frameSteps) FrameSteps::NoteDrawSteps(FrameSteps::Global(), phaseMs);
         if (!profile) return DrawVerdict::Drawn;
         auto& pending = pendingDrawPhases();
         pending.phases = true;

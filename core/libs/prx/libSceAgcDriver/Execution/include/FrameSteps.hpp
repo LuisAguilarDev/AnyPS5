@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMESTEPS_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMESTEPS_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -20,6 +21,9 @@ inline constexpr std::size_t SampleCapacity = 4096;
 inline constexpr std::size_t FlipQueueCapacity = 64;
 inline constexpr std::int64_t ReportWindowNs = 10'000'000'000;
 inline constexpr std::size_t WaitEqueue = 0, WaitSleep = 1, WaitVblank = 2, WaitEventFlag = 3, WaitSemaphore = 4, WaitCond = 5, WaitAddress = 6, KernelWaitKinds = 7;
+inline constexpr std::size_t PacketSlots = 258, FlipSlot = 256, RenderWaitSlot = 257, TopPacketSlots = 12;
+inline constexpr std::size_t PhaseGate = 0, PhaseDrain = 1, PhaseLock = 2, PhaseFlush = 3, PhasePrepare = 4, PhaseBody = 5, PacketPhases = 6;
+inline constexpr std::size_t DrawSteps = DriverDetail::DrawDriverPhaseCount;
 
 inline bool Enabled() {
     static const bool enabled = std::getenv("APS5_PROFILE_FRAME") != nullptr;
@@ -126,6 +130,11 @@ struct Totals {
     std::array<std::uint64_t, LaneThreads> recorderBusyNs{};
     std::uint64_t recorderChunks = 0, recorderDraws = 0;
     std::uint64_t vkSubmits = 0, vkSubmitNs = 0;
+    std::uint64_t executeNs = 0, drawStepDraws = 0;
+    std::array<std::uint64_t, PacketSlots> slotPackets{}, slotNs{};
+    std::array<std::uint64_t, PacketPhases> drawPhaseNs{}, otherPhaseNs{};
+    std::array<std::uint64_t, 2> phasePackets{};
+    std::array<std::uint64_t, DrawSteps> drawStepNs{};
 };
 
 struct Window {
@@ -191,6 +200,18 @@ public:
         totals.recorderDraws = take(recorderDraws);
         totals.vkSubmits = take(vkSubmits);
         totals.vkSubmitNs = take(vkSubmitNs);
+        totals.executeNs = take(executeNs);
+        totals.drawStepDraws = take(drawStepDraws);
+        for (std::size_t i = 0; i < PacketSlots; ++i) {
+            totals.slotPackets[i] = take(slotPackets[i]);
+            totals.slotNs[i] = take(slotNs[i]);
+        }
+        for (std::size_t i = 0; i < PacketPhases; ++i) {
+            totals.drawPhaseNs[i] = take(drawPhaseNs[i]);
+            totals.otherPhaseNs[i] = take(otherPhaseNs[i]);
+        }
+        for (std::size_t i = 0; i < phasePackets.size(); ++i) totals.phasePackets[i] = take(phasePackets[i]);
+        for (std::size_t i = 0; i < DrawSteps; ++i) totals.drawStepNs[i] = take(drawStepNs[i]);
         return totals;
     }
 
@@ -207,7 +228,74 @@ public:
     std::array<Counter, LaneThreads> recorderBusyNs{};
     Counter recorderChunks{0}, recorderDraws{0};
     Counter vkSubmits{0}, vkSubmitNs{0};
+    Counter executeNs{0}, drawStepDraws{0};
+    std::array<Counter, PacketSlots> slotPackets{}, slotNs{};
+    std::array<Counter, PacketPhases> drawPhaseNs{}, otherPhaseNs{};
+    std::array<Counter, 2> phasePackets{};
+    std::array<Counter, DrawSteps> drawStepNs{};
 };
+
+using StepClock = std::int64_t (*)();
+
+class PacketStep {
+public:
+    PacketStep(Counters& counters, std::size_t slot, bool draw, StepClock clock = NowNs)
+        : counters(counters), clock(clock), slot(std::min(slot, PacketSlots - 1)), draw(draw), startNs(clock != nullptr ? clock() : 0), lastNs(startNs) {}
+    PacketStep(const PacketStep&) = delete;
+    PacketStep& operator=(const PacketStep&) = delete;
+
+    ~PacketStep() {
+        if (clock == nullptr) return;
+        const auto now = clock();
+        phaseNs[phase] += now - lastNs;
+        Counters::Add(counters.slotPackets[slot], 1);
+        Counters::AddNs(counters.slotNs[slot], now - startNs);
+        Counters::Add(counters.phasePackets[draw ? 1 : 0], 1);
+        auto& phases = draw ? counters.drawPhaseNs : counters.otherPhaseNs;
+        for (std::size_t i = 0; i < PacketPhases; ++i) {
+            if (phaseNs[i] != 0) Counters::AddNs(phases[i], phaseNs[i]);
+        }
+    }
+
+    void Mark(std::size_t next) {
+        if (clock == nullptr) return;
+        const auto now = clock();
+        phaseNs[phase] += now - lastNs;
+        lastNs = now;
+        phase = std::min(next, PacketPhases - 1);
+    }
+
+private:
+    Counters& counters;
+    StepClock clock;
+    std::size_t slot;
+    bool draw;
+    std::int64_t startNs;
+    std::int64_t lastNs;
+    std::size_t phase = PhaseGate;
+    std::array<std::int64_t, PacketPhases> phaseNs{};
+};
+
+class ScopedNs {
+public:
+    explicit ScopedNs(Counters::Counter* counter) : counter(counter), startNs(counter != nullptr ? NowNs() : 0) {}
+    ScopedNs(const ScopedNs&) = delete;
+    ScopedNs& operator=(const ScopedNs&) = delete;
+    ~ScopedNs() {
+        if (counter != nullptr) Counters::AddNs(*counter, NowNs() - startNs);
+    }
+
+private:
+    Counters::Counter* counter;
+    std::int64_t startNs;
+};
+
+inline void NoteDrawSteps(Counters& counters, const std::array<double, DrawSteps>& stepMs) {
+    for (std::size_t i = 0; i < DrawSteps; ++i) {
+        if (stepMs[i] > 0) Counters::Add(counters.drawStepNs[i], static_cast<std::uint64_t>(stepMs[i] * 1e6));
+    }
+    Counters::Add(counters.drawStepDraws, 1);
+}
 
 class Frames {
 public:
@@ -264,11 +352,10 @@ private:
 
 std::string FormatGuest(const Totals& totals, const Window& window);
 std::string FormatLanes(const Totals& totals, const Window& window);
+using SlotNamer = std::string (*)(std::size_t slot);
+std::string FormatPackets(const Totals& totals, const Window& window, SlotNamer name);
 
-inline Counters& Global() {
-    static Counters* counters = new Counters();
-    return *counters;
-}
+Counters& Global();
 
 inline Frames& GlobalFrames() {
     static Frames* frames = new Frames();

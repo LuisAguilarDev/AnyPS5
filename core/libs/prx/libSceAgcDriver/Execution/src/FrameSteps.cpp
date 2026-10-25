@@ -47,6 +47,64 @@ std::string Finish(const char* text, int length) {
     return std::string(text) + "\n";
 }
 
+std::string PhaseList(const std::array<std::uint64_t, PacketPhases>& phaseNs, std::uint64_t packets) {
+    std::string list;
+    char text[32];
+    for (std::size_t i = 0; i < PacketPhases; ++i) {
+        std::snprintf(text, sizeof(text), "%s%.2f", i == 0 ? "" : "/", PerItem(Us(phaseNs[i]), packets));
+        list += text;
+    }
+    return list;
+}
+
+std::string DrawStepList(const Totals& totals) {
+    if (totals.drawStepDraws == 0) return "-";
+    std::string list;
+    char text[64];
+    for (std::size_t i = 0; i < DrawSteps; ++i) {
+        if (totals.drawStepNs[i] == 0) continue;
+        std::snprintf(text, sizeof(text), "%s%s=%.2f", list.empty() ? "" : "|", DriverDetail::DrawDriverPhaseNames[i], PerItem(Us(totals.drawStepNs[i]), totals.drawStepDraws));
+        list += text;
+    }
+    return list.empty() ? "-" : list;
+}
+
+std::string SlotLabel(std::size_t slot, SlotNamer name) {
+    if (slot == FlipSlot) return "FLIP";
+    if (slot == RenderWaitSlot) return "RENDER_WAIT";
+    if (name != nullptr) {
+        if (auto named = name(slot); !named.empty()) return named;
+    }
+    char text[16];
+    std::snprintf(text, sizeof(text), "0x%02zx", slot);
+    return text;
+}
+
+std::string TopSlots(const Totals& totals, std::uint64_t frames, SlotNamer name) {
+    std::array<std::size_t, PacketSlots> order{};
+    std::size_t used = 0;
+    for (std::size_t slot = 0; slot < PacketSlots; ++slot) {
+        if (totals.slotPackets[slot] != 0) order[used++] = slot;
+    }
+    if (used == 0) return "-";
+    const auto shown = std::min(used, TopPacketSlots);
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown), order.begin() + static_cast<std::ptrdiff_t>(used), [&](std::size_t left, std::size_t right) { return totals.slotNs[left] > totals.slotNs[right]; });
+    std::string list;
+    char text[96];
+    for (std::size_t i = 0; i < shown; ++i) {
+        const auto slot = order[i];
+        std::snprintf(text, sizeof(text), ":%.0f/f:%.2fus:%.2fms/f", PerFrame(static_cast<double>(totals.slotPackets[slot]), frames), PerItem(Us(totals.slotNs[slot]), totals.slotPackets[slot]), PerFrame(Ms(totals.slotNs[slot]), frames));
+        if (i != 0) list += ",";
+        list += SlotLabel(slot, name) + text;
+    }
+    return list;
+}
+
+}
+
+Counters& Global() {
+    static Counters* counters = new Counters();
+    return *counters;
 }
 
 std::string FormatGuest(const Totals& totals, const Window& window) {
@@ -108,6 +166,28 @@ std::string FormatLanes(const Totals& totals, const Window& window) {
         perFrameCount(totals.vkSubmits), perFrameMs(totals.vkSubmitNs), PerFrame(window.gpuBusyMs, frames),
         window.intervalMs.p50, window.intervalMs.p95, window.flipToPresentMs.p50, window.flipToPresentMs.p95, window.flipToPresentMs.mean);
     return Finish(text, length);
+}
+
+std::string FormatPackets(const Totals& totals, const Window& window, SlotNamer name) {
+    const auto frames = window.frames;
+    std::uint64_t loopPackets = 0, loopNs = 0;
+    for (std::size_t slot = 0; slot < PacketSlots; ++slot) {
+        loopPackets += totals.slotPackets[slot];
+        loopNs += totals.slotNs[slot];
+    }
+    const auto outside = [&](std::uint64_t whole, std::uint64_t part) { return PerFrame(Ms(whole > part ? whole - part : 0), frames); };
+    char text[512];
+    const auto length = std::snprintf(text, sizeof(text),
+        "[frame-steps-packets] window_s=%.1f frames=%llu loop_packets/f=%.0f loop_ms/f=%.2f us/loop_packet=%.2f execute_outside_loop_ms/f=%.2f busy_outside_execute_ms/f=%.2f ",
+        window.seconds, static_cast<unsigned long long>(frames), PerFrame(static_cast<double>(loopPackets), frames), PerFrame(Ms(loopNs), frames), PerItem(Us(loopNs), loopPackets),
+        outside(totals.executeNs, loopNs), outside(totals.packetBusyNs, totals.executeNs));
+    if (length < 0) return {};
+    std::string line(text);
+    line += "other_us/packet(gate/drain/lock/flush/prepare/body)=" + PhaseList(totals.otherPhaseNs, totals.phasePackets[0]);
+    line += " draw_us/packet(gate/drain/lock/flush/prepare/body)=" + PhaseList(totals.drawPhaseNs, totals.phasePackets[1]);
+    line += " draw_steps_us/drawn=" + DrawStepList(totals);
+    line += " top=" + TopSlots(totals, frames, name) + "\n";
+    return line;
 }
 
 }

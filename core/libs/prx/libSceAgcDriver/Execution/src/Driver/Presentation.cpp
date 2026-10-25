@@ -6,11 +6,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+std::string FrameStepSlotName(std::size_t slot) {
+    return Pm4::Name(0xc0000000u | (static_cast<std::uint32_t>(slot) << 8u));
+}
+
+}
 
 std::uint32_t Driver::ReserveEopFlip(const FlipInfo& info) {
     struct Timed {
@@ -238,6 +247,7 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     auto& output = ProfileOutput_nid_no_patch();
     output.Write(FrameSteps::FormatGuest(totals, window));
     output.Write(FrameSteps::FormatLanes(totals, window));
+    output.Write(FrameSteps::FormatPackets(totals, window, FrameStepSlotName));
 }
 
 void Driver::ReleaseWindow(void* window) {

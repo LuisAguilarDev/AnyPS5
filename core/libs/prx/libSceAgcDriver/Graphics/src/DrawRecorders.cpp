@@ -17,11 +17,16 @@ namespace {
 
 std::atomic<std::uint64_t> failAtDraw{0};
 std::atomic<std::uint64_t> recordedDraws{0};
+std::atomic<std::uint64_t> wakes{0};
 
 std::int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+}
+
+std::uint64_t DrawRecorders::Wakes() {
+    return wakes.load(std::memory_order_relaxed);
 }
 
 void DrawRecorders::FailAtDraw(std::uint64_t n) {
@@ -80,6 +85,7 @@ void DrawRecorders::push(Worker& worker, Item item) {
     worker.items.push_back(std::move(item));
     const auto queued = worker.items.size();
     lock.unlock();
+    wakes.fetch_add(1, std::memory_order_relaxed);
     worker.wake.notify_one();
     auto seen = maxQueued.load(std::memory_order_relaxed);
     while (queued > seen && !maxQueued.compare_exchange_weak(seen, queued, std::memory_order_relaxed)) {

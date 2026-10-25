@@ -74,6 +74,9 @@ public:
     // The most work items any thread had queued at once since start-up (the flood test's cap check).
     std::size_t MaxQueued() const { return maxQueued.load(std::memory_order_relaxed); }
     static constexpr std::size_t QueueDepth = 256;
+    static constexpr std::size_t HandoffDraws = 8;
+    // Wakes of the recorder threads since the start (test aid).
+    static std::uint64_t Wakes();
     // Test aid: throws from the recorder thread at its `n`th draw (1-based; 0 never).
     static void FailAtDraw(std::uint64_t n);
 

@@ -586,8 +586,8 @@ constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-
 // (indirect and mesh argument records, stencil replay pipelines, attachment proxies, completion
 // work or a lease, input capture, GPU timing, barrier validation) or a keep that records commands
 // after the work (MarkGpuWrites: copy-backs of copied regions, store backs of written storage images).
-enum SpinePath : std::size_t { SpineSplit, SpineSwitchedOff, SpineIndirect, SpineStencil, SpineProxy, SpineCompletion, SpineCapture, SpineTiming, SpineValidate, SpineCopyBacks, SpineStorageWrites, SpineNone, SpinePathCount = SpineNone };
-constexpr std::array<const char*, SpinePathCount> SpinePathNames{"split", "switched off", "indirect or mesh", "stencil replay", "attachment proxy", "completion or lease", "capture", "gpu timing", "barrier validation", "copy-backs", "storage writes"};
+enum SpinePath : std::size_t { SpineSplit, SpineSwitchedOff, SpineIndirect, SpineStencil, SpineProxy, SpineCompletion, SpineCapture, SpineTiming, SpineValidate, SpineCopyBacks, SpineStorageWrites, SpineLinearTarget, SpineNone, SpinePathCount = SpineNone };
+constexpr std::array<const char*, SpinePathCount> SpinePathNames{"split", "switched off", "indirect or mesh", "stencil replay", "attachment proxy", "completion or lease", "capture", "gpu timing", "barrier validation", "copy-backs", "storage writes", "linear target"};
 // What became of one draw, for the totals.
 struct DrawOutcome {
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
@@ -2663,6 +2663,7 @@ SpinePath spinePath(const State& state, std::span<const CompiledShader> shaders,
     if (Recorder::BarrierValidate()) return SpineValidate;
     if (resources.OwesCopyBacks()) return SpineCopyBacks;
     if (resources.WritesStorageImages()) return SpineStorageWrites;
+    if (std::ranges::any_of(record.targets, [](const std::shared_ptr<StorageTexture>& target) { return target != nullptr && target->Descriptor().tileMode == TextureTileMode::kLinear; })) return SpineLinearTarget;
     return SpineSplit;
 }
 

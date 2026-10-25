@@ -25,6 +25,7 @@
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
+namespace AgcDriver::GuestMemory { struct UnchangedQuery; }
 
 namespace AgcDriver::Graphics {
 
@@ -338,7 +339,7 @@ public:
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
     bool ProveCurrent(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(shader, report); }
-    // Proofs of Revalidate the epoch gate skipped since the start.
+    // Proofs of Revalidate the epoch gate skipped since the start (see provedUnchanged).
     static std::uint64_t GatedProofs();
     // FNV over the ShaderData/FlattenedSrt words, in binding order: of this object's data buffers
     // as the recorded work will find them (maintained by addDataBuffer and RefreshData), and of a
@@ -587,6 +588,30 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    // The epoch gate of Revalidate (APS5_NO_RESCACHE_EPOCH_GATE=1 turns it off): what the last
+    // plain fast proof of this object saw, so that a Revalidate in the same collect epoch skips the
+    // proof while nothing it read moved. The collects of the textures' memory repeat the epoch's
+    // first walk within the epoch, so the proof's answer can only change through the counters below
+    // (the pending registry, depth surfaces, unwatched and reallocated memory, a present), an image
+    // evicted or refreshed (its generation), or a stamp on the proved memory (UnchangedSinceAll).
+    // Objects with DCC keys or storage-image keys keep the proof.
+    struct ProofMemo {
+        std::uint64_t epoch = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t depthSurfaces = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t presents = 0;
+        bool operator==(const ProofMemo& other) const {
+            return epoch == other.epoch && pendingSerial == other.pendingSerial && depthSurfaces == other.depthSurfaces && unwatched == other.unwatched && allocations == other.allocations && presents == other.presents;
+        }
+    };
+    static ProofMemo currentProofMemo(std::uint64_t pendingSerial);
+    // Whether the memo still stands; `refusal` receives why not (GateRefusal).
+    bool provedUnchanged(const ProofMemo& now, std::size_t& refusal) const;
+    // Records the memo after a plain fast proof that ran from `before` with nothing moving through
+    // it, or clears it.
+    void noteProofMemo(const ProofMemo& before);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
@@ -686,6 +711,11 @@ private:
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
+    // The epoch gate's memo (provedUnchanged): its counters (epoch 0: none), and the memory queries
+    // and image generations the next proof would make.
+    ProofMemo proofMemo;
+    std::vector<GuestMemory::UnchangedQuery> proofQueries;
+    std::vector<std::pair<const StorageTexture*, std::uint64_t>> proofImages;
     // Draws of one cached template may be recorded on several threads at once: this serializes the
     // uses that write its per-use state, the proof records above (Revalidate) and its buffers' GPU
     // copy-back marks (MarkGpuWrites). Taken after the GPU lock, which a proof takes first (see

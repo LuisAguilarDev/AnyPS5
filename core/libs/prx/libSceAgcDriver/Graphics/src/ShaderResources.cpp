@@ -2901,6 +2901,25 @@ RevalidateProfile& Revalidations() {
 
 std::atomic<std::uint64_t> gatedProofs{0};
 
+// Why the epoch gate kept a proof (APS5_PROFILE_DRAW): no memo (a first proof, a full walk, keys,
+// T1), another collect epoch, a counter moved, an image evicted or refreshed, a stamp on the proved
+// memory.
+enum GateRefusal : std::size_t { GateNoMemo, GateEpoch, GateCounters, GateImage, GateStamped, GateRefusalCount };
+constexpr std::array<const char*, GateRefusalCount> GateRefusalNames{"no memo", "epoch", "counters", "image", "stamped"};
+std::array<std::atomic<std::uint64_t>, GateRefusalCount> gateRefusals{};
+
+bool EpochGate() {
+    static const bool enabled = std::getenv("APS5_NO_RESCACHE_EPOCH_GATE") == nullptr;
+    return enabled;
+}
+
+// APS5_VERIFY_RESCACHE_EPOCH_GATE=1: a gated Revalidate runs the proof anyway and aborts when the
+// proof refuses what the gate accepted.
+bool VerifyEpochGate() {
+    static const bool verify = std::getenv("APS5_VERIFY_RESCACHE_EPOCH_GATE") != nullptr;
+    return verify;
+}
+
 // Charges the time since the last lap to a part (APS5_PROFILE_DRAW only).
 class RevalidateLap {
 public:
@@ -2999,7 +3018,8 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)));
+    const auto kept = byReason(gateRefusals, GateRefusalNames);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped, %llu proofs skipped (proofs kept by reason:%s); lookup log: %llu builds and full walks kept their records past the bound\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(gatedProofs.load(std::memory_order_relaxed)), kept.c_str(), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)));
     std::string parts;
     for (std::size_t i = 0; i < RevalidatePartNames.size(); ++i) {
         const auto count = profile.partCalls[i].exchange(0, std::memory_order_relaxed);
@@ -3506,6 +3526,47 @@ std::uint64_t ShaderResources::GatedProofs() {
     return gatedProofs.load(std::memory_order_relaxed);
 }
 
+ShaderResources::ProofMemo ShaderResources::currentProofMemo(std::uint64_t pendingSerial) {
+    return {GuestMemory::CollectEpoch(), pendingSerial, DepthSurfacesSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), Recorder::Presents()};
+}
+
+bool ShaderResources::provedUnchanged(const ProofMemo& now, std::size_t& refusal) const {
+    if (proofMemo.epoch == 0) return refusal = GateNoMemo, false;
+    if (now.epoch != proofMemo.epoch) return refusal = GateEpoch, false;
+    if (!(now == proofMemo)) return refusal = GateCounters, false;
+    for (const auto& [image, generation] : proofImages) {
+        if (!image->Cached() || image->Generation() != generation) return refusal = GateImage, false;
+    }
+    if (!proofQueries.empty() && !GuestMemory::UnchangedSinceAll(proofQueries)) return refusal = GateStamped, false;
+    return true;
+}
+
+void ShaderResources::noteProofMemo(const ProofMemo& before) {
+    proofMemo = {};
+    proofQueries.clear();
+    proofImages.clear();
+    if (before.epoch == 0 || !(currentProofMemo(StorageTexture::PendingSerial()) == before)) return;
+    for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (surface.depth) continue;
+        if (surface.resource.dccAddress != 0 || (surface.source != nullptr && surface.source->Descriptor().dccAddress != 0)) return;
+        if (surface.source != nullptr) {
+            proofQueries.push_back({surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes), surface.source->Generation()});
+            proofImages.emplace_back(surface.source, surface.source->Generation());
+        } else {
+            proofQueries.push_back({surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes), surface.generation});
+        }
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        const auto* image = storageTextures[i].get();
+        if (image == nullptr || i >= storageKeys.size() || storageKeys[i] != 0 || image->Descriptor().dccAddress != 0) return;
+        if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
+        proofQueries.push_back({image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()), image->Generation()});
+        proofImages.emplace_back(image, image->Generation());
+    }
+    proofMemo = before;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
@@ -3568,6 +3629,14 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    // (0) The epoch gate (provedUnchanged): the counters are read with the serial, before any check,
+    // and recorded after a plain fast proof only when nothing moved through the whole call.
+    const auto memoBefore = EpochGate() && !noFast ? currentProofMemo(serialBefore) : ProofMemo{};
+    std::size_t refusal = GateRefusalCount;
+    const bool gated = memoBefore.epoch != 0 && provedUnchanged(memoBefore, refusal);
+    if (gated) gatedProofs.fetch_add(1, std::memory_order_relaxed);
+    else if (profile && memoBefore.epoch != 0) gateRefusals[refusal].fetch_add(1, std::memory_order_relaxed);
+    const bool verifyGate = gated && VerifyEpochGate();
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -3658,7 +3727,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    bool fast = (gated && !verifyGate) || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
+    if (verifyGate && !fast) {
+        std::fprintf(stderr, "[rescache] APS5_VERIFY_RESCACHE_EPOCH_GATE: the epoch gate accepted a template its fast proof refuses (%s)\n", FastFailNames[static_cast<std::size_t>(reason)]);
+        std::fflush(stderr);
+        std::abort();
+    }
+    const bool plainProof = fast && overlapping.empty() && !accepted;
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3781,6 +3856,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     lap(RevalidatePart::Staging);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    if (!gated) noteProofMemo(plainProof ? memoBefore : ProofMemo{});
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }

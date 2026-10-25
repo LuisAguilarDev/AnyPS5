@@ -128,7 +128,7 @@ struct Totals {
     std::uint64_t fifoFullNs = 0, fifoDrainNs = 0, fifoEmptyNs = 0, fifoDepthSum = 0, fifoEnqueued = 0;
     std::uint64_t spineBusyNs = 0, spineCommits = 0, drawCommits = 0, drawCommitNs = 0;
     std::array<std::uint64_t, LaneThreads> recorderBusyNs{};
-    std::uint64_t recorderChunks = 0, recorderDraws = 0, keepSealedChunks = 0;
+    std::uint64_t recorderChunks = 0, recorderDraws = 0, keepSealedChunks = 0, chunkEpochJoins = 0;
     std::uint64_t vkSubmits = 0, vkSubmitNs = 0;
     std::uint64_t executeNs = 0, drawStepDraws = 0;
     std::array<std::uint64_t, PacketSlots> slotPackets{}, slotNs{};
@@ -199,6 +199,7 @@ public:
         totals.recorderChunks = take(recorderChunks);
         totals.recorderDraws = take(recorderDraws);
         totals.keepSealedChunks = take(keepSealedChunks);
+        totals.chunkEpochJoins = take(chunkEpochJoins);
         totals.vkSubmits = take(vkSubmits);
         totals.vkSubmitNs = take(vkSubmitNs);
         totals.executeNs = take(executeNs);
@@ -227,7 +228,7 @@ public:
     Counter fifoFullNs{0}, fifoDrainNs{0}, fifoEmptyNs{0}, fifoDepthSum{0}, fifoEnqueued{0};
     Counter spineBusyNs{0}, spineCommits{0}, drawCommits{0}, drawCommitNs{0};
     std::array<Counter, LaneThreads> recorderBusyNs{};
-    Counter recorderChunks{0}, recorderDraws{0}, keepSealedChunks{0};
+    Counter recorderChunks{0}, recorderDraws{0}, keepSealedChunks{0}, chunkEpochJoins{0};
     Counter vkSubmits{0}, vkSubmitNs{0};
     Counter executeNs{0}, drawStepDraws{0};
     std::array<Counter, PacketSlots> slotPackets{}, slotNs{};

@@ -3430,7 +3430,14 @@ Recorder::ChunkJoin Recorder::JoinChunk() {
     if (joinable != nullptr && joinable->draws < ChunkDraws()) {
         ++joinable->draws;
         ++chunkTotals.draws;
-        return {joinable, joinableThread, false};
+        const auto epoch = GuestMemory::CollectEpoch();
+        const bool moved = joinable->spineEpoch != epoch;
+        if (moved) {
+            joinable->spineEpoch = epoch;
+            ++chunkTotals.epochJoins;
+            if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().chunkEpochJoins, 1);
+        }
+        return {joinable, joinableThread, false, moved};
     }
     SealChunk();
     // At most MaxChunksInFlight unfinished chunks per batch: the oldest is waited for first.
@@ -3485,6 +3492,7 @@ Recorder::ChunkJoin Recorder::JoinChunk() {
     joinableThread = recorders->Assign();
     ++chunkTotals.chunks;
     ++chunkTotals.draws;
+    chunk->spineEpoch = GuestMemory::CollectEpoch();
     return {chunk, joinableThread, true};
 }
 

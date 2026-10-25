@@ -197,6 +197,7 @@ public:
         std::shared_ptr<RecordedChunk> chunk;
         std::size_t thread = 0;
         bool fresh = false;
+        bool epochMoved = false;
     };
     DrawRecorders* Recorders();
     ChunkJoin JoinChunk();
@@ -237,6 +238,7 @@ public:
         std::uint64_t maxInFlight = 0;
         std::uint64_t failedChunks = 0;
         std::uint64_t keepSealed = 0;
+        std::uint64_t epochJoins = 0;
     };
     ChunkCounters ChunkTotals() const { return chunkTotals; }
     void NoteKeepSealed();

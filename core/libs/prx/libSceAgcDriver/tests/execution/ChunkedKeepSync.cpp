@@ -63,7 +63,7 @@ constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
 
-alignas(256) std::array<std::array<std::uint32_t, 16>, 4> Programs{};
+alignas(256) std::array<std::array<std::uint32_t, 16>, 8> Programs{};
 std::size_t programCount = 0;
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -255,6 +255,30 @@ bool Expect(AgcDriver::VulkanDevice& device) {
 
 }
 
+bool ExpectEpochJoins(AgcDriver::VulkanDevice& device) {
+    using ShaderRecompiler::PixelInput;
+    using ShaderRecompiler::PixelInputBit;
+    using AgcDriver::Graphics::Recorder;
+    Block block(TargetBlockBytes);
+    const auto color = DecodeTarget(block, Rgba32FloatInfo, Height);
+    Draw(device, color, Height, PixelInputBit(PixelInput::PositionFixedPoint), Program(ZeroConstant));
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder->Recorders() == nullptr) return false;
+    const auto before = recorder->ChunkTotals();
+    Draw(device, color, Height, PixelInputBit(PixelInput::PositionFixedPoint), Program(ZeroConstant));
+    const auto same = recorder->ChunkTotals();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Draw(device, color, Height, PixelInputBit(PixelInput::PositionFixedPoint), Program(OneConstant));
+    const auto after = recorder->ChunkTotals();
+    device.WaitIdle();
+    AgcDriver::Graphics::StorageTexture::FlushPending(block.Address(), static_cast<std::size_t>(color.bytes), nullptr, "test read-back");
+    device.WaitIdle();
+    Require(same.chunks == before.chunks && after.chunks == before.chunks, "the draws did not share one chunk");
+    Require(same.epochJoins == before.epochJoins, "a join within the spine's collect epoch was counted");
+    Require(after.epochJoins == before.epochJoins + 1, "the join after an ordering point of the spine was not counted");
+    return true;
+}
+
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_DRAW_RECORD_THREADS", "2");
@@ -268,6 +292,10 @@ int main() {
         if (!device) return VulkanTestSkipped;
         if (!Expect(*device)) {
             std::puts("chunked keep sync test skipped: no draw recorder threads");
+            return VulkanTestSkipped;
+        }
+        if (!ExpectEpochJoins(*device)) {
+            std::puts("chunked epoch join test skipped: no draw recorder threads");
             return VulkanTestSkipped;
         }
         std::puts("chunked keep sync tests passed");

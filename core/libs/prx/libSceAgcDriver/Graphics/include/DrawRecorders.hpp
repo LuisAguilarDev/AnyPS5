@@ -40,6 +40,7 @@ struct RecordedChunk {
     // Spine only: the draws that joined it, and whether its seal was dispatched.
     std::uint32_t draws = 0;
     bool sealed = false;
+    std::uint64_t spineEpoch = 0;
 };
 
 // The recorder threads (APS5_DRAW_RECORD_THREADS) of one recorder: each records the chunks given

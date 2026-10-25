@@ -244,6 +244,9 @@ public:
     void NoteKeepSealed();
     static void SyncAfterChunkedKeep(bool enabled);
     static bool SyncsAfterChunkedKeep();
+    static bool ChecksRecordInputs();
+    static void NoteStaleRecordInput(std::uint64_t address, std::size_t bytes);
+    static void NoteStaleRecordResources(std::uint64_t before, std::uint64_t after);
     // How often Commands() handed out the spine's command buffer: a chunked draw whose keep recorded
     // commands (a depth store-back, say) seals its chunk, so no later draw runs before them.
     std::uint64_t CommandRequests() const { return commandRequests; }

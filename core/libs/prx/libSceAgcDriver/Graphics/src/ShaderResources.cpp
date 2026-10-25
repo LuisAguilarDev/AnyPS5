@@ -3601,6 +3601,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    revalidateGeneration.fetch_add(1, std::memory_order_relaxed);
     const UseScope use(*this, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     RevalidateLap lap(profile);
@@ -4701,6 +4702,7 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
 
 bool ShaderResources::refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder) {
     Require(shader.program != nullptr, "missing compiled shader");
+    revalidateGeneration.fetch_add(1, std::memory_order_relaxed);
     const auto& program = *shader.program;
     Require(program.bindings.size() == bindings.size(), "template bindings disagree with the shader");
     bool recorded = false;
@@ -6045,6 +6047,41 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
+}
+
+void ShaderResources::GuestInputDigests(std::span<const MovedBuffer> moved, const std::vector<std::uint8_t>* pendingWrites, std::vector<GuestInputDigest>& digests) const {
+    digests.clear();
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    guestMemory.InPlaceReads(reads);
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end() && !override->words.empty()) continue;
+        std::uint64_t address = item.address;
+        std::size_t size = item.size;
+        if (override != moved.end()) {
+            address = override->address;
+            size = override->size;
+        } else {
+            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            if (!direct || (pendingWrites != nullptr && index < pendingWrites->size() && (*pendingWrites)[index] != 0)) continue;
+        }
+        const auto begin = address - item.adjustment;
+        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (bytes == 0 || bytes > maxDrawSnapshotBytes) continue;
+        digests.push_back({begin, bytes, DigestGuestBytes(begin, bytes)});
+    }
+}
+
+std::uint64_t ShaderResources::DigestGuestBytes(std::uint64_t address, std::size_t bytes) {
+    constexpr std::uint64_t FnvOffset = 0xcbf29ce484222325ull;
+    constexpr std::uint64_t FnvPrime = 0x100000001b3ull;
+    const auto* data = reinterpret_cast<const unsigned char*>(address);
+    std::uint64_t digest = FnvOffset;
+    for (std::size_t index = 0; index < bytes; ++index) digest = (digest ^ data[index]) * FnvPrime;
+    return digest;
 }
 
 void ShaderResources::PendingSnapshotWrites(Recorder& recorder, std::span<const MovedBuffer> moved, std::vector<std::uint8_t>& pendingWrites) const {

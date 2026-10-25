@@ -241,6 +241,14 @@ public:
     // Per allocation, whether recorded work writes the range a draw snapshot would copy (what
     // PrepareDrawBindings asks Recorder::PendingWriteOverlaps for; 0 where it would not ask).
     void PendingSnapshotWrites(Recorder& recorder, std::span<const MovedBuffer> moved, std::vector<std::uint8_t>& pendingWrites) const;
+    struct GuestInputDigest {
+        std::uint64_t address;
+        std::size_t bytes;
+        std::uint64_t digest;
+    };
+    void GuestInputDigests(std::span<const MovedBuffer> moved, const std::vector<std::uint8_t>* pendingWrites, std::vector<GuestInputDigest>& digests) const;
+    static std::uint64_t DigestGuestBytes(std::uint64_t address, std::size_t bytes);
+    std::uint64_t RevalidateGeneration() const { return revalidateGeneration.load(std::memory_order_relaxed); }
     // Whether MarkGpuWrites records commands after the work: copy-backs of copied regions, and store
     // backs of written storage images. Such a use must keep that order (see recordDraw).
     bool OwesCopyBacks() const { return guestMemory.OwesCopyBacks(); }
@@ -708,6 +716,7 @@ private:
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
+    std::atomic<std::uint64_t> revalidateGeneration{0};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

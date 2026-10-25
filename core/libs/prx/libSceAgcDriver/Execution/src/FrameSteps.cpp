@@ -153,7 +153,7 @@ std::string FormatLanes(const Totals& totals, const Window& window) {
         "packet_busy_ms/f=%.2f packet_idle_ms/f=%.2f us/packet=%.2f packet_lock_wait_ms/f=%.2f packet_lock_hold_ms/f=%.2f packet_pool_wait_ms/f=%.2f "
         "prep_busy_ms/f(sum/max)=%.2f/%.2f prep_threads=%s prep_turn_wait_ms/f=%.2f prep_jobs/f=%.1f "
         "fifo_full_ms/f=%.2f fifo_drain_ms/f=%.2f fifo_empty_ms/f=%.2f fifo_depth=%.2f "
-        "spine_busy_ms/f=%.2f spine_commits/f=%.0f draw_commit_us=%.2f spine_lock_hold_ms/f=%.2f spine_lock_wait_ms/f=%.2f chunks/f=%.1f draws/chunk=%.1f keep_sealed/f=%.1f epoch_joins/f=%.1f "
+        "spine_busy_ms/f=%.2f spine_commits/f=%.0f draw_commit_us=%.2f spine_lock_hold_ms/f=%.2f spine_lock_wait_ms/f=%.2f chunks/f=%.1f draws/chunk=%.1f keep_sealed/f=%.1f epoch_joins/f=%.1f stale_inputs/f=%.1f stale_resources/f=%.1f "
         "rec_busy_ms/f(sum/max)=%.2f/%.2f rec_threads=%s "
         "vk_submits/f=%.1f vk_submit_ms/f=%.2f gpu_busy_ms/f=%.2f "
         "present_interval_ms(p50/p95)=%.2f/%.2f flip_to_present_ms(p50/p95/mean)=%.2f/%.2f/%.2f",
@@ -161,7 +161,7 @@ std::string FormatLanes(const Totals& totals, const Window& window) {
         perFrameMs(totals.packetBusyNs), perFrameMs(totals.packetIdleNs), PerItem(Us(totals.packetBusyNs), totals.packetPackets), perFrameMs(totals.lockWaitNs[PacketRole]), perFrameMs(totals.lockHoldNs[PacketRole]), perFrameMs(totals.packetPoolWaitNs),
         prepSum, prepMax, prepThreads.c_str(), perFrameMs(totals.prepTurnWaitNs), perFrameCount(totals.prepJobs),
         perFrameMs(totals.fifoFullNs), perFrameMs(totals.fifoDrainNs), perFrameMs(totals.fifoEmptyNs), PerItem(static_cast<double>(totals.fifoDepthSum), totals.fifoEnqueued),
-        perFrameMs(totals.spineBusyNs), perFrameCount(totals.spineCommits), PerItem(Us(totals.drawCommitNs), totals.drawCommits), perFrameMs(totals.lockHoldNs[SpineRole]), perFrameMs(totals.lockWaitNs[SpineRole]), perFrameCount(totals.recorderChunks), PerItem(static_cast<double>(totals.recorderDraws), totals.recorderChunks), perFrameCount(totals.keepSealedChunks), perFrameCount(totals.chunkEpochJoins),
+        perFrameMs(totals.spineBusyNs), perFrameCount(totals.spineCommits), PerItem(Us(totals.drawCommitNs), totals.drawCommits), perFrameMs(totals.lockHoldNs[SpineRole]), perFrameMs(totals.lockWaitNs[SpineRole]), perFrameCount(totals.recorderChunks), PerItem(static_cast<double>(totals.recorderDraws), totals.recorderChunks), perFrameCount(totals.keepSealedChunks), perFrameCount(totals.chunkEpochJoins), perFrameCount(totals.staleRecordInputs), perFrameCount(totals.staleRecordResources),
         recSum, recMax, recThreads.c_str(),
         perFrameCount(totals.vkSubmits), perFrameMs(totals.vkSubmitNs), PerFrame(window.gpuBusyMs, frames),
         window.intervalMs.p50, window.intervalMs.p95, window.flipToPresentMs.p50, window.flipToPresentMs.p95, window.flipToPresentMs.mean);

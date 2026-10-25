@@ -3406,6 +3406,25 @@ bool Recorder::SyncsAfterChunkedKeep() {
     return syncAfterChunkedKeep.load(std::memory_order_relaxed);
 }
 
+bool Recorder::ChecksRecordInputs() {
+    static const bool checks = std::getenv("APS5_CHECK_RECORD_INPUTS") != nullptr;
+    return checks;
+}
+
+void Recorder::NoteStaleRecordInput(std::uint64_t address, std::size_t bytes) {
+    static std::atomic<std::uint64_t> noted{0};
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().staleRecordInputs, 1);
+    constexpr std::uint64_t LoggedStaleRecords = 16;
+    if (noted.fetch_add(1, std::memory_order_relaxed) < LoggedStaleRecords) std::fprintf(stderr, "[record-inputs] guest input changed between hand-off and record: address=0x%llx bytes=%zu\n", static_cast<unsigned long long>(address), bytes);
+}
+
+void Recorder::NoteStaleRecordResources(std::uint64_t before, std::uint64_t after) {
+    static std::atomic<std::uint64_t> noted{0};
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().staleRecordResources, 1);
+    constexpr std::uint64_t LoggedStaleRecords = 16;
+    if (noted.fetch_add(1, std::memory_order_relaxed) < LoggedStaleRecords) std::fprintf(stderr, "[record-inputs] shared resources revalidated between hand-off and record: generation %llu -> %llu\n", static_cast<unsigned long long>(before), static_cast<unsigned long long>(after));
+}
+
 void Recorder::SealChunk() {
     if (joinable == nullptr) return;
     auto chunk = std::move(joinable);

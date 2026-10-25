@@ -191,6 +191,8 @@ void CheckFormatting() {
     totals.recorderDraws = 250;
     totals.keepSealedChunks = 3;
     totals.chunkEpochJoins = 4;
+    totals.staleRecordInputs = 6;
+    totals.staleRecordResources = 2;
     totals.vkSubmits = 8;
     totals.vkSubmitNs = static_cast<std::uint64_t>(1 * Ms);
     FrameSteps::Window window;
@@ -233,7 +235,7 @@ void CheckFormatting() {
     Contains(lanes, "prep_busy_ms/f(sum/max)=4.00/3.00 ");
     Contains(lanes, "rec_busy_ms/f(sum/max)=2.00/2.00 ");
     Contains(lanes, "rec_threads=0.00/0.00/2.00 ");
-    Contains(lanes, "chunks/f=5.0 draws/chunk=25.0 keep_sealed/f=1.5 epoch_joins/f=2.0 ");
+    Contains(lanes, "chunks/f=5.0 draws/chunk=25.0 keep_sealed/f=1.5 epoch_joins/f=2.0 stale_inputs/f=3.0 stale_resources/f=1.0 ");
     Contains(lanes, "vk_submits/f=4.0 vk_submit_ms/f=0.50 ");
     Contains(lanes, "gpu_busy_ms/f=10.00 ");
     Require(lanes.back() == '\n', "the lanes line does not end the line");

@@ -2903,6 +2903,9 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         bool readsTarget = false;
         std::vector<std::uint8_t> pendingWrites;
         DrawPassInputs pass;
+        bool checksInputs = false;
+        std::uint64_t resourcesGeneration = 0;
+        std::vector<ShaderResources::GuestInputDigest> inputDigests;
     };
     auto half = std::make_shared<Half>(Half{context, state, draw});
     half->context.recorder = nullptr;
@@ -2931,11 +2934,22 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
     half->readsTarget = readsTarget;
     half->pendingWrites = pendingWrites;
     half->pass = pass;
+    if (Recorder::ChecksRecordInputs()) {
+        half->checksInputs = true;
+        half->resourcesGeneration = record.resources->RevalidateGeneration();
+        record.resources->GuestInputDigests(half->moved, &half->pendingWrites, half->inputDigests);
+    }
     {
         const Recorder::ChunkKeepScope scope(recorder);
         const auto join = recorder.JoinChunk();
         const auto requests = recorder.CommandRequests();
         recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording, DrawRecorders::DrawStats& stats) {
+            if (half->checksInputs) {
+                if (const auto generation = half->record.resources->RevalidateGeneration(); generation != half->resourcesGeneration) Recorder::NoteStaleRecordResources(half->resourcesGeneration, generation);
+                for (const auto& input : half->inputDigests) {
+                    if (ShaderResources::DigestGuestBytes(input.address, input.bytes) != input.digest) Recorder::NoteStaleRecordInput(input.address, input.bytes);
+                }
+            }
             DrawTimer timer(DrawRecorders::Profiled());
             DrawOutcome unreported;
             static_cast<void>(recordDrawHalf(half->context, recording, half->state, half->draw, {}, half->inputs, half->record, half->passKey, half->readsTarget, false, &half->pendingWrites, half->pass, unreported, timer, nullptr));

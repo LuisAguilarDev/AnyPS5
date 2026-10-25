@@ -136,6 +136,8 @@ bool Replay(const char* path) {
                 const auto runtime = memory.MakeRuntime(request.request.context.userData, request.request.shader.codeAddress);
                 phase = "capture";
                 const auto capture = invocation->Capture(runtime);
+                const auto& use = capture->userDataUse;
+                std::printf("  user data use: as value 0x%llx, as base 0x%llx, as buffer base 0x%llx\n", static_cast<unsigned long long>(use.asValue), static_cast<unsigned long long>(use.asBase), static_cast<unsigned long long>(use.asBufferBase));
                 phase = "materialize";
                 const auto result = invocation->Materialize(*capture);
                 std::printf("  materialized: %zu SPIR-V words\n", result->spirv.size());

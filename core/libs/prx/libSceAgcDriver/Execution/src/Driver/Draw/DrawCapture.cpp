@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <exception>
 #include <typeinfo>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -56,6 +57,22 @@ void TraceShaderRequestFailure(std::uint64_t token, const Submission& submission
                 static_cast<unsigned>(program.binary.stage), static_cast<unsigned>(program.snapshot->type), reason.c_str());
     } catch (...) {
     }
+}
+
+bool DumpedDrawProgram(std::uint64_t codeAddress) {
+    static const std::vector<std::uint64_t> programs = [] {
+        std::vector<std::uint64_t> listed;
+        const char* text = std::getenv("APS5_DUMP_DRAW_PROGRAMS");
+        while (text != nullptr && *text != '\0') {
+            char* end = nullptr;
+            const auto address = std::strtoull(text, &end, 16);
+            if (end == text) break;
+            listed.push_back(address);
+            text = *end == ',' ? end + 1 : end;
+        }
+        return listed;
+    }();
+    return std::find(programs.begin(), programs.end(), codeAddress) != programs.end();
 }
 
 }
@@ -121,6 +138,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
     }
     request.context.memory = memory;
+    if (DumpedDrawProgram(program.binary.codeAddress)) static_cast<void>(dumpRequest(program.binary.codeAddress, request, ".draw"));
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;

@@ -131,6 +131,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_DRAW_UPLOAD_MAX` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 4096 | largest draw snapshot in bytes copied into the per-recorder upload chunk; 0 turns the chunk off |
 | `APS5_DUMP_COMPUTE_MIN_WORDS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | only captures compute pipelines whose SPIR-V has at least this many words |
 | `APS5_DUMP_COMPUTE_PIPELINES` | string | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | directory in which captured compute pipelines are written |
+| `APS5_DUMP_DRAW_PROGRAMS` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawCapture.cpp` |  | comma-separated hex shader code addresses; the first capture of each listed draw stage writes its request, with the captured memory, to shader_<address>.draw.req for agc_shader_replay |
 | `APS5_DUMP_DRAW_SHADERS` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp` | 0 | hex color-target or slot-0 address whose draw's shaders are dumped |
 | `APS5_DUMP_DRAW_SLOT1` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/Draw.cpp` | 0 | hex slot-1 address whose draw's shaders and register state are dumped |
 | `APS5_DUMP_FRAMES` | integer | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` | 0 | saves the first n presented frames as frame_<index>.bmp |

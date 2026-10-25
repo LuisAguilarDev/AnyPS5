@@ -370,6 +370,7 @@ struct EmissionFailure {
 constexpr std::size_t ResultMemoSets = 64;
 constexpr std::size_t ResultMemoWays = 4;
 using ResultMemoTable = std::array<ResultMemoEntry, ResultMemoSets * ResultMemoWays>;
+using SnapshotParts = std::array<std::uint64_t, static_cast<std::size_t>(ResultMemoMissComponent::Count)>;
 
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
@@ -391,6 +392,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::uint64_t memoClock = 0;
     // The newest memo entry of each forwarded-user-word shape, a donor for patching (under mutex).
     std::unordered_map<std::uint64_t, ResultMemoEntry*> memoShapes;
+    std::unordered_map<std::uint64_t, SnapshotParts> memoNewestParts;
 };
 
 namespace {
@@ -1383,12 +1385,95 @@ std::atomic<std::uint64_t>& memoUserWordPatches() {
 
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, misses{0}, evictions{0}, populateNanoseconds{0}, patched{0};
+    std::atomic<std::uint64_t> hashNanoseconds{0}, lookupWaitNanoseconds{0}, lookupHeldNanoseconds{0}, insertWaitNanoseconds{0}, insertHeldNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
 ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
     return counters;
+}
+
+struct ResultMemoMissCounters {
+    std::atomic<std::uint64_t> firstSeen{0}, unchanged{0}, userDataOnly{0}, basesOnly{0}, basesAndSrtOnly{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
+};
+
+ResultMemoMissCounters& resultMemoMissCounters() {
+    static ResultMemoMissCounters counters;
+    return counters;
+}
+
+std::uint64_t elapsedNanoseconds(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+class MemoLockSpan {
+public:
+    MemoLockSpan(bool profile, std::atomic<std::uint64_t>& wait, std::atomic<std::uint64_t>& held) : profile(profile), wait(wait), held(held), started(profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    MemoLockSpan(const MemoLockSpan&) = delete;
+    MemoLockSpan& operator=(const MemoLockSpan&) = delete;
+    ~MemoLockSpan() {
+        if (profile) held.fetch_add(elapsedNanoseconds(locked, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    }
+    void Locked() {
+        if (!profile) return;
+        locked = std::chrono::steady_clock::now();
+        wait.fetch_add(elapsedNanoseconds(started, locked), std::memory_order_relaxed);
+    }
+
+private:
+    bool profile;
+    std::atomic<std::uint64_t>& wait;
+    std::atomic<std::uint64_t>& held;
+    std::chrono::steady_clock::time_point started;
+    std::chrono::steady_clock::time_point locked{};
+};
+
+constexpr std::uint32_t componentBit(ResultMemoMissComponent component) {
+    return 1u << static_cast<std::uint32_t>(component);
+}
+
+void classifyMemoMiss(SourceEntry& source, std::uint64_t variantId, const SnapshotParts& parts) {
+    auto& counters = resultMemoMissCounters();
+    const auto [newest, inserted] = source.memoNewestParts.try_emplace(variantId, parts);
+    if (inserted) {
+        counters.firstSeen.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::uint32_t changed = 0;
+    for (std::size_t part = 0; part < parts.size(); ++part) {
+        if (parts[part] == newest->second[part]) continue;
+        changed |= 1u << part;
+        counters.byComponent[part].fetch_add(1, std::memory_order_relaxed);
+    }
+    newest->second = parts;
+    constexpr auto bases = componentBit(ResultMemoMissComponent::BufferBase) | componentBit(ResultMemoMissComponent::ImageBase);
+    constexpr auto userData = componentBit(ResultMemoMissComponent::UserData);
+    constexpr auto srt = componentBit(ResultMemoMissComponent::FlattenedSrt);
+    if (changed == 0) counters.unchanged.fetch_add(1, std::memory_order_relaxed);
+    else if (changed == userData) counters.userDataOnly.fetch_add(1, std::memory_order_relaxed);
+    else if ((changed & bases) != 0 && (changed & ~(bases | userData)) == 0) counters.basesOnly.fetch_add(1, std::memory_order_relaxed);
+    else if ((changed & bases) != 0 && (changed & srt) != 0 && (changed & ~(bases | userData | srt)) == 0) counters.basesAndSrtOnly.fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportResultMemoSteps(std::uint64_t calls, std::uint64_t misses) {
+    auto& counters = resultMemoCounters();
+    static ResultMemoMissCauses reported;
+    const auto now = ResultMemoMisses();
+    const auto perCall = [&](std::atomic<std::uint64_t>& total, std::uint64_t count) { return count != 0 ? static_cast<double>(total.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count) : 0.0; };
+    const auto hash = perCall(counters.hashNanoseconds, calls);
+    const auto lookupWait = perCall(counters.lookupWaitNanoseconds, calls);
+    const auto lookupHeld = perCall(counters.lookupHeldNanoseconds, calls);
+    const auto insertWait = perCall(counters.insertWaitNanoseconds, misses);
+    const auto insertHeld = perCall(counters.insertHeldNanoseconds, misses);
+    const auto delta = [&](std::size_t component) { return static_cast<unsigned long long>(now.byComponent[component] - reported.byComponent[component]); };
+    using Component = ResultMemoMissComponent;
+    std::fprintf(stderr, "[recompile] result memo steps (10 s): us per call: hash %.2f, lookup lock wait %.2f / held %.2f; us per miss: insert lock wait %.2f / held %.2f (evictions included); misses against the newest snapshot of the variant: first seen %llu, unchanged (evicted) %llu, user data only %llu, descriptor bases only %llu, bases and flattened SRT only %llu; parts changed: buffer bases %llu, other buffer words %llu, image bases %llu, other image words %llu, samplers %llu, flattened SRT %llu, tables %llu, other %llu, user data %llu\n",
+        hash, lookupWait, lookupHeld, insertWait, insertHeld,
+        static_cast<unsigned long long>(now.firstSeen - reported.firstSeen), static_cast<unsigned long long>(now.unchanged - reported.unchanged), static_cast<unsigned long long>(now.userDataOnly - reported.userDataOnly), static_cast<unsigned long long>(now.basesOnly - reported.basesOnly), static_cast<unsigned long long>(now.basesAndSrtOnly - reported.basesAndSrtOnly),
+        delta(static_cast<std::size_t>(Component::BufferBase)), delta(static_cast<std::size_t>(Component::BufferOther)), delta(static_cast<std::size_t>(Component::ImageBase)), delta(static_cast<std::size_t>(Component::ImageOther)), delta(static_cast<std::size_t>(Component::Sampler)), delta(static_cast<std::size_t>(Component::FlattenedSrt)), delta(static_cast<std::size_t>(Component::Tables)), delta(static_cast<std::size_t>(Component::Other)), delta(static_cast<std::size_t>(Component::UserData)));
+    reported = now;
 }
 
 void reportResultMemo() {
@@ -1408,38 +1493,72 @@ void reportResultMemo() {
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto patched = counters.patched.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; %llu misses patched from a result that differs only in forwarded user words\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patched));
+    reportResultMemoSteps(hits + misses, misses);
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, std::uint64_t* shape) {
-    std::uint64_t hash = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
+constexpr std::uint64_t SnapshotHashBasis = 0xcbf29ce484222325ull;
+constexpr std::uint64_t SnapshotHashPrime = 0x100000001b3ull;
+constexpr std::uint32_t BufferBaseHighMask = 0xffffu;
+constexpr std::uint32_t ImageBaseHighMask = 0xffu;
+
+std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, std::uint64_t* shape, SnapshotParts* parts = nullptr) {
+    using Component = ResultMemoMissComponent;
+    std::uint64_t hash = SnapshotHashBasis;
+    auto current = Component::Other;
+    const auto mixPart = [&](Component component, std::uint64_t value) {
+        if (parts == nullptr) return;
+        auto& part = (*parts)[static_cast<std::size_t>(component)];
+        part ^= value;
+        part *= SnapshotHashPrime;
+    };
+    const auto mixHash = [&](std::uint64_t value) {
         hash ^= value;
-        hash *= 0x100000001b3ull;
+        hash *= SnapshotHashPrime;
+    };
+    const auto mix = [&](std::uint64_t value) {
+        mixHash(value);
+        mixPart(current, value);
     };
     const auto mixWords = [&](std::span<const std::uint32_t> words) {
         mix(words.size());
         for (const auto word : words) mix(word);
     };
-    const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
+    const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values, Component base, Component other, std::uint32_t baseHighMask) {
+        current = other;
         mix(values.size());
         for (const auto& value : values) {
             mix(value.dwordCount);
             mix(value.availableDwordMask);
-            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) {
+                const auto word = value.dwords[i];
+                mixHash(word);
+                if (i == 0) {
+                    mixPart(base, word);
+                } else if (i == 1) {
+                    mixPart(base, word & baseHighMask);
+                    mixPart(other, word & ~baseHighMask);
+                } else {
+                    mixPart(other, word);
+                }
+            }
         }
     };
-    mixDescriptors(snapshot.buffers);
-    mixDescriptors(snapshot.images);
-    mixDescriptors(snapshot.samplers);
+    if (parts != nullptr) parts->fill(SnapshotHashBasis);
+    mixDescriptors(snapshot.buffers, Component::BufferBase, Component::BufferOther, BufferBaseHighMask);
+    mixDescriptors(snapshot.images, Component::ImageBase, Component::ImageOther, ImageBaseHighMask);
+    mixDescriptors(snapshot.samplers, Component::Sampler, Component::Sampler, ~0u);
+    current = Component::FlattenedSrt;
     mixWords(snapshot.flattenedSrt);
+    current = Component::Other;
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    current = Component::Tables;
     const auto& tables = snapshot.tables;
     mix(tables.shader);
     mix(tables.tables.size());
@@ -1459,6 +1578,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         mix(base);
         mix(size);
     }
+    current = Component::Other;
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
@@ -1488,6 +1608,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     mix(snapshot.srtPoison.size());
     mix(snapshot.nullRootReads);
     if (shape != nullptr) *shape = hash;
+    current = Component::UserData;
     mixWords(snapshot.userData);
     return hash;
 }
@@ -1520,15 +1641,20 @@ void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& 
 // as good). `memoHit` reports the hit.
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& counters = resultMemoCounters();
     std::uint64_t shape = 0;
-    const auto hash = snapshotHash(request, snapshot, &shape);
+    SnapshotParts parts{};
+    const auto hashStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto hash = snapshotHash(request, snapshot, &shape, profile ? &parts : nullptr);
+    if (profile) counters.hashNanoseconds.fetch_add(elapsedNanoseconds(hashStarted, std::chrono::steady_clock::now()), std::memory_order_relaxed);
     const bool patching = MemoUserWordPatch() && !variant->bindings.layout.userDataRegisters.empty();
     std::uint64_t index = 0;
     std::uint64_t shapeIndex = 0;
     std::shared_ptr<const RecompileResult> donor;
-    auto& counters = resultMemoCounters();
     {
+        MemoLockSpan span(profile, counters.lookupWaitNanoseconds, counters.lookupHeldNanoseconds);
         std::lock_guard lock(source.mutex);
+        span.Locked();
         index = (variant->artifact.variantId * 0x9e3779b97f4a7c15ull) ^ hash;
         if (auto* set = memoSet(source, index)) {
             for (std::size_t way = 0; way < ResultMemoWays; ++way) {
@@ -1561,7 +1687,10 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     counters.misses.fetch_add(1, std::memory_order_relaxed);
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     {
+        MemoLockSpan span(profile, counters.insertWaitNanoseconds, counters.insertHeldNanoseconds);
         std::lock_guard lock(source.mutex);
+        span.Locked();
+        if (profile) classifyMemoMiss(source, variant->artifact.variantId, parts);
         if (source.memo == nullptr) source.memo = std::make_unique<ResultMemoTable>();
         auto* set = memoSet(source, index);
         auto* victim = set;
@@ -1848,6 +1977,18 @@ std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request
 
 std::uint64_t ResultMemoUserWordPatches() {
     return memoUserWordPatches().load(std::memory_order_relaxed);
+}
+
+ResultMemoMissCauses ResultMemoMisses() {
+    const auto& counters = resultMemoMissCounters();
+    ResultMemoMissCauses causes;
+    causes.firstSeen = counters.firstSeen.load(std::memory_order_relaxed);
+    causes.unchanged = counters.unchanged.load(std::memory_order_relaxed);
+    causes.userDataOnly = counters.userDataOnly.load(std::memory_order_relaxed);
+    causes.basesOnly = counters.basesOnly.load(std::memory_order_relaxed);
+    causes.basesAndSrtOnly = counters.basesAndSrtOnly.load(std::memory_order_relaxed);
+    for (std::size_t part = 0; part < causes.byComponent.size(); ++part) causes.byComponent[part] = counters.byComponent[part].load(std::memory_order_relaxed);
+    return causes;
 }
 
 }

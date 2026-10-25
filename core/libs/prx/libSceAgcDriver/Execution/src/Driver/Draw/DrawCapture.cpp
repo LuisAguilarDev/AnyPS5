@@ -7,6 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -59,6 +63,45 @@ void TraceShaderRequestFailure(std::uint64_t token, const Submission& submission
     }
 }
 
+constexpr std::int64_t DrawStageSplitReportNanoseconds = 10'000'000'000ll;
+
+struct DrawStageSplit {
+    std::atomic<std::uint64_t> stages{0}, invocationNs{0}, captureNs{0}, regionsNs{0}, materializeNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DrawStageSplit& drawStageSplit() {
+    static DrawStageSplit split;
+    return split;
+}
+
+std::uint64_t splitNanoseconds(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+void addDrawStageSplit(const std::array<std::chrono::steady_clock::time_point, 5>& marks) {
+    auto& split = drawStageSplit();
+    split.stages.fetch_add(1, std::memory_order_relaxed);
+    split.invocationNs.fetch_add(splitNanoseconds(marks[0], marks[1]), std::memory_order_relaxed);
+    split.captureNs.fetch_add(splitNanoseconds(marks[1], marks[2]), std::memory_order_relaxed);
+    split.regionsNs.fetch_add(splitNanoseconds(marks[2], marks[3]), std::memory_order_relaxed);
+    split.materializeNs.fetch_add(splitNanoseconds(marks[3], marks[4]), std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(marks[4].time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < DrawStageSplitReportNanoseconds || !split.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    const auto stages = split.stages.exchange(0, std::memory_order_relaxed);
+    const auto perStage = [&](std::atomic<std::uint64_t>& total) { return stages != 0 ? static_cast<double>(total.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(stages) : 0.0; };
+    const auto invocation = perStage(split.invocationNs);
+    const auto capture = perStage(split.captureNs);
+    const auto regions = perStage(split.regionsNs);
+    const auto materialize = perStage(split.materializeNs);
+    std::fprintf(stderr, "[capture] packet thread draw stages (10 s): %llu, us each: invocation %.2f, resource capture %.2f, region bookkeeping %.2f, dumps and materialize %.2f\n", static_cast<unsigned long long>(stages), invocation, capture, regions, materialize);
+}
+
 bool DumpedDrawProgram(std::uint64_t codeAddress) {
     static const std::vector<std::uint64_t> programs = [] {
         std::vector<std::uint64_t> listed;
@@ -81,6 +124,11 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
+    std::array<std::chrono::steady_clock::time_point, 5> splitMarks{};
+    const auto markSplit = [&](std::size_t mark) {
+        if (profile) splitMarks[mark] = std::chrono::steady_clock::now();
+    };
+    markSplit(0);
     const auto& program = programs[i];
     const auto waveSize = program.binary.stage == Stage::Fragment ? graphics.stages.fragmentWaveSize : graphics.stages.vertexWaveSize;
     ShaderRecompiler::RecompileRequest request{
@@ -100,6 +148,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
     timing.Mark("prepared_invocation");
+    markSplit(1);
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
@@ -128,6 +177,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
 
+    markSplit(2);
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
     stageCapture.userDataUse = capture->userDataUse;
@@ -138,6 +188,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
     }
     request.context.memory = memory;
+    markSplit(3);
     if (DumpedDrawProgram(program.binary.codeAddress)) static_cast<void>(dumpRequest(program.binary.codeAddress, request, ".draw"));
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
@@ -186,6 +237,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }
     stageCapture.userDataMask = mask;
+    markSplit(4);
+    if (profile) addDrawStageSplit(splitMarks);
     phaseTiming.Phase(DrawRowRecompile);
     return stageCapture.compiled;
 } catch (const std::exception& error) {

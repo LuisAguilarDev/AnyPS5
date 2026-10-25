@@ -1120,45 +1120,79 @@ void verifyTypeZeroImageMaterialization() {
     }
 }
 
-void verifyResultMemoMovedTable() {
+std::array<std::uint32_t, 4> memoTableBuffer(const std::array<std::uint32_t, 4>& target) {
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(target.data()));
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 16u, 0x00027facu};
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeMemoTable(const std::array<std::uint32_t, 4>& table, bool cached) {
     using namespace ShaderRecompiler;
-    const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000280u, 0xe0700000u, 0x80010000u, 0xbf810000u};
+    static const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000280u, 0xe0700000u, 0x80010000u, 0xbf810000u};
+    static const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    static const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
+    request.context.waveSize = 32u;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = cached;
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    return Recompile(request, *capture);
+}
+
+void verifyResultMemoMissCauses() {
+    using namespace ShaderRecompiler;
     alignas(16) static std::array<std::uint32_t, 4> output{};
     alignas(16) static std::array<std::uint32_t, 4> other{};
-    const auto buffer = [](const std::array<std::uint32_t, 4>& target) {
-        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(target.data()));
-        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 16u, 0x00027facu};
-    };
     alignas(16) static std::array<std::uint32_t, 4> first{};
     alignas(16) static std::array<std::uint32_t, 4> moved{};
     alignas(16) static std::array<std::uint32_t, 4> retargeted{};
-    first = buffer(output);
-    moved = buffer(output);
-    retargeted = buffer(other);
-    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
-    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
-    const auto materialize = [&](const std::array<std::uint32_t, 4>& table, bool cached) {
-        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
-        const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
-        RecompileRequest request{};
-        request.shader = {ShaderStage::Compute, 0x24000u, code, 0, {}};
-        request.context.waveSize = 32u;
-        request.context.userDataBaseRegister = 0;
-        request.context.userData = userData;
-        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
-        request.target.vulkanVersion = 0x00401000u;
-        request.target.spirvVersion = 0x00010300u;
-        request.target.subgroupSize = 32;
-        request.target.supportedCapabilities = capabilities;
-        request.target.supportedExtensions = extensions;
-        request.target.bdaAbiVersion = BdaAbi::Version;
-        request.target.fragmentShaderBarycentricEnabled = false;
-        request.layout.pushConstantSizeBytes = 128;
-        request.useCache = cached;
-        AgcDriver::ShaderMemory memory({});
-        const auto capture = memory.Capture(request);
-        return Recompile(request, *capture);
-    };
+    first = memoTableBuffer(output);
+    moved = memoTableBuffer(output);
+    retargeted = memoTableBuffer(other);
+    using Component = ResultMemoMissComponent;
+    const auto at = [](const ResultMemoMissCauses& causes, Component component) { return causes.byComponent[static_cast<std::size_t>(component)]; };
+    const auto start = ResultMemoMisses();
+    static_cast<void>(materializeMemoTable(first, true));
+    const auto seen = ResultMemoMisses();
+    require(seen.firstSeen - start.firstSeen == 1u, "result memo misses: the first materialization of a variant was not counted as first seen");
+    static_cast<void>(materializeMemoTable(moved, true));
+    const auto shifted = ResultMemoMisses();
+    require(shifted.userDataOnly - seen.userDataOnly == 1u && at(shifted, Component::UserData) - at(seen, Component::UserData) == 1u, "result memo misses: a moved SRT with the same contents was not counted as a user data only miss");
+    static_cast<void>(materializeMemoTable(retargeted, true));
+    const auto rebased = ResultMemoMisses();
+    require(at(rebased, Component::BufferBase) - at(shifted, Component::BufferBase) == 1u, "result memo misses: a V# with another base was not counted as a buffer base change");
+    require(at(rebased, Component::BufferOther) == at(shifted, Component::BufferOther), "result memo misses: a V# that only moved its base was counted as another buffer word change");
+    require(rebased.basesOnly + rebased.basesAndSrtOnly - shifted.basesOnly - shifted.basesAndSrtOnly == 1u, "result memo misses: a V# that only moved its base was not counted as a descriptor base only miss");
+    static_cast<void>(materializeMemoTable(retargeted, true));
+    require(ResultMemoMisses().firstSeen == rebased.firstSeen && ResultMemoMisses().basesOnly == rebased.basesOnly, "result memo misses: a memo hit was classified as a miss");
+}
+
+void verifyResultMemoMovedTable() {
+    using namespace ShaderRecompiler;
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    alignas(16) static std::array<std::uint32_t, 4> other{};
+    alignas(16) static std::array<std::uint32_t, 4> first{};
+    alignas(16) static std::array<std::uint32_t, 4> moved{};
+    alignas(16) static std::array<std::uint32_t, 4> retargeted{};
+    first = memoTableBuffer(output);
+    moved = memoTableBuffer(output);
+    retargeted = memoTableBuffer(other);
+    const auto materialize = materializeMemoTable;
     const auto same = [](const RecompileResult& a, const RecompileResult& b) {
         bool equal = a.pushConstants == b.pushConstants && a.bindings.size() == b.bindings.size() && a.shaderDataUserWords == b.shaderDataUserWords;
         for (std::size_t i = 0; equal && i < a.bindings.size(); ++i) equal = a.bindings[i].role == b.bindings[i].role && a.bindings[i].guestDescriptor == b.bindings[i].guestDescriptor;
@@ -8512,6 +8546,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-moved-table") {
             verifyResultMemoMovedTable();
             std::cout << "The result memo patches a result over a moved SRT with the same contents\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-miss-causes") {
+            verifyResultMemoMissCauses();
+            std::cout << "The result memo classifies each miss by the snapshot parts that changed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--layout-pair") {

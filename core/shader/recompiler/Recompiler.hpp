@@ -810,6 +810,17 @@ struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 [[nodiscard]] std::uint64_t ResultMemoUserWordPatches();
 
+enum class ResultMemoMissComponent : std::uint8_t { BufferBase, BufferOther, ImageBase, ImageOther, Sampler, FlattenedSrt, Tables, Other, UserData, Count };
+struct ResultMemoMissCauses {
+    std::uint64_t firstSeen = 0;
+    std::uint64_t unchanged = 0;
+    std::uint64_t userDataOnly = 0;
+    std::uint64_t basesOnly = 0;
+    std::uint64_t basesAndSrtOnly = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
+};
+[[nodiscard]] ResultMemoMissCauses ResultMemoMisses();
+
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile
 // cache keys on it.

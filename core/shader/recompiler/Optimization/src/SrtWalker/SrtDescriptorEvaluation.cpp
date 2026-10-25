@@ -275,7 +275,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
 }
 
 bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpreted) {
-    if (tape.asBase != interpreted.asBase || tape.asValue != interpreted.asValue) return false;
+    if (tape.asBase != interpreted.asBase || tape.asValue != interpreted.asValue || tape.descriptorBases != interpreted.descriptorBases) return false;
     auto tapeReads = tape.reads;
     auto interpretedReads = interpreted.reads;
     for (auto* reads : {&tapeReads, &interpretedReads}) {

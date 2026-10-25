@@ -37,10 +37,12 @@ public:
     bool Build() {
         tape.sourceDwords.assign(plan.descriptorSources.size(), {});
         for (auto& dwords : tape.sourceDwords) dwords.fill(SrtTape::NoNode);
+        tape.sourceBaseWords.assign(plan.descriptorSources.size(), -1);
         for (const auto index : plan.materializationSources) {
             if (index >= plan.descriptorSources.size()) return false;
             const auto& source = plan.descriptorSources[index];
             if (source.dwordCount > source.dwords.size()) return false;
+            tape.sourceBaseWords[index] = inlineBaseWord(source);
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) tape.sourceDwords[index][dword] = compile(source.dwords[dword], MainContext, 0);
         }
         tape.flatRoots.resize(plan.srtReads.size());
@@ -59,7 +61,15 @@ public:
 private:
     using Op = SrtTape::Op;
     using Node = SrtTape::Node;
-    struct Context {
+
+    std::int32_t inlineBaseWord(const DescriptorSource& source) const {
+        if (!SrtTape::BufferBases() || source.dwordCount != 4u || source.dwords[0] == nullptr) return -1;
+        const IrValue* dword = source.dwords[0]->Resolve();
+        if (dword->HasImmediate() || dword->Opcode() != IrOpcode::GetUserData || dword->ArgumentCount() < 1 || dword->Argument(0) == nullptr) return -1;
+        const auto reg = RegIndex(static_cast<ScalarReg>(dword->Argument(0)->Register().index));
+        if (reg < plan.userDataBase || reg - plan.userDataBase >= SrtUserDataUse::TrackedWords) return -1;
+        return static_cast<std::int32_t>(reg - plan.userDataBase);
+    }    struct Context {
         const IrValue* mask;
         bool clean;
         bool cleanSlots;
@@ -287,6 +297,11 @@ private:
 
 bool SrtTape::Enabled() {
     static const bool enabled = std::getenv("APS5_NO_SRT_TAPE") == nullptr && std::getenv("APS5_SRT_DEBUG") == nullptr;
+    return enabled;
+}
+
+bool SrtTape::BufferBases() {
+    static const bool enabled = std::getenv("APS5_NO_SRT_TAPE_BUFFER_BASES") == nullptr;
     return enabled;
 }
 
@@ -640,6 +655,12 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         value.dwordCount = source.dwordCount;
         if (active[sourceIndex]) {
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
+                const auto baseWord = dword == 0 ? sourceBaseWords[sourceIndex] : -1;
+                if (baseWord >= 0 && runtime.userDataUse != nullptr && static_cast<std::size_t>(baseWord) < runtime.userData.size()) {
+                    value.dwords[dword] = runtime.userData[static_cast<std::size_t>(baseWord)];
+                    runtime.userDataUse->descriptorBases.emplace_back(sourceIndex, static_cast<std::uint32_t>(baseWord));
+                    continue;
+                }
                 std::uint64_t word = 0;
                 if (!evaluate(frame, sourceDwords[sourceIndex][dword], word)) return refuse();
                 value.dwords[dword] = static_cast<std::uint32_t>(word);

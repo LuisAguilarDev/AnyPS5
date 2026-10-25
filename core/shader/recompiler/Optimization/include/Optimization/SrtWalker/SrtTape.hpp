@@ -16,6 +16,7 @@ public:
     static const SrtTape* For(const IrResourcePlan& plan);
     static bool Enabled();
     static bool Verified();
+    static bool BufferBases();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
@@ -50,6 +51,7 @@ private:
 
     std::vector<Node> nodes;
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
+    std::vector<std::int32_t> sourceBaseWords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
 };

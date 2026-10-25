@@ -1157,8 +1157,6 @@ void verifyResultMemoMovedTable() {
         request.useCache = cached;
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
-        const auto memoryRegions = memory.Regions();
-        request.context.memory = memoryRegions;
         return Recompile(request, *capture);
     };
     const auto same = [](const RecompileResult& a, const RecompileResult& b) {
@@ -1559,6 +1557,7 @@ void verifySrtTape() {
         std::uint64_t asBase = 0;
         std::uint64_t asValue = 0;
         std::vector<std::pair<std::uint64_t, std::int32_t>> userDataReads;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> descriptorBases;
         bool operator==(const Walk&) const = default;
     };
     const auto walk = [](const IrResourcePlan& plan, SrtRuntime runtime, bool tape) {
@@ -1584,6 +1583,7 @@ void verifySrtTape() {
         out.userDataReads = use.reads;
         std::sort(out.userDataReads.begin(), out.userDataReads.end());
         out.userDataReads.erase(std::unique(out.userDataReads.begin(), out.userDataReads.end()), out.userDataReads.end());
+        out.descriptorBases = use.descriptorBases;
         return out;
     };
     const auto answers = [](const IrResourcePlan& plan, const SrtRuntime& runtime) {
@@ -1667,6 +1667,20 @@ void verifySrtTape() {
     const auto runtime = runtimeFor(userData);
     require(answers(*outOfRangePlan, runtime), "SRT tape: the tape refused a constant read past its V#");
     require(walk(*outOfRangePlan, runtime, true) == walk(*outOfRangePlan, runtime, false), "SRT tape: a constant read past its V# differs from the Evaluator's");
+
+    const std::vector<std::uint32_t> inlineStore{0xe0700000u, 0x80000000u, 0xbf810000u};
+    auto inlineRequest = requestFor(0x26000u, inlineStore);
+    inlineRequest.context.userData = outputV;
+    const auto inlinePlan = GetResourcePlan(inlineRequest);
+    const auto inlineRuntime = runtimeFor(outputV);
+    require(answers(*inlinePlan, inlineRuntime), "SRT tape: the tape refused a store through an inline V#");
+    const auto inlineTape = walk(*inlinePlan, inlineRuntime, true);
+    if (std::getenv("APS5_NO_SRT_TAPE_BUFFER_BASES") != nullptr) {
+        require(inlineTape.descriptorBases.empty() && (inlineTape.asValue & 1u) != 0u, "SRT tape: APS5_NO_SRT_TAPE_BUFFER_BASES still read an inline V# base apart");
+        return;
+    }
+    require(inlineTape == walk(*inlinePlan, inlineRuntime, false), "SRT tape: a store through an inline V# differs from the Evaluator's walk");
+    require(inlineTape.descriptorBases.size() == 1u && inlineTape.descriptorBases.front().second == 0u && (inlineTape.asValue & 1u) == 0u, "SRT tape: the inline V# base word was not read as a descriptor base");
 }
 
 struct alignas(256) TableTexture {
@@ -8483,6 +8497,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--quad-mask-no-demote") {
             verifyQuadMaskNeighbourReads();
             std::cout << "Quad masks preserve neighbour-lane helpers or refuse without demote\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-tape") {
+            verifySrtTape();
+            std::cout << "SRT tape walks match the Evaluator's\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {

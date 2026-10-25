@@ -708,21 +708,29 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         for (const bool draw : {false, true}) {
             auto mixed = std::make_shared<ShaderResources>(context, mixedCompute);
             Require(mixed->HasCopiedWrites() && mixed->WritesOverlap(address, 4) && !mixed->CopiedWritesOverlap(address, 4) && mixed->CopiedWritesOverlap(copiedAddress, 4), "the mixed producer did not retain direct and CPU-copied writes");
-            auto& pending = draw ? *DrawCopiedWriters() : writers;
+            const auto list = [&writers, draw](const std::shared_ptr<ShaderResources>& writer) {
+                if (draw) ListDrawCopiedWriter(writer);
+                else writers.push_back(writer);
+            };
+            const auto delist = [&writers, draw](const std::shared_ptr<ShaderResources>& writer) {
+                if (draw) DelistDrawCopiedWriter(writer);
+                else std::erase(writers, writer);
+            };
+            const auto listedNone = [&writers, draw] { return draw ? DrawCopiedWriters()->empty() : writers.empty(); };
             static_cast<void>(recorder.Commands());
             recorder.Keep(mixed);
             mixed->MarkGpuWrites(recorder);
-            pending.push_back(mixed);
+            list(mixed);
             auto completed = std::make_shared<unsigned>(0);
-            recorder.OnComplete([mixed, &pending, completed] {
+            recorder.OnComplete([mixed, delist, completed] {
                 mixed->WriteBackBuffers();
-                std::erase(pending, mixed);
+                delist(mixed);
                 ++*completed;
             });
             Require(!CompletePendingCpuWrites(context, address, 4), "a direct write in a mixed producer caused a CPU write-back wait");
-            Require(*completed == 0 && !pending.empty(), "a disjoint copied write-back was completed while binding a direct buffer");
+            Require(*completed == 0 && !listedNone(), "a disjoint copied write-back was completed while binding a direct buffer");
             Require(CompletePendingCpuWrites(context, copiedAddress, 4), "a CPU-copied write in a mixed producer was not completed");
-            Require(*completed == 1 && pending.empty(), "the required CPU write-back did not release the mixed producer");
+            Require(*completed == 1 && listedNone(), "the required CPU write-back did not release the mixed producer");
         }
     }
     {

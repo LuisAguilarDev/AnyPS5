@@ -2935,8 +2935,6 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         const Recorder::ChunkKeepScope scope(recorder);
         const auto join = recorder.JoinChunk();
         const auto requests = recorder.CommandRequests();
-        keepRecordedDraw(recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), nullptr, {}, record.listed, record.completion, outcome);
-        timer.phase(PhaseKeep);
         recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording, DrawRecorders::DrawStats& stats) {
             DrawTimer timer(DrawRecorders::Profiled());
             DrawOutcome unreported;
@@ -2946,6 +2944,10 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
             stats.freshSets = timer.split.bindings.freshSets;
             stats.passBegun = unreported.passBegun;
         });
+        keepRecordedDraw(recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), nullptr, {}, record.listed, record.completion, outcome);
+        timer.phase(PhaseKeep);
+        if (Recorder::SyncsAfterChunkedKeep()) recorder.Sync();
+        if (join.chunk->sealed) recorder.NoteKeepSealed();
         if (recorder.CommandRequests() != requests) recorder.SealChunk();
     }
     outcome.spineChunked = true;

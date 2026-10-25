@@ -51,6 +51,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+std::atomic<bool> syncAfterChunkedKeep{false};
+
 // The process environment (OneRecordingStream scans it for debug switch prefixes).
 char** ProcessEnvironment() {
 #ifdef _WIN32
@@ -3389,6 +3391,19 @@ DrawRecorders* Recorder::Recorders() {
     // Sample counting starts on demand (the sample dump's first query): every draw from then on
     // records on the spine.
     return countingSamples ? nullptr : recorders.get();
+}
+
+void Recorder::NoteKeepSealed() {
+    ++chunkTotals.keepSealed;
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().keepSealedChunks, 1);
+}
+
+void Recorder::SyncAfterChunkedKeep(bool enabled) {
+    syncAfterChunkedKeep.store(enabled, std::memory_order_relaxed);
+}
+
+bool Recorder::SyncsAfterChunkedKeep() {
+    return syncAfterChunkedKeep.load(std::memory_order_relaxed);
 }
 
 void Recorder::SealChunk() {

@@ -236,8 +236,12 @@ public:
         std::uint64_t draws = 0;
         std::uint64_t maxInFlight = 0;
         std::uint64_t failedChunks = 0;
+        std::uint64_t keepSealed = 0;
     };
     ChunkCounters ChunkTotals() const { return chunkTotals; }
+    void NoteKeepSealed();
+    static void SyncAfterChunkedKeep(bool enabled);
+    static bool SyncsAfterChunkedKeep();
     // How often Commands() handed out the spine's command buffer: a chunked draw whose keep recorded
     // commands (a depth store-back, say) seals its chunk, so no later draw runs before them.
     std::uint64_t CommandRequests() const { return commandRequests; }

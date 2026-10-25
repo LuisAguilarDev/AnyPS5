@@ -1157,7 +1157,8 @@ void verifyResultMemoMovedTable() {
         request.useCache = cached;
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
-        request.context.memory = memory.Regions();
+        const auto memoryRegions = memory.Regions();
+        request.context.memory = memoryRegions;
         return Recompile(request, *capture);
     };
     const auto same = [](const RecompileResult& a, const RecompileResult& b) {

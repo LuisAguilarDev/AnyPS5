@@ -12,6 +12,8 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 
 namespace AgcDriver::FrameSteps {
 
@@ -24,10 +26,57 @@ inline constexpr std::size_t WaitEqueue = 0, WaitSleep = 1, WaitVblank = 2, Wait
 inline constexpr std::size_t PacketSlots = 258, FlipSlot = 256, RenderWaitSlot = 257, TopPacketSlots = 12;
 inline constexpr std::size_t PhaseGate = 0, PhaseDrain = 1, PhaseLock = 2, PhaseFlush = 3, PhasePrepare = 4, PhaseBody = 5, PacketPhases = 6;
 inline constexpr std::size_t DrawSteps = DriverDetail::DrawDriverPhaseCount;
+// DrawPipeline::CommitKind, then the enqueues made from a draw prep pool thread.
+inline constexpr std::size_t EnqueueKinds = 10, PoolEnqueueKind = 9;
+// DrawPipeline::DrainReason; drain opcodes 0x00-0xff and 0x100 for a drain without a packet.
+inline constexpr std::size_t DrainReasons = 6, DrainOpcodes = 257, NoDrainOpcode = 256, TopDrainOpcodes = 6;
+// The Graphics draw phases (Draw.cpp DrawPhase) and the rest of a sampled commit.
+inline constexpr std::size_t SpineDrawPhases = 13, SpineOtherPhase = SpineDrawPhases, SpinePhases = SpineDrawPhases + 1;
+// GuestMemory::ProofBreaker.
+inline constexpr std::size_t ProofBreakers = 9;
+inline constexpr std::size_t RoleOther = 0, RolePacket = 1, RoleSpine = 2, RolePool = 3, RoleRecorder = 4, RolePresenter = 5, RoleRelease = 6, ThreadRoles = 7;
+inline constexpr std::size_t TriggerOther = 0, TriggerCap = 1, TriggerDeadline = 2, TriggerLabel = 3, TriggerCompletion = 4, TriggerFlip = 5, TriggerPresent = 6, TriggerEnd = 7, TriggerIdle = 8, TriggerWait = 9, TriggerSuspend = 10, SubmitTriggers = 11;
+inline constexpr std::size_t CpuPacket = 0, CpuSpine = 1, CpuPresenter = 2, CpuRelease = 3, CpuRecorders = 4, CpuPool = CpuRecorders + LaneThreads, CpuSlots = CpuPool + LaneThreads;
+inline constexpr std::uint32_t DefaultSampleEvery = 16, MaxSampleEvery = 1024;
+inline constexpr std::uint64_t DigestOffset = 0xcbf29ce484222325ull, DigestPrime = 0x100000001b3ull;
 
 inline bool Enabled() {
     static const bool enabled = std::getenv("APS5_PROFILE_FRAME") != nullptr;
     return enabled;
+}
+
+// APS5_PROFILE_FRAME_SAMPLE: one in how many draw commits the spine phase split times (a power
+// of two up to 1024; anything else keeps 1 in 16).
+inline std::uint32_t SampleEvery(const char* text) {
+    if (text == nullptr || *text == '\0') return DefaultSampleEvery;
+    char* end = nullptr;
+    const auto value = std::strtoul(text, &end, 10);
+    if (*end != '\0' || value == 0 || value > MaxSampleEvery || (value & (value - 1)) != 0) return DefaultSampleEvery;
+    return static_cast<std::uint32_t>(value);
+}
+
+inline std::uint32_t SpineSampleEvery() {
+    static const std::uint32_t every = SampleEvery(std::getenv("APS5_PROFILE_FRAME_SAMPLE"));
+    return every;
+}
+
+// Picks the first of every `every` calls (a power of two); one owner thread.
+class Sampler {
+public:
+    explicit Sampler(std::uint32_t every) : mask(every - 1) {}
+    bool Next() { return (count++ & mask) == 0; }
+
+private:
+    std::uint32_t mask;
+    std::uint32_t count = 0;
+};
+
+inline std::uint64_t DigestWords(std::span<const std::uint32_t> words, std::uint64_t digest = DigestOffset) {
+    for (const auto word : words) {
+        digest ^= word;
+        digest *= DigestPrime;
+    }
+    return digest;
 }
 
 inline std::int64_t NowNs() {
@@ -135,6 +184,28 @@ struct Totals {
     std::array<std::uint64_t, PacketPhases> drawPhaseNs{}, otherPhaseNs{};
     std::array<std::uint64_t, 2> phasePackets{};
     std::array<std::uint64_t, DrawSteps> drawStepNs{};
+    std::array<std::uint64_t, EnqueueKinds> fifoFullKindNs{};
+    std::array<std::uint64_t, DrainReasons> fifoDrainReasonNs{}, fifoDrainReasonCount{};
+    std::array<std::uint64_t, DrainOpcodes> fifoDrainOpcodeNs{}, fifoDrainOpcodeCount{};
+    std::uint64_t mpassInline = 0, mpassPipelined = 0;
+    std::uint64_t spineSamples = 0, spineSampleNs = 0;
+    std::array<std::uint64_t, SpinePhases> spinePhaseNs{};
+    std::uint64_t submitValidateNs = 0;
+    std::array<std::uint64_t, ProofBreakers> proofBreaks{};
+    std::uint64_t targetMemoLookups = 0, targetMemoHits = 0, drawInputMemoLookups = 0, drawInputMemoHits = 0;
+    std::uint64_t drawStages = 0, stagedDraws = 0, halfChecks = 0, halfStale = 0;
+    std::array<std::uint64_t, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
+};
+
+struct ChainTotals {
+    std::uint64_t firstSubmitNs = 0, firstSubmits = 0, tailNs = 0, tails = 0;
+};
+
+// The recompiler's counts over the window (ShaderRecompiler::ResultMemoCounts deltas and the
+// program-key census).
+struct ShaderTotals {
+    std::uint64_t resultMemoHits = 0, resultMemoMisses = 0, resultMemoEvictions = 0;
+    std::uint64_t programKeys = 0, programKeysDistinct = 0, programKeyTableHits = 0, programKeyOverflow = 0;
 };
 
 struct Window {
@@ -142,8 +213,18 @@ struct Window {
     std::uint64_t frames = 0;
     std::uint64_t presents = 0;
     double gpuBusyMs = 0;
+    double gpuGapMs = 0;
     std::array<std::uint64_t, KernelWaitKinds> kernelWaitNs{};
     Spread gapMs, spanMs, insideMs, intervalMs, flipToPresentMs;
+    ChainTotals chain;
+    std::array<std::uint64_t, CpuSlots> threadCpuNs{};
+    ShaderTotals shaders;
+};
+
+// The lanes line's derived values: the packet thread's own work, and what the lanes' overlap
+// loses (coupling) and the frame's end costs (tail) beyond them.
+struct Derived {
+    double frameMs = 0, packetOwnMs = 0, couplingMs = 0, tailMs = 0;
 };
 
 class Counters {
@@ -216,6 +297,27 @@ public:
         }
         for (std::size_t i = 0; i < phasePackets.size(); ++i) totals.phasePackets[i] = take(phasePackets[i]);
         for (std::size_t i = 0; i < DrawSteps; ++i) totals.drawStepNs[i] = take(drawStepNs[i]);
+        takeAll(fifoFullKindNs, totals.fifoFullKindNs);
+        takeAll(fifoDrainReasonNs, totals.fifoDrainReasonNs);
+        takeAll(fifoDrainReasonCount, totals.fifoDrainReasonCount);
+        takeAll(fifoDrainOpcodeNs, totals.fifoDrainOpcodeNs);
+        takeAll(fifoDrainOpcodeCount, totals.fifoDrainOpcodeCount);
+        totals.mpassInline = take(mpassInline);
+        totals.mpassPipelined = take(mpassPipelined);
+        totals.spineSamples = take(spineSamples);
+        totals.spineSampleNs = take(spineSampleNs);
+        takeAll(spinePhaseNs, totals.spinePhaseNs);
+        totals.submitValidateNs = take(submitValidateNs);
+        takeAll(proofBreaks, totals.proofBreaks);
+        totals.targetMemoLookups = take(targetMemoLookups);
+        totals.targetMemoHits = take(targetMemoHits);
+        totals.drawInputMemoLookups = take(drawInputMemoLookups);
+        totals.drawInputMemoHits = take(drawInputMemoHits);
+        totals.drawStages = take(drawStages);
+        totals.stagedDraws = take(stagedDraws);
+        totals.halfChecks = take(halfChecks);
+        totals.halfStale = take(halfStale);
+        takeAll(vkSubmitsBy, totals.vkSubmitsBy);
         return totals;
     }
 
@@ -237,7 +339,170 @@ public:
     std::array<Counter, PacketPhases> drawPhaseNs{}, otherPhaseNs{};
     std::array<Counter, 2> phasePackets{};
     std::array<Counter, DrawSteps> drawStepNs{};
+    std::array<Counter, EnqueueKinds> fifoFullKindNs{};
+    std::array<Counter, DrainReasons> fifoDrainReasonNs{}, fifoDrainReasonCount{};
+    std::array<Counter, DrainOpcodes> fifoDrainOpcodeNs{}, fifoDrainOpcodeCount{};
+    Counter mpassInline{0}, mpassPipelined{0};
+    Counter spineSamples{0}, spineSampleNs{0};
+    std::array<Counter, SpinePhases> spinePhaseNs{};
+    Counter submitValidateNs{0};
+    std::array<Counter, ProofBreakers> proofBreaks{};
+    Counter targetMemoLookups{0}, targetMemoHits{0}, drawInputMemoLookups{0}, drawInputMemoHits{0};
+    Counter drawStages{0}, stagedDraws{0}, halfChecks{0}, halfStale{0};
+    std::array<Counter, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
+
+private:
+    template <std::size_t Size>
+    static void takeAll(std::array<Counter, Size>& counters, std::array<std::uint64_t, Size>& totals) {
+        for (std::size_t i = 0; i < Size; ++i) totals[i] = counters[i].exchange(0, std::memory_order_relaxed);
+    }
 };
+
+// Every split adds to its total in the same call, so the parts sum to the total.
+inline void NoteFifoFull(Counters& counters, std::size_t kind, std::int64_t ns) {
+    Counters::AddNs(counters.fifoFullNs, ns);
+    // An unknown kind is the commit kinds' 'other', never the pool.
+    Counters::AddNs(counters.fifoFullKindNs[kind < EnqueueKinds ? kind : PoolEnqueueKind - 1], ns);
+}
+
+inline void NoteFifoDrain(Counters& counters, std::size_t reason, std::uint32_t opcode, std::int64_t ns) {
+    const auto reasonSlot = std::min(reason, DrainReasons - 1);
+    const auto opcodeSlot = std::min<std::size_t>(opcode, NoDrainOpcode);
+    Counters::AddNs(counters.fifoDrainNs, ns);
+    Counters::AddNs(counters.fifoDrainReasonNs[reasonSlot], ns);
+    Counters::Add(counters.fifoDrainReasonCount[reasonSlot], 1);
+    Counters::AddNs(counters.fifoDrainOpcodeNs[opcodeSlot], ns);
+    Counters::Add(counters.fifoDrainOpcodeCount[opcodeSlot], 1);
+}
+
+// The committer's sampled draw commit (1 in SpineSampleEvery): the Graphics DrawTimer adds each
+// phase of the commit's draw here (active only on the committer, for that one commit).
+struct SpineSample {
+    bool active = false;
+    std::array<std::int64_t, SpineDrawPhases> phaseNs{};
+};
+
+inline thread_local SpineSample threadSpineSample;
+
+inline SpineSample& ThreadSpineSample() {
+    return threadSpineSample;
+}
+
+// The commit time the phases did not cover is 'other', so a sample's parts sum to its commit.
+inline void NoteSpineSample(Counters& counters, const SpineSample& sample, std::uint64_t commitNs) {
+    std::uint64_t phased = 0;
+    for (std::size_t i = 0; i < SpineDrawPhases; ++i) {
+        if (sample.phaseNs[i] <= 0) continue;
+        Counters::AddNs(counters.spinePhaseNs[i], sample.phaseNs[i]);
+        phased += static_cast<std::uint64_t>(sample.phaseNs[i]);
+    }
+    Counters::Add(counters.spinePhaseNs[SpineOtherPhase], commitNs > phased ? commitNs - phased : 0);
+    Counters::Add(counters.spineSamples, 1);
+    Counters::Add(counters.spineSampleNs, commitNs);
+}
+
+// The thread's role (BindThread) and the reason its current submit is made (SubmitCause), for
+// vk_submits by thread and trigger.
+inline thread_local std::uint8_t threadRole = RoleOther;
+inline thread_local std::uint8_t threadTrigger = TriggerOther;
+
+inline std::size_t ThreadRole() {
+    return threadRole;
+}
+
+inline std::size_t ThreadTrigger() {
+    return threadTrigger;
+}
+
+// A fallback cause names the submits only where no outer cause did (a flip's label flush stays a
+// flip submit).
+class SubmitCause {
+public:
+    explicit SubmitCause(std::size_t trigger, bool fallback = false) : active(Enabled()), previous(active ? threadTrigger : std::uint8_t{0}) {
+        if (active && !(fallback && previous != TriggerOther)) threadTrigger = static_cast<std::uint8_t>(std::min(trigger, SubmitTriggers - 1));
+    }
+    SubmitCause(const SubmitCause&) = delete;
+    SubmitCause& operator=(const SubmitCause&) = delete;
+    ~SubmitCause() {
+        if (active) threadTrigger = previous;
+    }
+
+private:
+    bool active;
+    std::uint8_t previous;
+};
+
+inline void NoteVkSubmit(Counters& counters, std::size_t role, std::size_t trigger) {
+    Counters::Add(counters.vkSubmitsBy[std::min(role, ThreadRoles - 1) * SubmitTriggers + std::min(trigger, SubmitTriggers - 1)], 1);
+}
+
+// The CPU-time slot of a thread role (CpuSlots for a role without one).
+inline std::size_t CpuSlot(std::size_t role, std::size_t index) {
+    const auto lane = std::min(index, LaneThreads - 1);
+    switch (role) {
+    case RolePacket: return CpuPacket;
+    case RoleSpine: return CpuSpine;
+    case RolePresenter: return CpuPresenter;
+    case RoleRelease: return CpuRelease;
+    case RoleRecorder: return CpuRecorders + lane;
+    case RolePool: return CpuPool + lane;
+    default: return CpuSlots;
+    }
+}
+
+// Thread cycle counts to time at the rate the window measured (TSC ticks over steady-clock ns).
+inline std::uint64_t CyclesToNs(std::uint64_t cycles, std::uint64_t ticks, std::uint64_t ns) {
+    if (ticks == 0) return 0;
+    return static_cast<std::uint64_t>(static_cast<long double>(cycles) * static_cast<long double>(ns) / static_cast<long double>(ticks));
+}
+
+// Names the calling thread's role and registers it for thread_cpu_ms/f (APS5_PROFILE_FRAME only).
+void BindThread(std::size_t role, std::size_t index);
+// Each registered thread's CPU time since the last call.
+std::array<std::uint64_t, CpuSlots> TakeThreadCpuNs();
+
+// The frame chain on queue 0: a frame opens at the packet thread's first dequeue after a flip;
+// its first vkQueueSubmit is timed from there, and every present from the newest submit.
+class FrameChain {
+public:
+    void Dequeued(std::int64_t nowNs) {
+        if (open.load(std::memory_order_relaxed)) return;
+        startNs.store(nowNs, std::memory_order_relaxed);
+        open.store(true, std::memory_order_relaxed);
+        firstPending.store(true, std::memory_order_release);
+    }
+
+    void Flipped() { open.store(false, std::memory_order_relaxed); }
+
+    void Submitted(std::int64_t nowNs) {
+        lastSubmitNs.store(nowNs, std::memory_order_relaxed);
+        if (!firstPending.load(std::memory_order_relaxed) || !firstPending.exchange(false, std::memory_order_acq_rel)) return;
+        Counters::AddNs(firstSubmitNs, nowNs - startNs.load(std::memory_order_relaxed));
+        Counters::Add(firstSubmits, 1);
+    }
+
+    void Presented(std::int64_t nowNs) {
+        const auto last = lastSubmitNs.load(std::memory_order_relaxed);
+        if (last == 0) return;
+        Counters::AddNs(tailNs, nowNs - last);
+        Counters::Add(tails, 1);
+    }
+
+    ChainTotals Take() {
+        const auto take = [](Counters::Counter& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+        return {take(firstSubmitNs), take(firstSubmits), take(tailNs), take(tails)};
+    }
+
+private:
+    std::atomic<bool> open{false}, firstPending{false};
+    std::atomic<std::int64_t> startNs{0}, lastSubmitNs{0};
+    Counters::Counter firstSubmitNs{0}, firstSubmits{0}, tailNs{0}, tails{0};
+};
+
+inline FrameChain& GlobalChain() {
+    static FrameChain* chain = new FrameChain();
+    return *chain;
+}
 
 using StepClock = std::int64_t (*)();
 
@@ -354,10 +619,20 @@ private:
     std::uint64_t presents = 0;
 };
 
+Derived Derive(const Totals& totals, const Window& window);
 std::string FormatGuest(const Totals& totals, const Window& window);
 std::string FormatLanes(const Totals& totals, const Window& window);
 using SlotNamer = std::string (*)(std::size_t slot);
 std::string FormatPackets(const Totals& totals, const Window& window, SlotNamer name);
+std::string FormatFifo(const Totals& totals, const Window& window, SlotNamer name);
+std::string FormatSpine(const Totals& totals, const Window& window, std::uint32_t sampleEvery);
+std::string FormatThreadCpu(const Window& window);
+std::string FormatChain(const Totals& totals, const Window& window);
+std::string FormatMemo(const Totals& totals, const Window& window);
+// The [run-id] line: the libs' git describe, their build time and the set APS5_ variables.
+std::string FormatRunId(std::string_view describe, std::string_view built, std::span<const std::string> environment);
+// Prints the [run-id] line to stderr (RunId.cpp, which embeds the build's revision).
+void PrintRunId();
 
 Counters& Global();
 

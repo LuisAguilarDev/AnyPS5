@@ -4,6 +4,7 @@
 #include "RuntimeAbi.hpp"
 #include "SharedVector.hpp"
 #include "PipelineSpecialization.hpp"
+#include "ProgramKeyCensus.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
 #include <array>
@@ -824,6 +825,14 @@ struct ResultMemoMissCauses {
     std::array<std::uint64_t, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
 };
 [[nodiscard]] ResultMemoMissCauses ResultMemoMisses();
+// The result memo's hits, misses and evictions since the start (APS5_PROFILE_FRAME takes deltas).
+struct ResultMemoTotals {
+    std::uint64_t hits = 0, misses = 0, evictions = 0;
+};
+[[nodiscard]] ResultMemoTotals ResultMemoCounts();
+// APS5_PROFILE_FRAME: the program keys (variant, binding-plan key, module key) materialized since
+// the last call ([frame-steps-memo]).
+[[nodiscard]] ProgramKeyCensus::Counts TakeProgramKeyCensus();
 
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile

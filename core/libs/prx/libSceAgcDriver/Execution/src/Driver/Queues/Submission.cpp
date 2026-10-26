@@ -414,7 +414,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
+    const auto validateStartNs = frameSteps ? FrameSteps::NowNs() : 0;
     validate(submission, descriptor.addr);
+    if (frameSteps) FrameSteps::Counters::AddNs(FrameSteps::Global().submitValidateNs, FrameSteps::NowNs() - validateStartNs);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     std::array<std::int64_t, 4> waitedAt{};

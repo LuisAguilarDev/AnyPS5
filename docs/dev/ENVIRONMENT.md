@@ -373,6 +373,8 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_PRESENT_POLL_FENCE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | polls the present fence every 50 us instead of blocking on it |
 | `APS5_PROBE_DISPATCH` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | probes one dispatch at a hex program address (optionally `:index`) with debug output |
 | `APS5_PROFILE_DRAW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | prints the per-phase driver and draw timing totals |
+| `APS5_PROFILE_FRAME` | presence | `core/libs/prx/libSceAgcDriver/Execution/include/FrameSteps.hpp` |  | prints the per-frame `[frame-steps*]` lines every 10 s (docs/dev/BUILD.md); the shader disk cache key ignores it |
+| `APS5_PROFILE_FRAME_SAMPLE` | string | `core/libs/prx/libSceAgcDriver/Execution/include/FrameSteps.hpp` | `16` | with APS5_PROFILE_FRAME, times the draw phases of one in this many draw commits on the spine for `[frame-steps-spine]`; a power of two from 1 to 1024, anything else is 16 |
 | `APS5_PROFILE_GPU` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records the GPU time of recorded work by key from batch timestamps |
 | `APS5_REAP_EACH_PACKET` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/DeferredLabels.cpp` |  | reaps deferred labels after every packet |
 | `APS5_RELEASE_ON_UNLOCK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | destroys deferred batches on the unlocking thread instead of a release thread |

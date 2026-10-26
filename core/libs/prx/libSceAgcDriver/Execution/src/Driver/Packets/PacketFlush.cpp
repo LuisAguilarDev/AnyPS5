@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 
@@ -88,6 +89,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     if (submit || capped) {
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
+        const FrameSteps::SubmitCause cause(capped ? FrameSteps::TriggerCap : !labelPacket && packetFlush ? FrameSteps::TriggerLabel : FrameSteps::TriggerDeadline);
         localDevice->SubmitRecorded(queue == 0);
         if (capped) ++capFlushes;
         else if (!labelPacket && packetFlush) ++packetFlushes;

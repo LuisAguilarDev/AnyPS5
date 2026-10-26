@@ -448,6 +448,7 @@ ReleaseQueue& ReleaseThreadQueue() {
 
 void ReleaseThreadMain() {
     CpuTopology::PinHelperThread("release thread");
+    FrameSteps::BindThread(FrameSteps::RoleRelease, 0);
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
     for (;;) {
@@ -4103,7 +4104,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         completionLabels.fetch_add(1, std::memory_order_acq_rel);
         ++batch.completionStoreCount;
         completionStores.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreaker::CompletionLabel);
     }
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
@@ -4120,7 +4121,7 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     batch.completions.push_back(std::move(action));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreaker::CompletionLabel);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
@@ -4148,7 +4149,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             label.counted = true;
             ++batch.completionLabelCount;
             completionLabels.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreaker::CompletionLabel);
             completionLabelsCountedLate.fetch_add(1, std::memory_order_relaxed);
             ++batch.completionStoreCount;
             completionStores.fetch_add(1, std::memory_order_acq_rel);
@@ -4290,6 +4291,8 @@ void Recorder::Submit() {
         auto& counters = FrameSteps::Global();
         FrameSteps::Counters::Add(counters.vkSubmits, 1);
         FrameSteps::Counters::AddNs(counters.vkSubmitNs, std::chrono::duration_cast<std::chrono::nanoseconds>(batch->submittedAt - submitStart).count());
+        FrameSteps::NoteVkSubmit(counters, FrameSteps::ThreadRole(), FrameSteps::ThreadTrigger());
+        FrameSteps::GlobalChain().Submitted(FrameSteps::NowNs());
     }
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {
@@ -4412,7 +4415,10 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    {
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerWait, true);
+        Submit();
+    }
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -4563,6 +4569,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // SyncThrough disabled everything is the target as well.
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerWait, true);
         Submit();
         targetSerial = submissions;
     } else {

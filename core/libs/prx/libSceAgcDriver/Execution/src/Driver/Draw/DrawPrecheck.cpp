@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -63,9 +64,11 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
                     target->ColorMetadataPass(pass);
                 }, std::move(writes));
                 DrawPipeline::CountPipelinedMetadataPass();
+                if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().mpassPipelined, 1);
                 return DrawVerdict::Drawn;
             }
         }
+        if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().mpassInline, 1);
         if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());

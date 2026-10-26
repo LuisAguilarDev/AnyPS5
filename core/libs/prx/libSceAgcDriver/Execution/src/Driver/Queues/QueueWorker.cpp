@@ -86,6 +86,7 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress)
     const auto localDevice = device.Load();
     if (work) {
         recordDeferredLabels(localDevice.get(), 0);
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerEnd);
         if (localDevice != nullptr) localDevice->SubmitRecorded(true);
     }
     if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);
@@ -142,6 +143,7 @@ void Driver::noteFrameStepDequeue(const Submission& submission, std::int64_t wai
     auto& counters = FrameSteps::Global();
     FrameSteps::Counters::AddNs(counters.packetIdleNs, dequeuedNs - waitStartNs);
     if (submission.suspend || submission.enqueuedAt == std::chrono::steady_clock::time_point{}) return;
+    FrameSteps::GlobalChain().Dequeued(dequeuedNs);
     FrameSteps::Counters::AddNs(counters.queueLatencyNs, std::chrono::duration_cast<std::chrono::nanoseconds>(now - submission.enqueuedAt).count());
     FrameSteps::Counters::Add(counters.queueLatencies, 1);
 }
@@ -159,6 +161,7 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
     const bool frameSteps = id == 0 && FrameSteps::Enabled();
+    if (frameSteps) FrameSteps::BindThread(FrameSteps::RolePacket, 0);
     try {
         if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {

@@ -544,7 +544,7 @@ if(BUILD_TESTING)
     endif()
 
     add_test_executable(agc_frame_steps_tests tests/FrameSteps.cpp Execution/src/FrameSteps.cpp)
-    target_include_directories(agc_frame_steps_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_include_directories(agc_frame_steps_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
     target_link_libraries(agc_frame_steps_tests PRIVATE libc)
     configure_windows_unwind(agc_frame_steps_tests)
     add_test(NAME agc_frame_steps COMMAND agc_frame_steps_tests)

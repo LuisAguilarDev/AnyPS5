@@ -1691,8 +1691,11 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+static_assert(static_cast<std::size_t>(ProofBreaker::Count) == FrameSteps::ProofBreakers, "the frame-step proof breakers are GuestMemory's");
+
+void BreakProofs(ProofBreaker caller) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().proofBreaks[static_cast<std::size_t>(caller)], 1);
 }
 
 void MarkProofThread() {
@@ -1911,7 +1914,7 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
-    BreakProofs();
+    BreakProofs(ProofBreaker::Store);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -1956,7 +1959,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    BreakProofs();
+    BreakProofs(ProofBreaker::Written);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2341,7 +2344,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(ProofBreaker::GpuHold);
         if (FrameSteps::Enabled()) frameStepHoldStartNs = FrameSteps::NowNs();
     }
 }
@@ -2704,7 +2707,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreaker::WriteChanged);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).

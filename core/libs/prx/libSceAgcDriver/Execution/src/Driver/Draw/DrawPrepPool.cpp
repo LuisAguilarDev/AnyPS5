@@ -96,6 +96,7 @@ void DrawPrepPool::run() {
     TagLockRole(LockRole::Prep);
     const bool frameSteps = FrameSteps::Enabled();
     const auto slot = FrameSteps::Counters::Slot(poolThreadsStarted.fetch_add(1, std::memory_order_relaxed));
+    if (frameSteps) FrameSteps::BindThread(FrameSteps::RolePool, slot);
     for (;;) {
         Task task;
         {

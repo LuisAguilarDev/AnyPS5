@@ -26,6 +26,8 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> CommitKindNames{"draw", "label", "dma", "dispatch", "fill", "pass", "completion", "open work", "other"};
+static_assert(static_cast<std::size_t>(DrawPipeline::CommitKind::Count) == FrameSteps::PoolEnqueueKind && FrameSteps::PoolEnqueueKind + 1 == FrameSteps::EnqueueKinds, "the frame-step enqueue kinds are the commit kinds and the pool");
+static_assert(static_cast<std::size_t>(DrawPipeline::DrainReason::Count) == FrameSteps::DrainReasons, "the frame-step drain reasons are the pipeline's");
 
 std::atomic<unsigned> runningCommitters{0};
 
@@ -321,7 +323,7 @@ void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> wr
         resumeAt = 0;
         const auto waited = elapsedNs(start);
         fullWaitNs += waited;
-        if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().fifoFullNs, waited);
+        if (FrameSteps::Enabled()) FrameSteps::NoteFifoFull(FrameSteps::Global(), DrawPrepPool::InPoolThread() ? FrameSteps::PoolEnqueueKind : static_cast<std::size_t>(kind), static_cast<std::int64_t>(waited));
         rethrowFailure();
     }
     if (FrameSteps::Enabled()) {
@@ -361,9 +363,9 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::snprintf(item, sizeof(item), " %s %llu (%.1f ms)", DrainNames[i], static_cast<unsigned long long>(drains[i]), static_cast<double>(drainWaitNs[i]) / 1e6);
         drainText += item;
     }
-    drainText += "; packet drains by opcode:";
+    drainText += "; packet drains by opcode (0x100: none):";
     for (int shown = 0; shown < 5; ++shown) {
-        const auto top = std::max_element(drainOpcodes.begin(), drainOpcodes.begin() + 0x100);
+        const auto top = std::max_element(drainOpcodes.begin(), drainOpcodes.end());
         if (*top == 0) break;
         char item[32];
         std::snprintf(item, sizeof(item), " 0x%02x x%llu", static_cast<unsigned>(top - drainOpcodes.begin()), static_cast<unsigned long long>(*top));
@@ -403,6 +405,9 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     const bool frameSteps = FrameSteps::Enabled();
+    if (frameSteps) FrameSteps::BindThread(FrameSteps::RoleSpine, 0);
+    FrameSteps::Sampler spineSampler(FrameSteps::SpineSampleEvery());
+    auto& spineSample = FrameSteps::ThreadSpineSample();
     for (;;) {
         const auto emptyStart = frameSteps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         Commit* commit = nullptr;
@@ -419,6 +424,11 @@ void DrawPipeline::run() {
             kind = items.front().kind;
             isDraw = items.front().draw;
         }
+        // 1 draw commit in SpineSampleEvery: its Graphics draw phases (DrawTimer) go to the spine split.
+        if (frameSteps && kind == CommitKind::Draw && spineSampler.Next()) {
+            spineSample.phaseNs = {};
+            spineSample.active = true;
+        }
         const auto start = std::chrono::steady_clock::now();
         if (frameSteps) FrameSteps::Counters::AddNs(FrameSteps::Global().fifoEmptyNs, std::chrono::duration_cast<std::chrono::nanoseconds>(start - emptyStart).count());
         std::exception_ptr fatal;
@@ -426,7 +436,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreaker::NonDrawCommit);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
@@ -437,6 +447,10 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (spineSample.active) {
+            spineSample.active = false;
+            FrameSteps::NoteSpineSample(FrameSteps::Global(), spineSample, spent);
+        }
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
@@ -511,7 +525,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     const auto waited = elapsedNs(start);
     drainWaitNs[index] += waited;
-    if (FrameSteps::Enabled()) FrameSteps::Counters::Add(FrameSteps::Global().fifoDrainNs, waited);
+    if (FrameSteps::Enabled()) FrameSteps::NoteFifoDrain(FrameSteps::Global(), index, opcode, static_cast<std::int64_t>(waited));
     rethrowFailure();
 }
 

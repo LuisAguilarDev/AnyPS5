@@ -267,6 +267,7 @@ function(add_shader_recompiler target runtimeTarget)
             Recompile
             RecompileCacheKey::ContextHash
             RecompileResult
+            ResultMemoCounts
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
@@ -301,6 +302,7 @@ function(add_shader_recompiler target runtimeTarget)
             SrgbUnormFormat
             FindUserDataTail
             LinkUserDataTail
+            TakeProgramKeyCensus
             ThreadOwned
             ProgramRole
             UnresolvableSwappcTarget

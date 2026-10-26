@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -223,6 +224,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
             }
 
+            const FrameSteps::SubmitCause cause(FrameSteps::TriggerWait);
             if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
         }
     }
@@ -283,6 +285,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             return false;
         }
         bool submitted = false;
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerWait);
         if (changed) {
             seenGeneration = generation;
             recheck = false;

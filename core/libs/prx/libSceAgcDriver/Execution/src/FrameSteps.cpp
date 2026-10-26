@@ -1,5 +1,19 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include <cstdio>
+#include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <intrin.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 namespace AgcDriver::FrameSteps {
 
@@ -8,6 +22,14 @@ namespace {
 constexpr std::size_t PacketRole = 1;
 constexpr std::size_t SpineRole = 3;
 constexpr double BytesPerKb = 1024.0;
+constexpr double Percent = 100.0;
+constexpr std::array<const char*, EnqueueKinds> EnqueueKindNames{"draw", "label", "dma", "dispatch", "fill", "pass", "completion", "open_work", "other", "pool"};
+constexpr std::array<const char*, DrainReasons> DrainReasonNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
+constexpr std::array<const char*, SpinePhases> SpinePhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe", "other"};
+constexpr std::array<const char*, ProofBreakers> ProofBreakerNames{"other", "store", "written", "write_changed", "gpu_hold", "non_draw_commit", "completion_label", "copied_writer", "resource_write_back"};
+constexpr std::array<const char*, ThreadRoles> RoleNames{"other", "packet", "spine", "pool", "recorder", "presenter", "release"};
+constexpr std::array<const char*, SubmitTriggers> TriggerNames{"other", "cap", "deadline", "label", "completion", "flip", "present", "end", "idle", "wait", "suspend"};
+constexpr std::string_view EnvironmentPrefix = "APS5_";
 
 double Ms(std::uint64_t ns) {
     return static_cast<double>(ns) / 1e6;
@@ -100,6 +122,265 @@ std::string TopSlots(const Totals& totals, std::uint64_t frames, SlotNamer name)
     return list;
 }
 
+template <std::size_t Size>
+std::string NameList(const std::array<const char*, Size>& names) {
+    std::string list;
+    for (std::size_t i = 0; i < Size; ++i) list += std::string(i == 0 ? "" : "/") + names[i];
+    return list;
+}
+
+// Each value per frame, '/'-separated: milliseconds of nanosecond totals, or counts.
+template <std::size_t Size>
+std::string PerFrameList(const std::array<std::uint64_t, Size>& values, std::uint64_t frames, bool nanoseconds) {
+    std::string list;
+    char text[32];
+    for (std::size_t i = 0; i < Size; ++i) {
+        const auto value = nanoseconds ? PerFrame(Ms(values[i]), frames) : PerFrame(static_cast<double>(values[i]), frames);
+        std::snprintf(text, sizeof(text), nanoseconds ? "%s%.2f" : "%s%.1f", i == 0 ? "" : "/", value);
+        list += text;
+    }
+    return list;
+}
+
+std::string DrainOpcodeLabel(std::size_t opcode, SlotNamer name) {
+    if (opcode == NoDrainOpcode) return "none";
+    if (name != nullptr) {
+        if (auto named = name(opcode); !named.empty()) return named;
+    }
+    char text[16];
+    std::snprintf(text, sizeof(text), "0x%02zx", opcode);
+    return text;
+}
+
+std::string TopDrains(const Totals& totals, std::uint64_t frames, SlotNamer name) {
+    std::array<std::size_t, DrainOpcodes> order{};
+    std::size_t used = 0;
+    for (std::size_t opcode = 0; opcode < DrainOpcodes; ++opcode) {
+        if (totals.fifoDrainOpcodeCount[opcode] != 0) order[used++] = opcode;
+    }
+    if (used == 0) return "-";
+    const auto shown = std::min(used, TopDrainOpcodes);
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown), order.begin() + static_cast<std::ptrdiff_t>(used), [&](std::size_t left, std::size_t right) { return totals.fifoDrainOpcodeNs[left] > totals.fifoDrainOpcodeNs[right]; });
+    std::string list;
+    char text[64];
+    for (std::size_t i = 0; i < shown; ++i) {
+        const auto opcode = order[i];
+        std::snprintf(text, sizeof(text), ":%.1f/f:%.2fms/f", PerFrame(static_cast<double>(totals.fifoDrainOpcodeCount[opcode]), frames), PerFrame(Ms(totals.fifoDrainOpcodeNs[opcode]), frames));
+        if (i != 0) list += ",";
+        list += DrainOpcodeLabel(opcode, name) + text;
+    }
+    return list;
+}
+
+std::array<std::uint64_t, LaneThreads> CpuLanes(const Window& window, std::size_t first) {
+    std::array<std::uint64_t, LaneThreads> lanes{};
+    for (std::size_t i = 0; i < LaneThreads; ++i) lanes[i] = window.threadCpuNs[first + i];
+    return lanes;
+}
+
+double Rate(std::uint64_t hits, std::uint64_t lookups) {
+    return lookups != 0 ? Percent * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
+}
+
+// The registered threads' CPU time: QueryThreadCycleTime on Windows (cycles, converted at the TSC
+// rate measured over the same interval), the thread's CPU-time clock elsewhere.
+struct CpuThreads {
+    std::mutex mutex;
+#ifdef _WIN32
+    std::array<HANDLE, CpuSlots> handles{};
+    std::uint64_t lastTicks = 0;
+    std::int64_t lastNs = 0;
+#else
+    std::array<clockid_t, CpuSlots> clocks{};
+    std::array<bool, CpuSlots> bound{};
+#endif
+    std::array<std::uint64_t, CpuSlots> last{};
+};
+
+CpuThreads& Threads() {
+    static CpuThreads* threads = new CpuThreads();
+    return *threads;
+}
+
+#ifdef _WIN32
+std::uint64_t ThreadCycles(HANDLE handle) {
+    ULONG64 cycles = 0;
+    return QueryThreadCycleTime(handle, &cycles) ? cycles : 0;
+}
+#else
+std::uint64_t ThreadClockNs(clockid_t clock) {
+    timespec now{};
+    if (clock_gettime(clock, &now) != 0) return 0;
+    return static_cast<std::uint64_t>(now.tv_sec) * 1'000'000'000ull + static_cast<std::uint64_t>(now.tv_nsec);
+}
+#endif
+
+}
+
+void BindThread(std::size_t role, std::size_t index) {
+    if (!Enabled()) return;
+    threadRole = static_cast<std::uint8_t>(std::min(role, ThreadRoles - 1));
+    const auto slot = CpuSlot(role, index);
+    if (slot >= CpuSlots) return;
+    auto& threads = Threads();
+    std::lock_guard lock(threads.mutex);
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle, THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) return;
+    if (threads.handles[slot] != nullptr) CloseHandle(threads.handles[slot]);
+    threads.handles[slot] = handle;
+    threads.last[slot] = ThreadCycles(handle);
+    if (threads.lastTicks == 0) {
+        threads.lastTicks = __rdtsc();
+        threads.lastNs = NowNs();
+    }
+#else
+    clockid_t clock{};
+    if (pthread_getcpuclockid(pthread_self(), &clock) != 0) return;
+    threads.clocks[slot] = clock;
+    threads.bound[slot] = true;
+    threads.last[slot] = ThreadClockNs(clock);
+#endif
+}
+
+std::array<std::uint64_t, CpuSlots> TakeThreadCpuNs() {
+    std::array<std::uint64_t, CpuSlots> spent{};
+    auto& threads = Threads();
+    std::lock_guard lock(threads.mutex);
+#ifdef _WIN32
+    const auto ticks = __rdtsc();
+    const auto nowNs = NowNs();
+    const auto elapsedTicks = threads.lastTicks != 0 && ticks > threads.lastTicks ? ticks - threads.lastTicks : 0;
+    const auto elapsedNs = static_cast<std::uint64_t>(std::max<std::int64_t>(0, nowNs - threads.lastNs));
+    threads.lastTicks = ticks;
+    threads.lastNs = nowNs;
+    for (std::size_t slot = 0; slot < CpuSlots; ++slot) {
+        if (threads.handles[slot] == nullptr) continue;
+        const auto cycles = ThreadCycles(threads.handles[slot]);
+        spent[slot] = CyclesToNs(cycles > threads.last[slot] ? cycles - threads.last[slot] : 0, elapsedTicks, elapsedNs);
+        threads.last[slot] = cycles;
+    }
+#else
+    for (std::size_t slot = 0; slot < CpuSlots; ++slot) {
+        if (!threads.bound[slot]) continue;
+        const auto ns = ThreadClockNs(threads.clocks[slot]);
+        spent[slot] = ns > threads.last[slot] ? ns - threads.last[slot] : 0;
+        threads.last[slot] = ns;
+    }
+#endif
+    return spent;
+}
+
+Derived Derive(const Totals& totals, const Window& window) {
+    const auto frames = window.frames;
+    const auto perFrameMs = [&](std::uint64_t ns) { return PerFrame(Ms(ns), frames); };
+    Derived derived;
+    derived.frameMs = window.gapMs.mean + window.spanMs.mean;
+    derived.packetOwnMs = std::max(0.0, perFrameMs(totals.packetBusyNs) - perFrameMs(totals.fifoFullNs) - perFrameMs(totals.fifoDrainNs) - perFrameMs(totals.packetPoolWaitNs));
+    if (frames == 0) return derived;
+    derived.couplingMs = derived.frameMs - perFrameMs(totals.packetIdleNs) - std::max(derived.packetOwnMs, perFrameMs(totals.spineBusyNs));
+    derived.tailMs = window.flipToPresentMs.mean - PerItem(Ms(totals.queueLatencyNs), totals.queueLatencies) - perFrameMs(totals.packetBusyNs);
+    return derived;
+}
+
+std::string FormatFifo(const Totals& totals, const Window& window, SlotNamer name) {
+    const auto frames = window.frames;
+    char text[192];
+    const auto length = std::snprintf(text, sizeof(text), "[frame-steps-fifo] window_s=%.1f frames=%llu fifo_full_ms/f=%.2f ", window.seconds, static_cast<unsigned long long>(frames), PerFrame(Ms(totals.fifoFullNs), frames));
+    if (length < 0) return {};
+    std::string line(text);
+    line += "fifo_full_ms/f(" + NameList(EnqueueKindNames) + ")=" + PerFrameList(totals.fifoFullKindNs, frames, true);
+    std::snprintf(text, sizeof(text), " fifo_drain_ms/f=%.2f", PerFrame(Ms(totals.fifoDrainNs), frames));
+    line += text;
+    line += " fifo_drains/f(" + NameList(DrainReasonNames) + ")=" + PerFrameList(totals.fifoDrainReasonCount, frames, false);
+    line += " fifo_drain_ms/f(" + NameList(DrainReasonNames) + ")=" + PerFrameList(totals.fifoDrainReasonNs, frames, true);
+    line += " drain_top=" + TopDrains(totals, frames, name);
+    std::snprintf(text, sizeof(text), " mpass_inline/f=%.1f mpass_pipelined/f=%.1f\n", PerFrame(static_cast<double>(totals.mpassInline), frames), PerFrame(static_cast<double>(totals.mpassPipelined), frames));
+    return line + text;
+}
+
+std::string FormatSpine(const Totals& totals, const Window& window, std::uint32_t sampleEvery) {
+    char text[256];
+    const auto length = std::snprintf(text, sizeof(text), "[frame-steps-spine] window_s=%.1f frames=%llu sampled_commits=%llu sample_every=%u sampled_commit_us=%.2f draw_commit_us=%.2f spine_phases_us/commit=",
+        window.seconds, static_cast<unsigned long long>(window.frames), static_cast<unsigned long long>(totals.spineSamples), sampleEvery, PerItem(Us(totals.spineSampleNs), totals.spineSamples), PerItem(Us(totals.drawCommitNs), totals.drawCommits));
+    if (length < 0) return {};
+    std::string line(text);
+    std::string list;
+    for (std::size_t i = 0; totals.spineSamples != 0 && i < SpinePhases; ++i) {
+        if (totals.spinePhaseNs[i] == 0) continue;
+        std::snprintf(text, sizeof(text), "%s%s=%.2f", list.empty() ? "" : "|", SpinePhaseNames[i], PerItem(Us(totals.spinePhaseNs[i]), totals.spineSamples));
+        list += text;
+    }
+    return line + (list.empty() ? "-" : list) + "\n";
+}
+
+std::string FormatThreadCpu(const Window& window) {
+    const auto frames = window.frames;
+    const auto perFrameMs = [&](std::size_t slot) { return PerFrame(Ms(window.threadCpuNs[slot]), frames); };
+    const auto recorders = ThreadList(CpuLanes(window, CpuRecorders), frames);
+    const auto pool = ThreadList(CpuLanes(window, CpuPool), frames);
+    char text[512];
+    const auto length = std::snprintf(text, sizeof(text), "[frame-steps-cpu] window_s=%.1f frames=%llu thread_cpu_ms/f packet=%.2f spine=%.2f presenter=%.2f release=%.2f rec=%s pool=%s",
+        window.seconds, static_cast<unsigned long long>(frames), perFrameMs(CpuPacket), perFrameMs(CpuSpine), perFrameMs(CpuPresenter), perFrameMs(CpuRelease), recorders.c_str(), pool.c_str());
+    return Finish(text, length);
+}
+
+std::string FormatChain(const Totals& totals, const Window& window) {
+    const auto frames = window.frames;
+    char text[384];
+    const auto length = std::snprintf(text, sizeof(text), "[frame-steps-chain] window_s=%.1f frames=%llu gpu_gap_ms/f=%.2f first_submit_ms=%.2f last_submit_to_present_ms=%.2f submit_validate_us=%.1f vk_submits/f=%.1f vk_submits/f(thread:trigger)=",
+        window.seconds, static_cast<unsigned long long>(frames), PerFrame(window.gpuGapMs, frames), PerItem(Ms(window.chain.firstSubmitNs), window.chain.firstSubmits), PerItem(Ms(window.chain.tailNs), window.chain.tails),
+        PerItem(Us(totals.submitValidateNs), totals.submits), PerFrame(static_cast<double>(totals.vkSubmits), frames));
+    if (length < 0) return {};
+    std::string line(text);
+    std::string list;
+    for (std::size_t role = 0; role < ThreadRoles; ++role) {
+        for (std::size_t trigger = 0; trigger < SubmitTriggers; ++trigger) {
+            const auto count = totals.vkSubmitsBy[role * SubmitTriggers + trigger];
+            if (count == 0) continue;
+            std::snprintf(text, sizeof(text), "%s%s:%s=%.1f", list.empty() ? "" : ",", RoleNames[role], TriggerNames[trigger], PerFrame(static_cast<double>(count), frames));
+            list += text;
+        }
+    }
+    return line + (list.empty() ? "-" : list) + "\n";
+}
+
+std::string FormatMemo(const Totals& totals, const Window& window) {
+    const auto frames = window.frames;
+    const auto perFrame = [&](std::uint64_t count) { return PerFrame(static_cast<double>(count), frames); };
+    std::uint64_t breaks = 0;
+    for (const auto count : totals.proofBreaks) breaks += count;
+    const auto& shaders = window.shaders;
+    const auto resultLookups = shaders.resultMemoHits + shaders.resultMemoMisses;
+    char text[1024];
+    const auto length = std::snprintf(text, sizeof(text), "[frame-steps-memo] window_s=%.1f frames=%llu proof_breaks/f=%.1f proof_breaks/f(%s)=%s ",
+        window.seconds, static_cast<unsigned long long>(frames), perFrame(breaks), NameList(ProofBreakerNames).c_str(), PerFrameList(totals.proofBreaks, frames, false).c_str());
+    if (length < 0) return {};
+    std::string line(text);
+    const auto tail = std::snprintf(text, sizeof(text),
+        "target_memo_hit%%=%.1f target_memo_lookups/f=%.1f draw_input_memo_hit%%=%.1f draw_input_memo_lookups/f=%.1f result_memo_hit%%=%.1f result_memo_lookups/f=%.1f result_memo_evictions/f=%.1f "
+        "stages/draw=%.2f program_keys/10s=%llu program_key_materializes/f=%.1f program_key_table_hit%%=%.1f program_key_overflow=%llu half_checks/f=%.1f half_stale/f=%.1f",
+        Rate(totals.targetMemoHits, totals.targetMemoLookups), perFrame(totals.targetMemoLookups), Rate(totals.drawInputMemoHits, totals.drawInputMemoLookups), perFrame(totals.drawInputMemoLookups),
+        Rate(shaders.resultMemoHits, resultLookups), perFrame(resultLookups), perFrame(shaders.resultMemoEvictions),
+        PerItem(static_cast<double>(totals.drawStages), totals.stagedDraws), static_cast<unsigned long long>(shaders.programKeysDistinct), perFrame(shaders.programKeys), Rate(shaders.programKeyTableHits, shaders.programKeys), static_cast<unsigned long long>(shaders.programKeyOverflow),
+        perFrame(totals.halfChecks), perFrame(totals.halfStale));
+    if (tail < 0) return {};
+    return line + text + "\n";
+}
+
+std::string FormatRunId(std::string_view describe, std::string_view built, std::span<const std::string> environment) {
+    std::vector<std::string> set;
+    for (const auto& entry : environment) {
+        if (entry.starts_with(EnvironmentPrefix)) set.push_back(entry);
+    }
+    std::sort(set.begin(), set.end());
+    std::string list;
+    for (const auto& entry : set) list += (list.empty() ? "" : ",") + entry;
+    std::string line = "[run-id] libs=";
+    line += describe.empty() ? "unknown" : describe;
+    line += " built=";
+    line += built.empty() ? "unknown" : built;
+    return line + " env=" + (list.empty() ? "-" : list) + "\n";
 }
 
 Counters& Global() {
@@ -165,7 +446,11 @@ std::string FormatLanes(const Totals& totals, const Window& window) {
         recSum, recMax, recThreads.c_str(),
         perFrameCount(totals.vkSubmits), perFrameMs(totals.vkSubmitNs), PerFrame(window.gpuBusyMs, frames),
         window.intervalMs.p50, window.intervalMs.p95, window.flipToPresentMs.p50, window.flipToPresentMs.p95, window.flipToPresentMs.mean);
-    return Finish(text, length);
+    if (length < 0) return {};
+    std::string line(text);
+    const auto derived = Derive(totals, window);
+    std::snprintf(text, sizeof(text), " packet_own_ms/f=%.2f coupling_ms=%.2f tail_ms=%.2f\n", derived.packetOwnMs, derived.couplingMs, derived.tailMs);
+    return line + text;
 }
 
 std::string FormatPackets(const Totals& totals, const Window& window, SlotNamer name) {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -551,6 +552,7 @@ TileMipLayout ColorTargetMip(const ColorTarget& color, const ColorTargetLayout& 
 // the millisecond the old print rounded to), totalled over 10 s in the [draws] line.
 enum DrawPhase : std::size_t { PhaseValidate, PhaseVertex, PhaseSetup, PhaseReadTarget, PhasePrepare, PhaseLookup, PhaseResources, PhasePipeline, PhaseRecord, PhaseKeep, PhaseSync, PhaseWriteBack, PhaseDescribe, PhaseCount };
 constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+static_assert(PhaseCount == AgcDriver::FrameSteps::SpineDrawPhases, "the frame-step spine phases are the draw phases");
 enum RecordPart : std::size_t { RecordPrologue, RecordBindings, RecordPass, RecordBarriers, RecordBegin, RecordContinue, RecordBind, RecordPush, RecordCommands, RecordLeave, RecordPartCount };
 constexpr std::array<const char*, RecordPartCount> RecordPartNames{"prologue", "bindings", "pass", "barriers", "begin", "continue", "bind", "push", "commands", "leave"};
 // The lookup phase of a cacheable draw (resolveDrawResources): the content key, the cache find,
@@ -1435,45 +1437,66 @@ namespace {
 // DrawWithRecipe.
 struct DrawTimer {
     bool profile;
+    // The spine's sampled draw commit (APS5_PROFILE_FRAME, [frame-steps-spine]) this draw runs in,
+    // if any: its phases are added there as well.
+    AgcDriver::FrameSteps::SpineSample* sample;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
     RecordSplit split;
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
-    void phase(DrawPhase which) {
-        if (!profile) return;
+    explicit DrawTimer(bool profile) : profile(profile), sample(sampledCommit()), phaseStart(std::chrono::steady_clock::now()) {}
+    static AgcDriver::FrameSteps::SpineSample* sampledCommit() {
+        if (!AgcDriver::FrameSteps::Enabled()) return nullptr;
+        auto& sample = AgcDriver::FrameSteps::ThreadSpineSample();
+        return sample.active ? &sample : nullptr;
+    }
+    bool timed() const { return profile || sample != nullptr; }
+    // The time since the last mark, in microseconds; the sample takes it in nanoseconds.
+    double mark(DrawPhase which) {
         const auto now = std::chrono::steady_clock::now();
-        us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
+        const auto elapsed = now - phaseStart;
         phaseStart = now;
+        if (sample != nullptr) sample->phaseNs[which] += std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+        return std::chrono::duration<double, std::micro>(elapsed).count();
+    }
+    void phase(DrawPhase which) {
+        if (!timed()) return;
+        const auto elapsed = mark(which);
+        if (profile) us[which] += elapsed;
     }
     void part(RecordPart which) {
+        if (!timed()) return;
+        const auto elapsed = mark(PhaseRecord);
         if (!profile) return;
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
         us[PhaseRecord] += elapsed;
         split.us[which] += elapsed;
         split.used = true;
-        phaseStart = now;
     }
     // A slice of the lookup phase (the phase total stays what phase(PhaseLookup) adds up).
     void lookup(LookupPart which) {
+        if (!timed()) return;
+        const auto elapsed = mark(PhaseLookup);
         if (!profile) return;
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
         us[PhaseLookup] += elapsed;
         split.lookup[which] += elapsed;
-        phaseStart = now;
     }
     // A slice of the vertex phase, likewise.
     void vertex(VertexPart which) {
+        if (!timed()) return;
+        const auto elapsed = mark(PhaseVertex);
         if (!profile) return;
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration<double, std::micro>(now - phaseStart).count();
         us[PhaseVertex] += elapsed;
         split.vertex[which] += elapsed;
-        phaseStart = now;
     }
     ShaderResources::DrawBindingsProfile* bindingsProfile() { return profile ? &split.bindings : nullptr; }
 };
+
+// The shader stages of a drawn draw ([frame-steps-memo] stages/draw).
+void noteDrawStages(std::size_t stages) {
+    if (!AgcDriver::FrameSteps::Enabled()) return;
+    auto& counters = AgcDriver::FrameSteps::Global();
+    AgcDriver::FrameSteps::Counters::Add(counters.stagedDraws, 1);
+    AgcDriver::FrameSteps::Counters::Add(counters.drawStages, stages);
+}
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
@@ -1736,6 +1759,8 @@ DrawInputMemo& drawInputMemo(std::uint64_t address, std::size_t bytes) {
 DrawInputCopy copyDrawInputMemo(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::uint64_t& hits) {
     if (!drawInputMemoEnabled() || recorder == nullptr || bytes == 0 || DeviceLocalDrawBuffers(context)) return CopyDrawInput(context, recorder, address, bytes, alignment, use);
     auto& memo = drawInputMemo(address, bytes);
+    const bool frameSteps = AgcDriver::FrameSteps::Enabled();
+    if (frameSteps) AgcDriver::FrameSteps::Counters::Add(AgcDriver::FrameSteps::Global().drawInputMemoLookups, 1);
     const auto before = currentTargetMemoToken();
     if (before.epoch != 0 && memo.token == before && memo.address == address && memo.bytes == bytes && memo.alignment == alignment && memo.use == use && memo.recorder == recorder) {
         if (auto buffer = memo.buffer.lock(); buffer != nullptr) {
@@ -1754,6 +1779,7 @@ DrawInputCopy copyDrawInputMemo(const Context& context, Recorder* recorder, std:
             copy.generation = memo.generation;
             copy.registryGeneration = memo.registryGeneration;
             drawInputMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (frameSteps) AgcDriver::FrameSteps::Counters::Add(AgcDriver::FrameSteps::Global().drawInputMemoHits, 1);
             ++hits;
             return copy;
         }
@@ -2159,12 +2185,15 @@ std::shared_ptr<StorageTexture> residentTargetMemo(const Context& context, const
     const auto& color = state.colors[index];
     if (!targetMemoEnabled() || index >= TargetMemoSlots) return refreshResidentTarget(context, state, color, outcome, profile, lookup);
     auto& memo = residentTargetMemos()[index];
+    const bool frameSteps = AgcDriver::FrameSteps::Enabled();
+    if (frameSteps) AgcDriver::FrameSteps::Counters::Add(AgcDriver::FrameSteps::Global().targetMemoLookups, 1);
     const auto before = currentTargetMemoToken();
     if (before.epoch != 0 && memo.token == before && memo.device == context.device && sameColorTarget(memo.color, color)) {
         if (auto memoized = memo.resident.lock(); memoized != nullptr && memoized->Cached()) {
             static const bool verify = std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr;
             if (verify) Require(refreshResidentTarget(context, state, color, outcome, profile, lookup) == memoized, "the resident target memo answered another image than the lookup");
             targetMemoHits.fetch_add(1, std::memory_order_relaxed);
+            if (frameSteps) AgcDriver::FrameSteps::Counters::Add(AgcDriver::FrameSteps::Global().targetMemoHits, 1);
             ++outcome.targetMemoHits;
             return memoized;
         }
@@ -2513,7 +2542,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             resources->WriteBackBuffers();
         });
         ListDrawCopiedWriter(resources);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreaker::CopiedWriter);
     } else if (completion) {
         if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
         else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
@@ -3033,6 +3062,14 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         bool checksInputs = false;
         std::uint64_t resourcesGeneration = 0;
         std::vector<ShaderResources::GuestInputDigest> inputDigests;
+        // APS5_PROFILE_FRAME: the moved buffers' words at queue time ([frame-steps-memo] half_stale).
+        bool checksMoved = false;
+        std::uint64_t movedDigest = 0;
+    };
+    const auto digestMoved = [](std::span<const ShaderResources::MovedBuffer> moved) {
+        auto digest = AgcDriver::FrameSteps::DigestOffset;
+        for (const auto& buffer : moved) digest = AgcDriver::FrameSteps::DigestWords(buffer.words, digest);
+        return digest;
     };
     auto half = std::make_shared<Half>(Half{context, state, draw});
     half->context.recorder = nullptr;
@@ -3066,11 +3103,20 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         half->resourcesGeneration = record.resources->RevalidateGeneration();
         record.resources->GuestInputDigests(half->moved, &half->pendingWrites, half->inputDigests);
     }
+    if (AgcDriver::FrameSteps::Enabled()) {
+        half->checksMoved = true;
+        half->movedDigest = digestMoved(half->moved);
+    }
     {
         const Recorder::ChunkKeepScope scope(recorder);
         const auto join = recorder.JoinChunk();
         const auto requests = recorder.CommandRequests();
-        recorders.Record(join.thread, join.chunk, [half](RecordingContext& recording, DrawRecorders::DrawStats& stats) {
+        recorders.Record(join.thread, join.chunk, [half, digestMoved](RecordingContext& recording, DrawRecorders::DrawStats& stats) {
+            if (half->checksMoved) {
+                auto& counters = AgcDriver::FrameSteps::Global();
+                AgcDriver::FrameSteps::Counters::Add(counters.halfChecks, 1);
+                if (digestMoved(half->moved) != half->movedDigest) AgcDriver::FrameSteps::Counters::Add(counters.halfStale, 1);
+            }
             if (half->checksInputs) {
                 if (const auto generation = half->record.resources->RevalidateGeneration(); generation != half->resourcesGeneration) Recorder::NoteStaleRecordResources(half->resourcesGeneration, generation);
                 for (const auto& input : half->inputDigests) {
@@ -4033,6 +4079,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    noteDrawStages(shaders.size());
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
     prepared.recipeOut = recipeOut;
@@ -4048,6 +4095,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
     DrawRecipeOutcome result;
+    // A miss is drawn again by Draw, which counts its stages then.
+    struct StageNote {
+        const DrawRecipeOutcome& result;
+        std::size_t stages;
+        ~StageNote() {
+            if (result.miss == DrawRecipeMiss::None) noteDrawStages(stages);
+        }
+    } stageNote{result, shaders.size()};
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;

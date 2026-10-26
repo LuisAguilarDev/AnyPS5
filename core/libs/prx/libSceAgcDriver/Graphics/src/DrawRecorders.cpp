@@ -219,6 +219,7 @@ void DrawRecorders::run(Worker& worker) {
     std::size_t slot = 0;
     while (slot < workers.size() && workers[slot].get() != &worker) ++slot;
     slot = FrameSteps::Counters::Slot(slot);
+    if (frameSteps) FrameSteps::BindThread(FrameSteps::RoleRecorder, slot);
     for (;;) {
         Item item;
         {

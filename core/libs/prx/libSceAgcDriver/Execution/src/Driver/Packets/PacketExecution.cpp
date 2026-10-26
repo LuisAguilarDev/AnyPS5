@@ -209,6 +209,7 @@ void Driver::execute(const Submission& submission) {
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
+                const FrameSteps::SubmitCause cause(FrameSteps::TriggerSuspend);
                 if (suspendDrain) localDevice->WaitIdle();
                 else localDevice->SubmitRecorded(submission.queue == 0);
             }
@@ -433,7 +434,10 @@ void Driver::execute(const Submission& submission) {
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
 
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                {
+                    const FrameSteps::SubmitCause cause(FrameSteps::TriggerFlip);
+                    if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                }
                 if (localDevice != nullptr) {
                     localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
                     const auto queueId = submission.queue;
@@ -441,6 +445,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
             if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
+            if (submission.queue == 0 && FrameSteps::Enabled()) FrameSteps::GlobalChain().Flipped();
             ++flipsCounted;
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
@@ -623,6 +628,7 @@ void Driver::execute(const Submission& submission) {
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerEnd);
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
     }
     endTiming.Finish();

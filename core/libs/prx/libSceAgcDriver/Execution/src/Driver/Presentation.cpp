@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "Recompiler.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
@@ -101,6 +102,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         pinned = true;
         PinWorkerThread("presenter");
         GuestMemory::MarkPresenterThread();
+        FrameSteps::BindThread(FrameSteps::RolePresenter, 0);
     }
     CheckFailure();
     require(gpuReady != nullptr && context != nullptr, "missing GPU completion callback");
@@ -186,7 +188,11 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
         if (profile) reportPresents(waitedMs, inFlight);
-        if (FrameSteps::Enabled()) reportFrameSteps(FrameSteps::NowNs());
+        if (FrameSteps::Enabled()) {
+            const auto presentedNs = FrameSteps::NowNs();
+            FrameSteps::GlobalChain().Presented(presentedNs);
+            reportFrameSteps(presentedNs);
+        }
         CheckFailure();
     } catch (const ProcessShutdown&) {
         throw;
@@ -226,19 +232,41 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
 void Driver::reportFrameSteps(std::int64_t nowNs) {
     static bool started = false;
     static double previousGpuBusyMs = 0;
+    static double previousGpuGapMs = 0;
+    static ShaderRecompiler::ResultMemoTotals previousMemo;
     static std::array<std::uint64_t, FrameSteps::KernelWaitKinds> previousWaits{};
     if (!started) {
         started = true;
         FrameSteps::Global().Take();
-        previousGpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
+        FrameSteps::GlobalChain().Take();
+        static_cast<void>(FrameSteps::TakeThreadCpuNs());
+        static_cast<void>(ShaderRecompiler::TakeProgramKeyCensus());
+        previousMemo = ShaderRecompiler::ResultMemoCounts();
+        const auto counts = VulkanDevice::PresentCounts();
+        previousGpuBusyMs = counts.gpuBusyMs;
+        previousGpuGapMs = counts.gpuGapMs;
         KernelFrameWaitNanos_nid_postfix(previousWaits.data(), previousWaits.size());
     }
     auto& frames = FrameSteps::GlobalFrames();
     if (!frames.Present(nowNs)) return;
     auto window = frames.Take(nowNs);
-    const auto gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs;
-    window.gpuBusyMs = gpuBusyMs - previousGpuBusyMs;
-    previousGpuBusyMs = gpuBusyMs;
+    const auto counts = VulkanDevice::PresentCounts();
+    window.gpuBusyMs = counts.gpuBusyMs - previousGpuBusyMs;
+    window.gpuGapMs = counts.gpuGapMs - previousGpuGapMs;
+    previousGpuBusyMs = counts.gpuBusyMs;
+    previousGpuGapMs = counts.gpuGapMs;
+    window.chain = FrameSteps::GlobalChain().Take();
+    window.threadCpuNs = FrameSteps::TakeThreadCpuNs();
+    const auto memo = ShaderRecompiler::ResultMemoCounts();
+    window.shaders.resultMemoHits = memo.hits - previousMemo.hits;
+    window.shaders.resultMemoMisses = memo.misses - previousMemo.misses;
+    window.shaders.resultMemoEvictions = memo.evictions - previousMemo.evictions;
+    previousMemo = memo;
+    const auto census = ShaderRecompiler::TakeProgramKeyCensus();
+    window.shaders.programKeys = census.keys;
+    window.shaders.programKeysDistinct = census.distinct;
+    window.shaders.programKeyTableHits = census.tableHits;
+    window.shaders.programKeyOverflow = census.overflow;
     std::array<std::uint64_t, FrameSteps::KernelWaitKinds> waits{};
     KernelFrameWaitNanos_nid_postfix(waits.data(), waits.size());
     for (std::size_t i = 0; i < waits.size(); ++i) window.kernelWaitNs[i] = waits[i] - previousWaits[i];
@@ -248,6 +276,11 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     output.Write(FrameSteps::FormatGuest(totals, window));
     output.Write(FrameSteps::FormatLanes(totals, window));
     output.Write(FrameSteps::FormatPackets(totals, window, FrameStepSlotName));
+    output.Write(FrameSteps::FormatFifo(totals, window, FrameStepSlotName));
+    output.Write(FrameSteps::FormatSpine(totals, window, FrameSteps::SpineSampleEvery()));
+    output.Write(FrameSteps::FormatThreadCpu(window));
+    output.Write(FrameSteps::FormatChain(totals, window));
+    output.Write(FrameSteps::FormatMemo(totals, window));
 }
 
 void Driver::ReleaseWindow(void* window) {

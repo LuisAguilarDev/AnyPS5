@@ -110,7 +110,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-void BreakProofs();
+// The caller of a proof break, counted per caller under APS5_PROFILE_FRAME ([frame-steps-memo]).
+enum class ProofBreaker : std::uint8_t { Other, Store, Written, WriteChanged, GpuHold, NonDrawCommit, CompletionLabel, CopiedWriter, ResourceWriteBack, Count };
+void BreakProofs(ProofBreaker caller = ProofBreaker::Other);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

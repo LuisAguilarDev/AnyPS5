@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
@@ -63,6 +64,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (reason == 0 || reason == 5) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([this, queueId] { deliverGuestEopInterrupt(queueId); }, submission.queue == 0);
+                const FrameSteps::SubmitCause cause(FrameSteps::TriggerCompletion);
                 if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
                 wroteOnGpu = true;
             } else if (reason == 1) {
@@ -254,6 +256,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
 
             recordDeferredLabels(draining.get(), submission.queue);
             if (draining != nullptr) {
+                const FrameSteps::SubmitCause cause(FrameSteps::TriggerWait);
                 if (unlockedDrain && draining->CanWaitUnlocked()) epoch = draining->SubmitAndEpoch();
                 else draining->WaitIdle();
             }
@@ -515,6 +518,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         bool deferred = false;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue] { deliverGuestEopInterrupt(queue); }, queue == 0);
+            const FrameSteps::SubmitCause cause(FrameSteps::TriggerCompletion);
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
         if (!deferred) deliverGuestEopInterrupt(queue);
@@ -529,7 +533,9 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (!due && !capped) return;
+    const FrameSteps::SubmitCause cause(capped ? FrameSteps::TriggerCap : FrameSteps::TriggerDeadline);
+    localDevice->SubmitRecorded(true);
 }
 
 }

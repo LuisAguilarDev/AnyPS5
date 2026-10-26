@@ -919,6 +919,19 @@ std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t varian
     return entry->module;
 }
 
+ProgramKeyCensus& programKeyCensus() {
+    static ProgramKeyCensus* census = new ProgramKeyCensus();
+    return *census;
+}
+
+bool programKeyCensusEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_FRAME") != nullptr;
+    return enabled;
+}
+
+// The binding-plan key of this thread's last preparedBindingPlan, hashed (program-key census).
+thread_local std::uint64_t lastPlanKeyHash = 0;
+
 std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
@@ -946,6 +959,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
+    if (programKeyCensusEnabled()) lastPlanKeyHash = ProgramKeyCensus::Hash(key);
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -1107,6 +1121,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
+    if (programKeyCensusEnabled()) programKeyCensus().Note(ProgramKeyCensus::Combine(lastPlanKeyHash, ProgramKeyCensus::Hash(std::span<const std::uint32_t>(moduleKey))));
     if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap) {
         {
             std::shared_lock lock(plan->mutex);
@@ -1500,9 +1515,14 @@ void reportResultMemo() {
         return;
     }
     if (now - last < 10'000'000'000ll || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    const auto hits = counters.hits.exchange(0, std::memory_order_relaxed);
-    const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);
-    const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
+    // Deltas: the totals stay cumulative for ResultMemoCounts. Only the thread that won the
+    // lastReport exchange gets here.
+    static ResultMemoTotals reported;
+    const auto totals = ResultMemoCounts();
+    const auto hits = totals.hits - reported.hits;
+    const auto misses = totals.misses - reported.misses;
+    const auto evictions = totals.evictions - reported.evictions;
+    reported = totals;
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto patched = counters.patched.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions; %llu misses patched from a result that differs only in forwarded user words\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patched));
@@ -2006,6 +2026,15 @@ std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request
 
 std::uint64_t ResultMemoUserWordPatches() {
     return memoUserWordPatches().load(std::memory_order_relaxed);
+}
+
+ResultMemoTotals ResultMemoCounts() {
+    const auto& counters = resultMemoCounters();
+    return {counters.hits.load(std::memory_order_relaxed), counters.misses.load(std::memory_order_relaxed), counters.evictions.load(std::memory_order_relaxed)};
+}
+
+ProgramKeyCensus::Counts TakeProgramKeyCensus() {
+    return programKeyCensus().Take();
 }
 
 ResultMemoMissCauses ResultMemoMisses() {

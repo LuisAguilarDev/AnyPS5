@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
+#include "ProgramKeyCensus.hpp"
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -245,9 +247,301 @@ void CheckFormatting() {
     Contains(quiet, "packet_busy_ms/f=0.00 ");
 }
 
+void CheckFifoSplits() {
+    FrameSteps::Counters counters;
+    FrameSteps::NoteFifoFull(counters, 0, 3 * Ms);
+    FrameSteps::NoteFifoFull(counters, FrameSteps::PoolEnqueueKind, 2 * Ms);
+    FrameSteps::NoteFifoFull(counters, 99, 1 * Ms);
+    FrameSteps::NoteFifoDrain(counters, 3, 0x100, 4 * Ms);
+    FrameSteps::NoteFifoDrain(counters, 0, 0x2d, 1 * Ms);
+    FrameSteps::NoteFifoDrain(counters, 0, 0x2d, 2 * Ms);
+    FrameSteps::NoteFifoDrain(counters, 77, 0x9999, -5);
+    const auto totals = counters.Take();
+    std::uint64_t kinds = 0;
+    for (const auto ns : totals.fifoFullKindNs) kinds += ns;
+    Require(totals.fifoFullNs == static_cast<std::uint64_t>(6 * Ms) && kinds == totals.fifoFullNs, "the fifo_full kinds do not sum to fifo_full");
+    Require(totals.fifoFullKindNs[FrameSteps::PoolEnqueueKind] == static_cast<std::uint64_t>(2 * Ms), "a pool caller was not its own kind");
+    Require(totals.fifoFullKindNs[FrameSteps::PoolEnqueueKind - 1] == static_cast<std::uint64_t>(1 * Ms), "a kind past the list was not folded into other");
+    std::uint64_t reasons = 0, opcodes = 0, drains = 0;
+    for (const auto ns : totals.fifoDrainReasonNs) reasons += ns;
+    for (const auto ns : totals.fifoDrainOpcodeNs) opcodes += ns;
+    for (const auto count : totals.fifoDrainReasonCount) drains += count;
+    Require(totals.fifoDrainNs == static_cast<std::uint64_t>(7 * Ms) && reasons == totals.fifoDrainNs && opcodes == totals.fifoDrainNs, "the drain reasons or opcodes do not sum to fifo_drain");
+    Require(drains == 4 && totals.fifoDrainReasonCount[FrameSteps::DrainReasons - 1] == 1, "a drain was not counted, or a reason past the list was not folded");
+    Require(totals.fifoDrainOpcodeNs[FrameSteps::NoDrainOpcode] == static_cast<std::uint64_t>(4 * Ms) && totals.fifoDrainOpcodeCount[FrameSteps::NoDrainOpcode] == 2, "a drain without an opcode (or past 0x100) was not counted at 0x100");
+    Require(totals.fifoDrainOpcodeCount[0x2d] == 2 && totals.fifoDrainOpcodeNs[0x2d] == static_cast<std::uint64_t>(3 * Ms), "the drains of one opcode were not added up");
+    Require(counters.Take().fifoFullKindNs[0] == 0, "taking the counters did not reset the kinds");
+}
+
+void CheckDerived() {
+    FrameSteps::Totals totals;
+    totals.packetBusyNs = static_cast<std::uint64_t>(94 * Ms);
+    totals.packetIdleNs = static_cast<std::uint64_t>(6 * Ms);
+    totals.fifoFullNs = static_cast<std::uint64_t>(10 * Ms);
+    totals.fifoDrainNs = static_cast<std::uint64_t>(6 * Ms);
+    totals.packetPoolWaitNs = static_cast<std::uint64_t>(2 * Ms);
+    totals.spineBusyNs = static_cast<std::uint64_t>(84 * Ms);
+    totals.queueLatencyNs = static_cast<std::uint64_t>(4 * Ms);
+    totals.queueLatencies = 4;
+    FrameSteps::Window window;
+    window.frames = 2;
+    window.gapMs.mean = 48.0;
+    window.spanMs.mean = 2.0;
+    window.flipToPresentMs.mean = 50.0;
+    const auto derived = FrameSteps::Derive(totals, window);
+    Require(Near(derived.frameMs, 50.0), "frame_ms is not gap + span");
+    Require(Near(derived.packetOwnMs, 38.0), "packet_own is not packet_busy less fifo_full, fifo_drain and pool_wait");
+    Require(Near(derived.couplingMs, 50.0 - 3.0 - 42.0), "coupling is not frame less packet_idle and the larger lane");
+    Require(Near(derived.tailMs, 50.0 - 1.0 - 47.0), "tail is not flip_to_present less q0_enqueue and packet_busy");
+    totals.spineBusyNs = 0;
+    Require(Near(FrameSteps::Derive(totals, window).couplingMs, 50.0 - 3.0 - 38.0), "coupling did not take packet_own when it is the larger lane");
+    const auto quiet = FrameSteps::Derive(FrameSteps::Totals{}, FrameSteps::Window{});
+    Require(Near(quiet.packetOwnMs, 0.0) && Near(quiet.couplingMs, 0.0) && Near(quiet.tailMs, 0.0), "an empty window derived nonzero values");
+    totals.fifoFullNs = static_cast<std::uint64_t>(200 * Ms);
+    Require(Near(FrameSteps::Derive(totals, window).packetOwnMs, 0.0), "packet_own went below zero");
+    const auto lanes = FrameSteps::FormatLanes(totals, window);
+    Contains(lanes, "packet_own_ms/f=0.00 ");
+    Contains(lanes, "coupling_ms=47.00 ");
+    Contains(lanes, "tail_ms=2.00");
+}
+
+void CheckSampler() {
+    FrameSteps::Sampler every16(16);
+    std::size_t picked = 0, first = 99, second = 99;
+    for (std::size_t i = 0; i < 64; ++i) {
+        if (!every16.Next()) continue;
+        if (picked == 0) first = i;
+        if (picked == 1) second = i;
+        ++picked;
+    }
+    Require(picked == 4 && first == 0 && second == 16, "the sampler does not pick one commit in 16, starting with the first");
+    Require(FrameSteps::SampleEvery(nullptr) == 16 && FrameSteps::SampleEvery("") == 16, "an unset sample switch is not 1 in 16");
+    Require(FrameSteps::SampleEvery("64") == 64 && FrameSteps::SampleEvery("1") == 1, "a power of two was not taken");
+    Require(FrameSteps::SampleEvery("48") == 16 && FrameSteps::SampleEvery("0") == 16 && FrameSteps::SampleEvery("x") == 16 && FrameSteps::SampleEvery("4096") == 16, "a value that is not a power of two up to 1024 was taken");
+}
+
+void CheckSpineSample() {
+    FrameSteps::Counters counters;
+    FrameSteps::SpineSample sample;
+    sample.phaseNs[0] = 10'000;
+    sample.phaseNs[FrameSteps::SpineDrawPhases - 1] = 20'000;
+    FrameSteps::NoteSpineSample(counters, sample, 40'000);
+    sample.phaseNs = {};
+    sample.phaseNs[1] = 50'000;
+    FrameSteps::NoteSpineSample(counters, sample, 40'000);
+    const auto totals = counters.Take();
+    Require(totals.spineSamples == 2 && totals.spineSampleNs == 80'000, "the sampled commits were not counted");
+    std::uint64_t phases = 0;
+    for (const auto ns : totals.spinePhaseNs) phases += ns;
+    Require(totals.spinePhaseNs[FrameSteps::SpineOtherPhase] == 10'000, "the commit time outside the draw marks is not 'other'");
+    Require(phases == 90'000, "a phase past its commit was not kept as measured");
+    FrameSteps::Window window;
+    window.frames = 2;
+    FrameSteps::Totals split;
+    split.spineSamples = 2;
+    split.spineSampleNs = 80'000;
+    split.drawCommits = 32;
+    split.drawCommitNs = 32 * 41'000;
+    split.spinePhaseNs[0] = 30'000;
+    split.spinePhaseNs[FrameSteps::SpineOtherPhase] = 50'000;
+    const auto line = FrameSteps::FormatSpine(split, window, 16);
+    Contains(line, "[frame-steps-spine] ");
+    Contains(line, "sampled_commits=2 sample_every=16 sampled_commit_us=40.00 draw_commit_us=41.00 ");
+    Contains(line, "spine_phases_us/commit=validate=15.00|other=25.00");
+    Require(line.back() == '\n', "the spine line does not end the line");
+    Contains(FrameSteps::FormatSpine(FrameSteps::Totals{}, window, 16), "spine_phases_us/commit=-");
+}
+
+void CheckDigest() {
+    const std::vector<std::uint32_t> words{1u, 2u, 3u};
+    auto changed = words;
+    changed[2] = 4u;
+    Require(FrameSteps::DigestWords(words) == FrameSteps::DigestWords(std::vector<std::uint32_t>{1u, 2u, 3u}), "equal words digest apart");
+    Require(FrameSteps::DigestWords(words) != FrameSteps::DigestWords(changed), "a changed word kept the digest");
+    Require(FrameSteps::DigestWords({}) == FrameSteps::DigestOffset, "no words do not digest to the offset basis");
+    const std::vector<std::uint32_t> head{1u, 2u}, tail{3u};
+    Require(FrameSteps::DigestWords(tail, FrameSteps::DigestWords(head)) == FrameSteps::DigestWords(words), "chained spans do not digest as their concatenation");
+}
+
+void CheckFrameChain() {
+    FrameSteps::FrameChain chain;
+    chain.Submitted(1 * Ms);
+    chain.Dequeued(10 * Ms);
+    chain.Dequeued(11 * Ms);
+    chain.Submitted(13 * Ms);
+    chain.Submitted(15 * Ms);
+    chain.Flipped();
+    chain.Presented(18 * Ms);
+    chain.Dequeued(30 * Ms);
+    chain.Submitted(31 * Ms);
+    chain.Flipped();
+    chain.Presented(40 * Ms);
+    const auto totals = chain.Take();
+    Require(totals.firstSubmits == 2 && totals.firstSubmitNs == static_cast<std::uint64_t>(4 * Ms), "the first submit is not timed from the frame's first dequeue");
+    Require(totals.tails == 2 && totals.tailNs == static_cast<std::uint64_t>(12 * Ms), "the tail is not the last submit to the present");
+    const auto next = chain.Take();
+    Require(next.firstSubmits == 0 && next.tails == 0, "taking the chain did not reset it");
+    FrameSteps::FrameChain quiet;
+    quiet.Presented(5 * Ms);
+    Require(quiet.Take().tails == 0, "a present with no submit before it was timed");
+}
+
+void CheckRunId() {
+    const std::vector<std::string> environment{"PATH=C:\\bin", "APS5_PROFILE_FRAME=1", "APS5_DRAW_PIPELINE=1", "aps5_lower=1", "APS5_EMPTY="};
+    const auto line = FrameSteps::FormatRunId("ba27916dd-dirty+1a2b3c4d", "Oct 26 2026 10:00:00", environment);
+    Require(line == "[run-id] libs=ba27916dd-dirty+1a2b3c4d built=Oct 26 2026 10:00:00 env=APS5_DRAW_PIPELINE=1,APS5_EMPTY=,APS5_PROFILE_FRAME=1\n", "the run id line is not the build and the sorted APS5_ variables: " + line);
+    const std::vector<std::string> none{"PATH=C:\\bin"};
+    Require(FrameSteps::FormatRunId("", "", none) == "[run-id] libs=unknown built=unknown env=-\n", "an unknown build or no APS5_ variable is not named so");
+}
+
+void CheckThreadCpu() {
+    Require(FrameSteps::CyclesToNs(3'000'000, 3'000'000'000, 1'000'000'000) == 1'000'000, "cycles at the calibrated rate are not converted to time");
+    Require(FrameSteps::CyclesToNs(5, 0, 10) == 0, "cycles without a calibration were converted");
+    Require(FrameSteps::CpuSlot(FrameSteps::RolePacket, 3) == FrameSteps::CpuPacket && FrameSteps::CpuSlot(FrameSteps::RoleSpine, 0) == FrameSteps::CpuSpine, "the packet thread or the spine has another slot");
+    Require(FrameSteps::CpuSlot(FrameSteps::RoleRecorder, 2) == FrameSteps::CpuRecorders + 2 && FrameSteps::CpuSlot(FrameSteps::RolePool, 99) == FrameSteps::CpuPool + FrameSteps::LaneThreads - 1, "a recorder or pool thread has another slot");
+    Require(FrameSteps::CpuSlot(FrameSteps::RoleOther, 0) == FrameSteps::CpuSlots, "a thread without a role has a slot");
+    FrameSteps::Window window;
+    window.frames = 2;
+    window.threadCpuNs[FrameSteps::CpuPacket] = static_cast<std::uint64_t>(80 * Ms);
+    window.threadCpuNs[FrameSteps::CpuSpine] = static_cast<std::uint64_t>(70 * Ms);
+    window.threadCpuNs[FrameSteps::CpuPresenter] = static_cast<std::uint64_t>(2 * Ms);
+    window.threadCpuNs[FrameSteps::CpuRecorders + 1] = static_cast<std::uint64_t>(4 * Ms);
+    window.threadCpuNs[FrameSteps::CpuPool] = static_cast<std::uint64_t>(1 * Ms);
+    const auto line = FrameSteps::FormatThreadCpu(window);
+    Contains(line, "[frame-steps-cpu] ");
+    Contains(line, "thread_cpu_ms/f packet=40.00 spine=35.00 presenter=1.00 release=0.00 rec=0.00/2.00 pool=0.50");
+    Require(line.back() == '\n', "the cpu line does not end the line");
+    Contains(FrameSteps::FormatThreadCpu(FrameSteps::Window{}), "rec=0 pool=0");
+}
+
+void CheckSubmitSplits() {
+    FrameSteps::Counters counters;
+    FrameSteps::NoteVkSubmit(counters, FrameSteps::RolePacket, FrameSteps::TriggerCap);
+    FrameSteps::NoteVkSubmit(counters, FrameSteps::RolePacket, FrameSteps::TriggerCap);
+    FrameSteps::NoteVkSubmit(counters, FrameSteps::RoleSpine, FrameSteps::TriggerLabel);
+    FrameSteps::NoteVkSubmit(counters, 99, 99);
+    const auto totals = counters.Take();
+    Require(totals.vkSubmitsBy[FrameSteps::RolePacket * FrameSteps::SubmitTriggers + FrameSteps::TriggerCap] == 2, "the cap submits of the packet thread were not counted");
+    Require(totals.vkSubmitsBy[(FrameSteps::ThreadRoles - 1) * FrameSteps::SubmitTriggers + FrameSteps::SubmitTriggers - 1] == 1, "a role or trigger past the list was not folded");
+    FrameSteps::Window window;
+    window.frames = 2;
+    window.gpuGapMs = 3.0;
+    window.chain.firstSubmitNs = static_cast<std::uint64_t>(3 * Ms);
+    window.chain.firstSubmits = 2;
+    window.chain.tailNs = static_cast<std::uint64_t>(5 * Ms);
+    window.chain.tails = 2;
+    auto split = totals;
+    split.submits = 4;
+    split.submitValidateNs = 8'000;
+    split.vkSubmits = 4;
+    const auto line = FrameSteps::FormatChain(split, window);
+    Contains(line, "[frame-steps-chain] ");
+    Contains(line, "gpu_gap_ms/f=1.50 first_submit_ms=1.50 last_submit_to_present_ms=2.50 submit_validate_us=2.0 ");
+    Contains(line, "vk_submits/f=2.0 vk_submits/f(thread:trigger)=packet:cap=1.0,spine:label=0.5,release:suspend=0.5");
+    Require(line.back() == '\n', "the chain line does not end the line");
+    Contains(FrameSteps::FormatChain(FrameSteps::Totals{}, FrameSteps::Window{}), "vk_submits/f(thread:trigger)=-");
+    {
+        const FrameSteps::SubmitCause cause(FrameSteps::TriggerFlip);
+        Require(FrameSteps::ThreadTrigger() == (FrameSteps::Enabled() ? FrameSteps::TriggerFlip : FrameSteps::TriggerOther), "a submit cause did not name the trigger while profiling");
+        {
+            const FrameSteps::SubmitCause inner(FrameSteps::TriggerLabel, true);
+            Require(FrameSteps::ThreadTrigger() == (FrameSteps::Enabled() ? FrameSteps::TriggerFlip : FrameSteps::TriggerOther), "a fallback cause replaced the outer one");
+        }
+        Require(FrameSteps::ThreadTrigger() == (FrameSteps::Enabled() ? FrameSteps::TriggerFlip : FrameSteps::TriggerOther), "a fallback cause did not restore the outer one");
+    }
+    {
+        const FrameSteps::SubmitCause fallback(FrameSteps::TriggerLabel, true);
+        Require(FrameSteps::ThreadTrigger() == (FrameSteps::Enabled() ? FrameSteps::TriggerLabel : FrameSteps::TriggerOther), "a fallback cause without an outer one did not name the trigger");
+    }
+    Require(FrameSteps::ThreadTrigger() == FrameSteps::TriggerOther, "a submit cause outlived its scope");
+}
+
+void CheckFifoFormatting() {
+    FrameSteps::Totals totals;
+    totals.fifoFullNs = static_cast<std::uint64_t>(6 * Ms);
+    totals.fifoFullKindNs[0] = static_cast<std::uint64_t>(4 * Ms);
+    totals.fifoFullKindNs[FrameSteps::PoolEnqueueKind] = static_cast<std::uint64_t>(2 * Ms);
+    totals.fifoDrainNs = static_cast<std::uint64_t>(5 * Ms);
+    totals.fifoDrainReasonNs[0] = static_cast<std::uint64_t>(1 * Ms);
+    totals.fifoDrainReasonNs[3] = static_cast<std::uint64_t>(4 * Ms);
+    totals.fifoDrainReasonCount[0] = 2;
+    totals.fifoDrainReasonCount[3] = 6;
+    totals.fifoDrainOpcodeNs[0x2d] = static_cast<std::uint64_t>(1 * Ms);
+    totals.fifoDrainOpcodeCount[0x2d] = 2;
+    totals.fifoDrainOpcodeNs[FrameSteps::NoDrainOpcode] = static_cast<std::uint64_t>(4 * Ms);
+    totals.fifoDrainOpcodeCount[FrameSteps::NoDrainOpcode] = 6;
+    totals.mpassInline = 4;
+    totals.mpassPipelined = 6;
+    FrameSteps::Window window;
+    window.frames = 2;
+    const auto line = FrameSteps::FormatFifo(totals, window, [](std::size_t opcode) { return opcode == 0x2d ? std::string("DRAW_INDEX_AUTO") : std::string(); });
+    Contains(line, "[frame-steps-fifo] ");
+    Contains(line, "fifo_full_ms/f=3.00 fifo_full_ms/f(draw/label/dma/dispatch/fill/pass/completion/open_work/other/pool)=2.00/0.00/0.00/0.00/0.00/0.00/0.00/0.00/0.00/1.00 ");
+    Contains(line, "fifo_drain_ms/f=2.50 fifo_drains/f(packet/flush/labels/capture/indirect/submission)=1.0/0.0/0.0/3.0/0.0/0.0 ");
+    Contains(line, "fifo_drain_ms/f(packet/flush/labels/capture/indirect/submission)=0.50/0.00/0.00/2.00/0.00/0.00 ");
+    Contains(line, "drain_top=none:3.0/f:2.00ms/f,DRAW_INDEX_AUTO:1.0/f:0.50ms/f ");
+    Contains(line, "mpass_inline/f=2.0 mpass_pipelined/f=3.0");
+    Require(line.back() == '\n', "the fifo line does not end the line");
+    Contains(FrameSteps::FormatFifo(FrameSteps::Totals{}, window, nullptr), "drain_top=-");
+}
+
+void CheckMemoFormatting() {
+    FrameSteps::Totals totals;
+    totals.proofBreaks[0] = 2;
+    totals.proofBreaks[4] = 8;
+    totals.targetMemoLookups = 10;
+    totals.targetMemoHits = 9;
+    totals.drawInputMemoLookups = 4;
+    totals.drawInputMemoHits = 1;
+    totals.drawStages = 30;
+    totals.stagedDraws = 12;
+    totals.halfChecks = 20;
+    totals.halfStale = 2;
+    FrameSteps::Window window;
+    window.frames = 2;
+    window.shaders.resultMemoHits = 3;
+    window.shaders.resultMemoMisses = 1;
+    window.shaders.resultMemoEvictions = 4;
+    window.shaders.programKeys = 40;
+    window.shaders.programKeysDistinct = 7;
+    window.shaders.programKeyTableHits = 30;
+    const auto line = FrameSteps::FormatMemo(totals, window);
+    Contains(line, "[frame-steps-memo] ");
+    Contains(line, "proof_breaks/f=5.0 proof_breaks/f(other/store/written/write_changed/gpu_hold/non_draw_commit/completion_label/copied_writer/resource_write_back)=1.0/0.0/0.0/0.0/4.0/0.0/0.0/0.0/0.0 ");
+    Contains(line, "target_memo_hit%=90.0 target_memo_lookups/f=5.0 draw_input_memo_hit%=25.0 draw_input_memo_lookups/f=2.0 ");
+    Contains(line, "result_memo_hit%=75.0 result_memo_lookups/f=2.0 result_memo_evictions/f=2.0 ");
+    Contains(line, "stages/draw=2.50 ");
+    Contains(line, "program_keys/10s=7 program_key_materializes/f=20.0 program_key_table_hit%=75.0 program_key_overflow=0 ");
+    Contains(line, "half_checks/f=10.0 half_stale/f=1.0");
+    Require(line.back() == '\n', "the memo line does not end the line");
+    Contains(FrameSteps::FormatMemo(FrameSteps::Totals{}, FrameSteps::Window{}), "target_memo_hit%=0.0 ");
+}
+
+void CheckProgramKeyCensus() {
+    ShaderRecompiler::ProgramKeyCensus census;
+    for (std::uint64_t key : {5ull, 7ull, 5ull, 0ull, 5ull + ShaderRecompiler::ProgramKeyCensus::TableSlots}) census.Note(key);
+    const auto counts = census.Take();
+    Require(counts.keys == 5 && counts.distinct == 4 && counts.overflow == 0, "the census does not count the distinct keys");
+    Require(counts.tableHits == 1, "a direct-mapped table hit was not counted, or a collision counted as a hit");
+    census.Note(7);
+    const auto next = census.Take();
+    Require(next.keys == 1 && next.distinct == 1 && next.tableHits == 1, "the next window did not start empty, or the table forgot its entries");
+    std::vector<std::uint64_t> plan{1, 2, 3};
+    std::vector<std::uint32_t> module{4, 5};
+    const auto key = ShaderRecompiler::ProgramKeyCensus::Combine(ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint64_t>(plan)), ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint32_t>(module)));
+    module[1] = 6;
+    Require(key != ShaderRecompiler::ProgramKeyCensus::Combine(ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint64_t>(plan)), ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint32_t>(module))), "a changed module key kept the program key");
+}
+
 }
 
 int main() {
+    // Before the first Enabled(): the submit causes are checked as they run under profiling.
+#ifdef _WIN32
+    _putenv("APS5_PROFILE_FRAME=1");
+#else
+    setenv("APS5_PROFILE_FRAME", "1", 1);
+#endif
     try {
         CheckGuestFrames();
         CheckSampleWindow();
@@ -257,6 +551,18 @@ int main() {
         CheckPacketFormatting();
         CheckPresentPairing();
         CheckFormatting();
+        CheckFifoSplits();
+        CheckDerived();
+        CheckSampler();
+        CheckSpineSample();
+        CheckDigest();
+        CheckFrameChain();
+        CheckRunId();
+        CheckThreadCpu();
+        CheckSubmitSplits();
+        CheckFifoFormatting();
+        CheckMemoFormatting();
+        CheckProgramKeyCensus();
         std::cout << "frame steps tests passed\n";
         return 0;
     } catch (const std::exception& error) {

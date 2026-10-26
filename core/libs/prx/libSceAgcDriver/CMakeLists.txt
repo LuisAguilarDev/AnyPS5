@@ -305,6 +305,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/LockProfile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameSteps.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RunId.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -384,9 +385,11 @@ set(agcDriverSources
 
 find_package(Git QUIET)
 set(agcTraceRevisionHeader ${agcTextureDetileGeneratedRoot}/prx/libSceAgcDriver/TraceRevision.hpp)
+# The describe has its own header: it changes with every edit, the revision only with the commit.
+set(agcTraceDescribeHeader ${agcTextureDetileGeneratedRoot}/prx/libSceAgcDriver/TraceDescribe.hpp)
 add_custom_target(agc_trace_revision
-        COMMAND ${CMAKE_COMMAND} -DGIT=${GIT_EXECUTABLE} -DSOURCE=${CMAKE_SOURCE_DIR} -DOUTPUT=${agcTraceRevisionHeader} -P ${CMAKE_CURRENT_SOURCE_DIR}/trace_revision.cmake
-        BYPRODUCTS ${agcTraceRevisionHeader}
+        COMMAND ${CMAKE_COMMAND} -DGIT=${GIT_EXECUTABLE} -DSOURCE=${CMAKE_SOURCE_DIR} -DOUTPUT=${agcTraceRevisionHeader} -DDESCRIBE_OUTPUT=${agcTraceDescribeHeader} -P ${CMAKE_CURRENT_SOURCE_DIR}/trace_revision.cmake
+        BYPRODUCTS ${agcTraceRevisionHeader} ${agcTraceDescribeHeader}
         VERBATIM
 )
 set(agcZlibIncludeDir ${CMAKE_SOURCE_DIR}/3rdparty/libjpeg-turbo/src/spng/zlib)

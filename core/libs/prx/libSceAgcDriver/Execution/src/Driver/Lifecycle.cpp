@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
@@ -191,6 +192,7 @@ void Driver::stop() {
 
 Driver::Driver() {
     InstallAsyncLog_nid_no_patch();
+    FrameSteps::PrintRunId();
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
     LibcSetExitDrain_nid_no_patch([] {

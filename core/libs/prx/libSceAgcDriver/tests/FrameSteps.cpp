@@ -386,12 +386,21 @@ void CheckFrameChain() {
     Require(quiet.Take().tails == 0, "a present with no submit before it was timed");
 }
 
+std::string RunIdLine(std::string_view describe, std::string_view built, std::vector<std::string_view> environment, std::size_t room = 512) {
+    std::vector<char> out(room, 'x');
+    const auto length = FrameSteps::FormatRunId(out, describe, built, environment);
+    Require(length < room && out[length] == '\0', "the run id line is not NUL-terminated inside its buffer");
+    return std::string(out.data(), length);
+}
+
 void CheckRunId() {
-    const std::vector<std::string> environment{"PATH=C:\\bin", "APS5_PROFILE_FRAME=1", "APS5_DRAW_PIPELINE=1", "aps5_lower=1", "APS5_EMPTY="};
-    const auto line = FrameSteps::FormatRunId("ba27916dd-dirty+1a2b3c4d", "Oct 26 2026 10:00:00", environment);
+    const std::vector<std::string_view> environment{"PATH=C:\\bin", "APS5_PROFILE_FRAME=1", "APS5_DRAW_PIPELINE=1", "aps5_lower=1", "APS5_EMPTY="};
+    const auto line = RunIdLine("ba27916dd-dirty+1a2b3c4d", "Oct 26 2026 10:00:00", environment);
     Require(line == "[run-id] libs=ba27916dd-dirty+1a2b3c4d built=Oct 26 2026 10:00:00 env=APS5_DRAW_PIPELINE=1,APS5_EMPTY=,APS5_PROFILE_FRAME=1\n", "the run id line is not the build and the sorted APS5_ variables: " + line);
-    const std::vector<std::string> none{"PATH=C:\\bin"};
-    Require(FrameSteps::FormatRunId("", "", none) == "[run-id] libs=unknown built=unknown env=-\n", "an unknown build or no APS5_ variable is not named so");
+    Require(RunIdLine("", "", {"PATH=C:\\bin"}) == "[run-id] libs=unknown built=unknown env=-\n", "an unknown build or no APS5_ variable is not named so");
+    // A line past its buffer is cut, still ending in a newline.
+    const auto cut = RunIdLine("ba27916dd", "Oct 26 2026 10:00:00", environment, 24);
+    Require(cut == "[run-id] libs=ba27916d\n", "a run id line past its buffer is not cut to fit: " + cut);
 }
 
 void CheckThreadCpu() {

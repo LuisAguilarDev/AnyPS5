@@ -368,19 +368,35 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
     return line + text + "\n";
 }
 
-std::string FormatRunId(std::string_view describe, std::string_view built, std::span<const std::string> environment) {
-    std::vector<std::string> set;
-    for (const auto& entry : environment) {
-        if (entry.starts_with(EnvironmentPrefix)) set.push_back(entry);
+std::size_t FormatRunId(std::span<char> out, std::string_view describe, std::string_view built, std::span<std::string_view> environment) {
+    // The newline and the NUL always fit.
+    constexpr std::size_t Ending = 2;
+    if (out.size() < Ending) {
+        if (!out.empty()) out[0] = '\0';
+        return 0;
     }
-    std::sort(set.begin(), set.end());
-    std::string list;
-    for (const auto& entry : set) list += (list.empty() ? "" : ",") + entry;
-    std::string line = "[run-id] libs=";
-    line += describe.empty() ? "unknown" : describe;
-    line += " built=";
-    line += built.empty() ? "unknown" : built;
-    return line + " env=" + (list.empty() ? "-" : list) + "\n";
+    const auto room = out.size() - Ending;
+    std::size_t length = 0;
+    const auto append = [&](std::string_view text) {
+        const auto taken = std::min(text.size(), room - length);
+        std::copy_n(text.data(), taken, out.data() + length);
+        length += taken;
+    };
+    const auto set = std::partition(environment.begin(), environment.end(), [](std::string_view entry) { return entry.starts_with(EnvironmentPrefix); });
+    std::sort(environment.begin(), set);
+    append("[run-id] libs=");
+    append(describe.empty() ? "unknown" : describe);
+    append(" built=");
+    append(built.empty() ? "unknown" : built);
+    append(" env=");
+    if (set == environment.begin()) append("-");
+    for (auto entry = environment.begin(); entry != set; ++entry) {
+        if (entry != environment.begin()) append(",");
+        append(*entry);
+    }
+    out[length++] = '\n';
+    out[length] = '\0';
+    return length;
 }
 
 Counters& Global() {

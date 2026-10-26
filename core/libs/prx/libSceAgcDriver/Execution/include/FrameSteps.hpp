@@ -629,8 +629,11 @@ std::string FormatSpine(const Totals& totals, const Window& window, std::uint32_
 std::string FormatThreadCpu(const Window& window);
 std::string FormatChain(const Totals& totals, const Window& window);
 std::string FormatMemo(const Totals& totals, const Window& window);
-// The [run-id] line: the libs' git describe, their build time and the set APS5_ variables.
-std::string FormatRunId(std::string_view describe, std::string_view built, std::span<const std::string> environment);
+// The [run-id] line: the libs' git describe, their build time and the set APS5_ variables (the
+// entries of `environment` with that prefix, sorted in place). Written into `out`, cut to fit and
+// always ended by a newline and a NUL, without touching the heap: the driver prints it on the
+// thread that starts it, whose small-block cache it must leave alone. Returns the line's length.
+std::size_t FormatRunId(std::span<char> out, std::string_view describe, std::string_view built, std::span<std::string_view> environment);
 // Prints the [run-id] line to stderr (RunId.cpp, which embeds the build's revision).
 void PrintRunId();
 

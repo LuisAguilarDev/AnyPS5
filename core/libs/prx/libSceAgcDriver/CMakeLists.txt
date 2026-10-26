@@ -467,6 +467,7 @@ if(BUILD_TESTING)
     add_test_executable(agc_driver_draw_prep_pool_bounds_tests
             tests/DrawPrepPoolBounds.cpp
             Execution/src/Driver/Draw/DrawPrepPool.cpp
+            Execution/src/FrameSteps.cpp
             Execution/src/LockProfile.cpp
     )
     target_include_directories(agc_driver_draw_prep_pool_bounds_tests PRIVATE ${LIBS_INCLUDE_DIR})

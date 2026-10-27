@@ -861,6 +861,27 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_epoch_proof_tests EXCLUDE_FROM_ALL
+        tests/EpochProof.cpp
+        Execution/src/GuestMemory.cpp
+        Execution/src/FrameSteps.cpp
+        Execution/src/LockProfile.cpp
+        Execution/src/PerformanceTraceThread.cpp
+)
+target_include_directories(agc_epoch_proof_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_epoch_proof_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_epoch_proof_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_epoch_proof_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_epoch_proof_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_epoch_proof COMMAND agc_epoch_proof_tests)
+    set_tests_properties(agc_epoch_proof PROPERTIES ENVIRONMENT "APS5_PROFILE_FRAME=1" SKIP_RETURN_CODE 77 TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_epoch_proof PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp

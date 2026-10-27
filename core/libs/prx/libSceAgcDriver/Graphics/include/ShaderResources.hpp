@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EpochProof.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -736,9 +737,8 @@ private:
     // no image other than the object's own sources has results pending over its surfaces and
     // regions, so those checks are skipped (see fastRevalidate).
     std::uint64_t pendingSerialSeen = 0;
-    std::uint64_t provedEpoch = 0;
-    std::uint64_t provedProof = 0;
-    std::uint64_t provedPending = 0;
+    // The window of the last Revalidate that proved this object (EpochProofs; epoch 0: none).
+    EpochProofToken proved;
     std::atomic<std::uint64_t> revalidateGeneration{0};
     std::atomic<std::uint32_t> recordHalves{0};
     std::atomic<DrawRecorders*> recordHalvesThreads{nullptr};

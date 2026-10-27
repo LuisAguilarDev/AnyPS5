@@ -352,6 +352,8 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
     for (const auto count : totals.proofBreaks) breaks += count;
     const auto& shaders = window.shaders;
     const auto resultLookups = shaders.resultMemoHits + shaders.resultMemoMisses;
+    const auto epochProofs = totals.epochProofReuses + totals.epochProofFulls;
+    const auto refreshProofs = totals.refreshProofReuses + totals.refreshProofFulls;
     char text[1024];
     const auto length = std::snprintf(text, sizeof(text), "[frame-steps-memo] window_s=%.1f frames=%llu proof_breaks/f=%.1f proof_breaks/f(%s)=%s ",
         window.seconds, static_cast<unsigned long long>(frames), perFrame(breaks), NameList(ProofBreakerNames).c_str(), PerFrameList(totals.proofBreaks, frames, false).c_str());
@@ -359,11 +361,14 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
     std::string line(text);
     const auto tail = std::snprintf(text, sizeof(text),
         "target_memo_hit%%=%.1f target_memo_lookups/f=%.1f draw_input_memo_hit%%=%.1f draw_input_memo_lookups/f=%.1f result_memo_hit%%=%.1f result_memo_lookups/f=%.1f result_memo_evictions/f=%.1f "
-        "stages/draw=%.2f program_keys/10s=%llu program_key_materializes/f=%.1f program_key_table_hit%%=%.1f program_key_overflow=%llu half_checks/f=%.1f half_stale/f=%.1f half_copy_us/draw=%.3f hold_waits/f=%.1f hold_wait_ms/f=%.2f",
+        "stages/draw=%.2f program_keys/10s=%llu program_key_materializes/f=%.1f program_key_table_hit%%=%.1f program_key_overflow=%llu half_checks/f=%.1f half_stale/f=%.1f half_copy_us/draw=%.3f hold_waits/f=%.1f hold_wait_ms/f=%.2f "
+        "epoch_proof_reuse%%=%.1f epoch_proofs/f=%.1f refresh_proof_reuse%%=%.1f refresh_proofs/f=%.1f proof_verify_checks=%llu proof_verify_mismatches=%llu",
         Rate(totals.targetMemoHits, totals.targetMemoLookups), perFrame(totals.targetMemoLookups), Rate(totals.drawInputMemoHits, totals.drawInputMemoLookups), perFrame(totals.drawInputMemoLookups),
         Rate(shaders.resultMemoHits, resultLookups), perFrame(resultLookups), perFrame(shaders.resultMemoEvictions),
         PerItem(static_cast<double>(totals.drawStages), totals.stagedDraws), static_cast<unsigned long long>(shaders.programKeysDistinct), perFrame(shaders.programKeys), Rate(shaders.programKeyTableHits, shaders.programKeys), static_cast<unsigned long long>(shaders.programKeyOverflow),
-        perFrame(totals.halfChecks), perFrame(totals.halfStale), PerItem(Us(totals.halfCopyNs), totals.halfCopies), perFrame(totals.holdWaits), PerFrame(Ms(totals.holdWaitNs), frames));
+        perFrame(totals.halfChecks), perFrame(totals.halfStale), PerItem(Us(totals.halfCopyNs), totals.halfCopies), perFrame(totals.holdWaits), PerFrame(Ms(totals.holdWaitNs), frames),
+        Rate(totals.epochProofReuses, epochProofs), perFrame(epochProofs), Rate(totals.refreshProofReuses, refreshProofs), perFrame(refreshProofs),
+        static_cast<unsigned long long>(totals.proofVerifyChecks), static_cast<unsigned long long>(totals.proofVerifyMismatches));
     if (tail < 0) return {};
     return line + text + "\n";
 }

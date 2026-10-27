@@ -194,6 +194,7 @@ struct Totals {
     std::array<std::uint64_t, ProofBreakers> proofBreaks{};
     std::uint64_t targetMemoLookups = 0, targetMemoHits = 0, drawInputMemoLookups = 0, drawInputMemoHits = 0;
     std::uint64_t drawStages = 0, stagedDraws = 0, halfChecks = 0, halfStale = 0, halfCopies = 0, halfCopyNs = 0, holdWaits = 0, holdWaitNs = 0;
+    std::uint64_t epochProofReuses = 0, epochProofFulls = 0, refreshProofReuses = 0, refreshProofFulls = 0, proofVerifyChecks = 0, proofVerifyMismatches = 0;
     std::array<std::uint64_t, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
 };
 
@@ -321,6 +322,12 @@ public:
         totals.halfCopyNs = take(halfCopyNs);
         totals.holdWaits = take(holdWaits);
         totals.holdWaitNs = take(holdWaitNs);
+        totals.epochProofReuses = take(epochProofReuses);
+        totals.epochProofFulls = take(epochProofFulls);
+        totals.refreshProofReuses = take(refreshProofReuses);
+        totals.refreshProofFulls = take(refreshProofFulls);
+        totals.proofVerifyChecks = take(proofVerifyChecks);
+        totals.proofVerifyMismatches = take(proofVerifyMismatches);
         takeAll(vkSubmitsBy, totals.vkSubmitsBy);
         return totals;
     }
@@ -353,6 +360,7 @@ public:
     std::array<Counter, ProofBreakers> proofBreaks{};
     Counter targetMemoLookups{0}, targetMemoHits{0}, drawInputMemoLookups{0}, drawInputMemoHits{0};
     Counter drawStages{0}, stagedDraws{0}, halfChecks{0}, halfStale{0}, halfCopies{0}, halfCopyNs{0}, holdWaits{0}, holdWaitNs{0};
+    Counter epochProofReuses{0}, epochProofFulls{0}, refreshProofReuses{0}, refreshProofFulls{0}, proofVerifyChecks{0}, proofVerifyMismatches{0};
     std::array<Counter, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
 
 private:

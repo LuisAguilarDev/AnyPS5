@@ -2090,23 +2090,28 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     const bool epochProofs = ShaderResources::EpochProofs();
-    const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
-    if (epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial()) {
+    const auto now = epochProofs ? CurrentEpochProof(PendingSerial()) : EpochProofToken{};
+    thread_local std::uint64_t reuses = 0;
+    const EpochProofToken proved{provedEpoch.load(std::memory_order_relaxed), provedProof.load(std::memory_order_relaxed), provedPending.load(std::memory_order_relaxed)};
+    const auto use = ChooseEpochProofUse(proved, now, VerifyEpochProofs(), reuses);
+    if (use == EpochProofUse::Reuse) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
+        NoteEpochProofUse(EpochProofKind::Refresh, use, false);
         return true;
     }
-    const auto proofBefore = GuestMemory::ProofSerial();
-    const auto pendingBefore = PendingSerial();
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    const bool proven = refreshProved();
+    if (epochProofs) NoteEpochProofUse(EpochProofKind::Refresh, use, !proven);
+    if (!proven && use == EpochProofUse::Verify) provedEpoch.store(0, std::memory_order_relaxed);
+    if (proven) {
         layerBehind.clear();
-        if (epoch != 0) {
-            provedEpoch.store(epoch, std::memory_order_relaxed);
-            provedProof.store(proofBefore, std::memory_order_relaxed);
-            provedPending.store(pendingBefore, std::memory_order_relaxed);
+        if (now.epoch != 0 && use == EpochProofUse::Full) {
+            provedEpoch.store(now.epoch, std::memory_order_relaxed);
+            provedProof.store(now.proof, std::memory_order_relaxed);
+            provedPending.store(now.pending, std::memory_order_relaxed);
         }
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);

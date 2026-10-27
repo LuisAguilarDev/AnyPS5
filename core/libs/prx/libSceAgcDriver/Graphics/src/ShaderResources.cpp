@@ -3570,34 +3570,25 @@ void ShaderResources::noteProofMemo(const ProofMemo& before) {
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
-    if (EpochProofs()) {
-        const auto epoch = GuestMemory::CollectEpoch();
-        const auto proof = GuestMemory::ProofSerial();
-        const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
-            static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
-            thread_local std::uint64_t reuses = 0;
-            if (verify && ++reuses % 64u == 0u) {
-                const bool ok = revalidateFull(shaders, report);
-                noteEpochProof(true, true, !ok);
-                return ok;
-            }
-            if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
-            noteEpochProof(true, false, false);
-            return true;
-        }
-        const bool ok = revalidateFull(shaders, report);
-        noteEpochProof(false, false, false);
-        if (ok) {
-            provedEpoch = epoch;
-            provedProof = proof;
-            provedPending = pending;
-        } else {
-            provedEpoch = 0;
-        }
-        return ok;
+    if (!EpochProofs()) return revalidateFull(shaders, report);
+    const auto now = CurrentEpochProof(StorageTexture::PendingSerial());
+    thread_local std::uint64_t reuses = 0;
+    const auto use = ChooseEpochProofUse(proved, now, VerifyEpochProofs(), reuses);
+    if (use == EpochProofUse::Reuse) {
+        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+        noteEpochProof(true, false, false);
+        NoteEpochProofUse(EpochProofKind::Resources, use, false);
+        return true;
     }
-    return revalidateFull(shaders, report);
+    const bool ok = revalidateFull(shaders, report);
+    noteEpochProof(use == EpochProofUse::Verify, use == EpochProofUse::Verify, use == EpochProofUse::Verify && !ok);
+    NoteEpochProofUse(EpochProofKind::Resources, use, !ok);
+    if (use == EpochProofUse::Verify) {
+        if (!ok) proved = {};
+    } else {
+        proved = ok ? now : EpochProofToken{};
+    }
+    return ok;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {

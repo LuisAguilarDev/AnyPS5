@@ -258,6 +258,9 @@ public:
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
     double FinishPresent();
     void QueuePresent();
+    // The recorder serial the newest blit was queued behind (its frame's batches; 0 before any):
+    // WaitRecorded on it is the early flip release of a trailing presentation (PresentRelease.hpp).
+    std::uint64_t PresentedSerial() const;
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
     // APS5_PROFILE_DRAW, how many in flight have not signaled (the frame record's batches_at_flip).
     void FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const;

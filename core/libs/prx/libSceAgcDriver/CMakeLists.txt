@@ -285,6 +285,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Packets/PacketTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Presentation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/PresentRelease.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/QueueWorker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/Submission.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Queues/SubmissionRing.cpp
@@ -551,6 +552,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_frame_steps PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_frame_steps PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_present_release_tests tests/PresentRelease.cpp Execution/src/Driver/PresentRelease.cpp)
+    target_include_directories(agc_present_release_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_present_release_tests PRIVATE libc)
+    configure_windows_unwind(agc_present_release_tests)
+    add_test(NAME agc_present_release COMMAND agc_present_release_tests)
+    set_tests_properties(agc_present_release PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_present_release PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

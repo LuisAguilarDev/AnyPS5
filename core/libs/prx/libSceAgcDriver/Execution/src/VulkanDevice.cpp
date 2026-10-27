@@ -3775,6 +3775,11 @@ double VulkanDevice::FinishPresent() {
     return RetirePresents(0);
 }
 
+std::uint64_t VulkanDevice::PresentedSerial() const {
+    std::lock_guard lock(state->presentMutex);
+    return state->lastPresentSerial;
+}
+
 void VulkanDevice::QueuePresent() {
     if (!state->queuePending) return;
     PerformanceTimer timing("Vulkan.QueuePresent");

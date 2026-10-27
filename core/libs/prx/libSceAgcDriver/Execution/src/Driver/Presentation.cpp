@@ -3,6 +3,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/PresentRelease.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -19,6 +20,25 @@ namespace {
 std::string FrameStepSlotName(std::size_t slot) {
     return Pm4::Name(0xc0000000u | (static_cast<std::uint32_t>(slot) << 8u));
 }
+
+// The presenter's waits on its device after a trailing presentation was queued (no mutex held).
+class DeviceTrailingPresent final : public TrailingPresent {
+public:
+    explicit DeviceTrailingPresent(VulkanDevice& device) : device(device) {}
+    bool WaitFrameBatches(double& waitedMs) override {
+        if (!device.CanWaitUnlocked()) return false;
+        const auto start = std::chrono::steady_clock::now();
+        device.WaitRecorded(device.PresentedSerial());
+        waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return true;
+    }
+    double RetirePresents(std::size_t keepInFlight) override {
+        return device.RetirePresents(keepInFlight);
+    }
+
+private:
+    VulkanDevice& device;
+};
 
 }
 
@@ -111,6 +131,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
     static const std::size_t inFlight = VulkanDevice::FlipInFlight();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool earlyRelease = EarlyFlipRelease();
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
@@ -172,7 +193,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
         }
         if (trailing) {
-            waitedMs += presenting->FinishPresent();
+            DeviceTrailingPresent trailingPresent(*presenting);
+            waitedMs += FinishTrailingPresent(trailingPresent, earlyRelease);
             timing.Mark("render_fence_wait");
         }
         if (submitted) {

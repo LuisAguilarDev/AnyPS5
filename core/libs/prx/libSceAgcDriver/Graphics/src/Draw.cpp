@@ -1167,7 +1167,11 @@ std::vector<std::uint64_t>& validationKeyScratch() {
     return key;
 }
 
-std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+std::atomic<std::uint64_t> commitTrimHits{0};
+std::atomic<std::uint64_t> commitTrimVerifies{0};
+
+// `trim`: CommitTrims, answered from the thread's last key; set when it was.
+std::uint32_t fragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit, bool& trim) {
     memoized = false;
     hit = false;
     auto& key = validationKeyScratch();
@@ -1177,10 +1181,12 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
     auto& lastKey = HostThreadLocal<std::vector<std::uint64_t>, LastKeyStorage>();
     thread_local std::uint32_t lastOutputs = 0;
     thread_local bool lastValid = false;
-    const bool trims = keyed && CommitTrims();
+    const bool trims = keyed && trim;
+    trim = false;
     if (trims && lastValid && key == lastKey) {
         memoized = true;
         hit = true;
+        trim = true;
         return lastOutputs;
     }
     if (keyed) {
@@ -1217,6 +1223,21 @@ std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const Comp
         if (memo.size() >= 1024) memo.clear();
         memo.emplace(key, outputs);
     }
+    return outputs;
+}
+
+std::uint32_t CachedFragmentOutputs(const Context& context, std::span<const CompiledShader> shaders, const State& state, bool& memoized, bool& hit) {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    bool trim = CommitTrims();
+    const auto outputs = fragmentOutputs(context, shaders, state, memoized, hit, trim);
+    if (!trim) return outputs;
+    commitTrimHits.fetch_add(1, std::memory_order_relaxed);
+    if (!verify) return outputs;
+    bool fullMemoized = false;
+    bool fullHit = false;
+    bool untrimmed = false;
+    Require(fragmentOutputs(context, shaders, state, fullMemoized, fullHit, untrimmed) == outputs, "a trimmed fragment-output validation differs from the full one (APS5_VERIFY_DRAW_PIPELINE)");
+    commitTrimVerifies.fetch_add(1, std::memory_order_relaxed);
     return outputs;
 }
 
@@ -4314,7 +4335,16 @@ bool DrawPipelineEnabled() {
 }
 
 bool CommitTrims() {
-    return DrawPipelineEnabled();
+    static const bool enabled = std::getenv("APS5_NO_COMMIT_TRIMS") == nullptr;
+    return enabled;
+}
+
+std::uint64_t CommitTrimHits() {
+    return commitTrimHits.load(std::memory_order_relaxed);
+}
+
+std::uint64_t CommitTrimVerifies() {
+    return commitTrimVerifies.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ResidentTargetMemoHits() {

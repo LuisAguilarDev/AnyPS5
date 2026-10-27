@@ -395,6 +395,24 @@ void CheckTargetMemo() {
     }
 }
 
+// CommitTrims (on by default, APS5_NO_COMMIT_TRIMS=1 off): a stream of one draw state answers
+// its fragment-output validation from the committer's last key after the first two draws (a miss,
+// then a memo hit that becomes the last key). APS5_VERIFY_DRAW_PIPELINE=1 validates every trimmed
+// draw again untrimmed and throws on a difference, so the trims commit what the full path would.
+void CheckCommitTrims() {
+    constexpr std::size_t draws = 64;
+    const bool trims = std::getenv("APS5_NO_COMMIT_TRIMS") == nullptr;
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    const auto hitsBefore = AgcDriver::Graphics::CommitTrimHits();
+    const auto verifiedBefore = AgcDriver::Graphics::CommitTrimVerifies();
+    static_cast<void>(Submit(Stream(Kind::Hits, draws, 0)));
+    const auto hits = AgcDriver::Graphics::CommitTrimHits() - hitsBefore;
+    const auto verified = AgcDriver::Graphics::CommitTrimVerifies() - verifiedBefore;
+    if (!trims) Require(hits == 0, "a stream of " + std::to_string(draws) + " draws trimmed " + std::to_string(hits) + " validations with the trims off");
+    else Require(hits + 4u >= draws && hits < draws, "a stream of " + std::to_string(draws) + " draws of one state trimmed " + std::to_string(hits) + " validations");
+    Require(verified == (verify ? hits : 0u), "verify mode checked " + std::to_string(verified) + " of " + std::to_string(hits) + " trimmed validations");
+}
+
 void CheckDrawInputMemo(std::uint16_t* indices) {
     Require(indices != nullptr, "the draw input memo check needs the indices in a guest arena block");
     constexpr std::size_t draws = 64;
@@ -464,6 +482,9 @@ int main(int argc, char** argv) {
             static_cast<void>(Submit(Stream(Kind::Hits, 64, 0)));
             CheckTargetMemo();
             std::cout << "the resident target memo answered the repeated lookups\n";
+        } else if (argc >= 2 && std::string_view(argv[1]) == "--commit-trims") {
+            CheckCommitTrims();
+            std::cout << "the committer trimmed the repeated validations to the same outputs\n";
         } else if (argc >= 3 && std::string_view(argv[1]) == "--benchmark") {
             Benchmark(ParseKind(argv[2]), argc >= 4 ? std::strtod(argv[3], nullptr) : 21.0);
         } else {

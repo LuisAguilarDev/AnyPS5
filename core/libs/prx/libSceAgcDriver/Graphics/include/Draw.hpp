@@ -174,7 +174,15 @@ void ClearDrawCopiedWriters();
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
+// The committer's trims of work whose inputs match its last commit: a fragment-output validation
+// answered from the thread's last key, and the per-layer unsaved scan of markLayersPending skipped
+// when no layer in the range is unsaved. On by default, with or without APS5_DRAW_PIPELINE (they
+// never call the draw finisher); APS5_NO_COMMIT_TRIMS=1 runs both in full. Under
+// APS5_VERIFY_DRAW_PIPELINE=1 every trimmed validation is repeated untrimmed and a difference
+// throws. CommitTrimHits counts the trimmed validations, CommitTrimVerifies the repeated ones.
 bool CommitTrims();
+std::uint64_t CommitTrimHits();
+std::uint64_t CommitTrimVerifies();
 std::uint64_t ResidentTargetMemoHits();
 std::uint64_t DrawInputMemoHits();
 

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <thread>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -54,12 +55,99 @@ std::byte* const Memory = allocateMemory();
 const std::span<std::uint32_t, Width * Height> Surface{reinterpret_cast<std::uint32_t*>(Memory), Width * Height};
 const std::span<std::uint8_t, 4096> Cmask{reinterpret_cast<std::uint8_t*>(Memory + 4096), 4096};
 
+// A plain draw into a target of its own (the pixel stage adds user word 2 to a constant it loads).
+alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
+    0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
+    0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
+};
+alignas(256) constexpr std::array<std::uint32_t, 10> ArithmeticPixelCode{0xf4000100u, 0xfa000000u, 0xbf8cc07fu, 0x7e000204u, 0x06000002u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
+alignas(256) std::array<float, 4> PixelConstant{};
+alignas(256) std::array<std::byte, 1024> ColorMemory{};
+alignas(256) std::array<std::uint32_t, 4> Label{};
+
+struct Header {
+    Shader shader{};
+    ShaderUserData userData{};
+};
+
+alignas(8) Header VertexHeader{};
+alignas(8) Header PixelHeader{};
+
+void registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18u;
+    header.shader.header_size = sizeof(Header);
+    header.shader.shader_size = static_cast<std::uint32_t>(bytes);
+    header.shader.code = code;
+    header.shader.type = type;
+    header.shader.user_data = &header.userData;
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+}
+
 void check(bool condition, const std::string& what) {
     if (!condition) throw std::runtime_error("pipelined metadata pass: " + what);
 }
 
 void setContext(std::vector<std::uint32_t>& words, std::uint32_t offset, std::uint32_t value) {
     words.insert(words.end(), {0xc0016900u, offset, value});
+}
+
+void setShader(std::vector<std::uint32_t>& words, std::uint32_t offset, std::uint32_t value) {
+    words.insert(words.end(), {0xc0017600u, offset, value});
+}
+
+void colorDraw(std::vector<std::uint32_t>& words) {
+    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto vertex = reinterpret_cast<std::uintptr_t>(TriangleVertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(ArithmeticPixelCode.data());
+    const auto table = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+        {0x2d5, 0x2000},
+        {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
+        {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
+        {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
+        {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
+        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0xc, 0}, {0xd, 0x40040},
+        {0x81, 0x80000000}, {0x82, 0x40040},
+        {0x90, 0x80000000}, {0x91, 0x40040},
+        {0x94, 0x80000000}, {0x95, 0x40040},
+        {0x318, static_cast<std::uint32_t>(color >> 8u)}, {0x390, static_cast<std::uint32_t>(color >> 40u)},
+        {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
+        {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
+        {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
+        {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
+        {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
+    };
+    words.insert(words.end(), {0xc0017900u, 0x242u, 4u});
+    for (const auto& [offset, value] : context) setContext(words, offset, value);
+    setShader(words, 0xc8, static_cast<std::uint32_t>(vertex >> 8u));
+    setShader(words, 0xc9, static_cast<std::uint32_t>(vertex >> 40u));
+    setShader(words, 0x8b, 0);
+    setShader(words, 0x8c, 0);
+    setShader(words, 0x008, static_cast<std::uint32_t>(pixel >> 8u));
+    setShader(words, 0x009, static_cast<std::uint32_t>(pixel >> 40u));
+    setShader(words, 0x00b, 3u << 1u);
+    setShader(words, 0x00c, static_cast<std::uint32_t>(table));
+    setShader(words, 0x00d, static_cast<std::uint32_t>(table >> 32u));
+    setShader(words, 0x00e, std::bit_cast<std::uint32_t>(0.25f));
+    words.insert(words.end(), {0xc0012d00u, 3u, 2u});
+}
+
+void writeData(std::vector<std::uint32_t>& words, const void* destination, std::uint32_t value) {
+    const auto pointer = reinterpret_cast<std::uintptr_t>(destination);
+    words.insert(words.end(), {0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u), value});
+}
+
+unsigned brightestColorByte() {
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    unsigned brightest = 0;
+    for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
+    return brightest;
 }
 
 void dmaFill(std::vector<std::uint32_t>& words, std::uint32_t data, const void* destination, std::uint32_t bytes) {
@@ -115,6 +203,58 @@ void expectEliminated(const std::string& what) {
     for (std::size_t i = 0; i < cmaskBytes; ++i) check(Cmask[i] == 0xffu, what + ": the CMASK was not left expanded");
 }
 
+// Holds the committer behind a commit of its own until `release` is set by a thread that, after
+// 300 ms, notes whether the label had been written by then.
+struct HeldCommitter {
+    explicit HeldCommitter(std::atomic<bool>& early) : early(early) {
+        AgcDriver::DriverDetail::DrawPipeline::Queue0().Enqueue([this] {
+            while (!release.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }, {});
+        releaser = std::thread([this] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            this->early.store(std::atomic_ref<std::uint32_t>(Label[0]).load(std::memory_order_acquire) != 0, std::memory_order_release);
+            release.store(true, std::memory_order_release);
+        });
+    }
+    ~HeldCommitter() {
+        if (releaser.joinable()) releaser.join();
+    }
+    std::atomic<bool>& early;
+    std::atomic<bool> release{false};
+    std::thread releaser;
+};
+
+// A draw, a CB metadata pass and a label behind them keep their program order whether the pass is
+// a commit of the pipeline or runs inline after a drain: while the committer is held behind an
+// earlier commit nothing behind it lands (the label is not written early), and once the label is
+// written the draw and the pass have landed too.
+void drawPassLabelOrder(bool pipelined) {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    registered(PixelHeader, ArithmeticPixelCode.data(), sizeof(ArithmeticPixelCode), 1);
+    PixelConstant[0] = 0.25f;
+    std::atomic_ref<std::uint32_t>(Label[0]).store(0, std::memory_order_release);
+    const auto before = DrawPipeline::PipelinedMetadataPasses();
+    std::vector<std::uint32_t> words;
+    dmaFill(words, Stale, Surface.data(), static_cast<std::uint32_t>(Surface.size_bytes()));
+    dmaFill(words, 0, Cmask.data(), static_cast<std::uint32_t>(Cmask.size()));
+    colorDraw(words);
+    eliminate(words);
+    writeData(words, Label.data(), 1);
+    std::atomic<bool> early{false};
+    {
+        HeldCommitter held(early);
+        submit(words);
+    }
+    check(!early.load(std::memory_order_acquire), "the label behind the draw and the pass was written while the committer was held ahead of them");
+    check(std::atomic_ref<std::uint32_t>(Label[0]).load(std::memory_order_acquire) == 1, "the label behind the draw and the pass was not written");
+    const auto passes = DrawPipeline::PipelinedMetadataPasses() - before;
+    check(passes == (pipelined ? 1u : 0u), "the pass between a draw and a label was " + std::string(passes != 0 ? "" : "not ") + "pipelined");
+    expectEliminated("the eliminate between a draw and a label");
+    const auto brightest = brightestColorByte();
+    check(brightest + 2 >= 128 && brightest <= 130, "the draw ahead of the pass wrote " + std::to_string(brightest) + ", expected 128");
+}
+
 }
 
 // The passes are pipelined by default, with or without APS5_DRAW_PIPELINE=1;
@@ -156,6 +296,7 @@ int main() {
         releaser.join();
         check(DrawPipeline::PipelinedMetadataPasses() == before + (pipelined ? 1u : 0u), "the second eliminate was not ordered with the commits (" + std::to_string(DrawPipeline::PipelinedMetadataPasses() - before) + " pipelined)");
         expectEliminated("the eliminate after the queued stores");
+        drawPassLabelOrder(pipelined);
         {
             GuestAllocations::Mutation mutation;
             mutation.Remove(Surface.data());

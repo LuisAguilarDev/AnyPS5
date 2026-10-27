@@ -2691,6 +2691,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_reap_epoch_keep_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # The CB metadata passes inline after a drain (APS5_NO_PIPELINED_METADATA_PASSES), in the same
+    # order; the plain test runs them pipelined by default and the _draw_pipeline variant with
+    # APS5_DRAW_PIPELINE=1.
+    add_test(NAME agc_driver_pipelined_metadata_pass_inline COMMAND agc_driver_pipelined_metadata_pass_tests)
+    set_tests_properties(agc_driver_pipelined_metadata_pass_inline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINED_METADATA_PASSES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_pipelined_metadata_pass_inline PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_pipelined_dma_off COMMAND agc_driver_pipelined_dma_tests)
     set_tests_properties(agc_driver_pipelined_dma_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_PIPELINE_DMA=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     if(WIN32)

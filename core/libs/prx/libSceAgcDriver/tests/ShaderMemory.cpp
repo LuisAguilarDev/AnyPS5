@@ -1258,6 +1258,44 @@ void verifyResultMismatch() {
     require(after.verifyChecks - before.verifyChecks == 2 && after.verifyMismatches - before.verifyMismatches == 1, "result mismatch: the verify checks and mismatches were not counted");
 }
 
+// The program split: two draws of one program with different data words (each V# points at
+// another buffer) share one program, built once, and each result carries its own draw's words, as
+// a full materialization would (APS5_VERIFY_PROGRAM_SPLIT=1 checks every split result). Another
+// V# format is another program. APS5_NO_PROGRAM_SPLIT=1 materializes without programs.
+void verifyProgramSplit() {
+    using namespace ShaderRecompiler;
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    alignas(16) static std::array<std::uint32_t, 4> other{};
+    alignas(16) static std::array<std::uint32_t, 4> first{};
+    alignas(16) static std::array<std::uint32_t, 4> second{};
+    alignas(16) static std::array<std::uint32_t, 4> reformatted{};
+    first = memoTableBuffer(output);
+    second = memoTableBuffer(other);
+    reformatted = memoTableBuffer(output);
+    reformatted[3] ^= 0x1000u;
+    const auto guestWords = [](const RecompileResult& result) {
+        const auto found = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::GuestBuffers; });
+        require(found != result.bindings.end(), "program split: the result has no GuestBuffers binding");
+        return found->guestDescriptor;
+    };
+    const bool split = std::getenv("APS5_NO_PROGRAM_SPLIT") == nullptr;
+    const auto before = ProgramMemoCounts();
+    const auto a = materializeMemoTable(first, true);
+    const auto b = materializeMemoTable(second, true);
+    const auto after = ProgramMemoCounts();
+    require(guestWords(*a) == std::vector<std::uint32_t>(first.begin(), first.end()) && guestWords(*b) == std::vector<std::uint32_t>(second.begin(), second.end()), "program split: a result does not carry its own draw's V#");
+    if (!split) {
+        require(a->programPart == nullptr && b->programPart == nullptr && after.misses == before.misses && after.hits == before.hits, "program split: APS5_NO_PROGRAM_SPLIT=1 still materialized through a program");
+        return;
+    }
+    require(a->programPart != nullptr && a->programPart == b->programPart, "program split: two draws of one program did not share it");
+    require(after.misses - before.misses == 1 && after.hits - before.hits == 1, "program split: the program was not built once and then found");
+    require(after.verifyChecks - before.verifyChecks == 2 && after.verifyMismatches == before.verifyMismatches, "program split: a split result differs from its full materialization");
+    const auto c = materializeMemoTable(reformatted, true);
+    require(c->programPart != nullptr && c->programPart != a->programPart, "program split: another V# format shared the program");
+    require(ProgramMemoCounts().verifyMismatches == before.verifyMismatches, "program split: the reformatted result differs from its full materialization");
+}
+
 void verifySharedBindingMetadata() {
     using namespace ShaderRecompiler;
     alignas(16) static std::array<std::uint32_t, 4> output{};
@@ -8655,6 +8693,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--shared-binding-metadata") {
             verifySharedBindingMetadata();
             std::cout << "Results of one binding plan share its binding metadata until a copy writes it\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--program-split") {
+            verifyProgramSplit();
+            std::cout << "Draws of one program share it and fill their own words\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-mismatch") {

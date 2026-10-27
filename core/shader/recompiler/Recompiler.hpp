@@ -758,8 +758,18 @@ struct ResultKeyMemo {
     }
 };
 
+// The part of a materialized result that the program key alone selects (the variant, its binding
+// plan, its module and the request words they read): built once per key and shared by every result
+// filled from it. A result's words, push constants and per-binding guest descriptors stay its own.
+struct ProgramPart {
+    std::vector<std::uint64_t> key;
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
+    // The program this result was filled from, null when it was materialized in full
+    // (APS5_NO_PROGRAM_SPLIT, registration results and uncached requests).
+    std::shared_ptr<const ProgramPart> programPart;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;

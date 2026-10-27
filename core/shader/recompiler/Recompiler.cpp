@@ -966,9 +966,7 @@ private:
     std::optional<MaterializeSplit::Sample> sample;
 };
 
-std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
-    struct BindingPlanKeyStorage {};
-    auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
+void bindingPlanKey(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, std::vector<std::uint64_t>& key) {
     key.clear();
     key.push_back(variant.artifact.variantId);
     for (std::size_t index = 0; index < variant.info.info.buffers.size(); ++index) {
@@ -994,6 +992,9 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
     if (programKeyCensusEnabled()) lastPlanKeyHash = ProgramKeyCensus::Hash(key);
+}
+
+std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const std::vector<std::uint64_t>& key, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
     static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
@@ -1061,10 +1062,119 @@ const ResourceSnapshot& mergeTargetImage(const CompiledVariant& variant, const R
     return merged;
 }
 
-RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false) {
-    ResourceSnapshot merged;
-    const auto& snapshot = mergeTargetImage(variant, request, captured, registrationDefaults, merged);
-    RecompileResult result;
+struct ProgramMemoCounters {
+    std::atomic<std::uint64_t> hits{0}, misses{0}, resets{0}, verifyCalls{0}, verifyChecks{0}, verifyMismatches{0};
+};
+
+ProgramMemoCounters& programMemoCounters() {
+    static ProgramMemoCounters counters;
+    return counters;
+}
+
+// APS5_NO_PROGRAM_SPLIT=1: a memoized materialization builds its program fields again for every
+// result instead of filling the words into the program memo's program.
+bool ProgramSplit() {
+    static const bool split = std::getenv("APS5_NO_PROGRAM_SPLIT") == nullptr;
+    return split;
+}
+
+// What one materialization reads from the request and the snapshot to select its program, and the
+// per-draw vertex values found on the way.
+struct ProgramInputs {
+    std::vector<std::uint64_t> planKey;
+    std::vector<std::uint32_t> moduleKey;
+    // The program key: the plan key, the module key and the request words the program reads.
+    std::vector<std::uint64_t> key;
+    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
+    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
+    std::vector<VertexAttribute> vertexAttributes;
+    bool depthRemap = false;
+};
+
+// The program fields of a result (no bindings, push constants or per-draw values) and the plan and
+// module they came from.
+struct ProgramState : ProgramPart {
+    RecompileResult program;
+    std::shared_ptr<PreparedBindingPlan> plan;
+    std::shared_ptr<PreparedModuleEntry> entry;
+    const DescriptorBindingPlan* bindings = nullptr;
+};
+
+std::span<const std::uint8_t> exportMapping(const RecompileRequest& request) {
+    return request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{};
+}
+
+void readProgramInputs(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults, ProgramInputs& inputs) {
+    const auto& artifact = variant.artifact;
+    bindingPlanKey(variant, snapshot, exportMapping(request), inputs.planKey);
+    auto& moduleKey = inputs.moduleKey;
+    moduleKey.clear();
+    if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
+    if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
+    if (request.context.pixel) {
+        for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
+        moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        moduleKey.push_back(request.context.pixel->reversedBlend);
+        if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
+        if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
+    }
+    inputs.depthRemap = request.target.depthRangeRemap && request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value();
+    if (inputs.depthRemap) {
+        if (request.context.vertex->depthRemapMode != 0u && request.layout.pushConstantOffsetBytes % (RuntimeAbi::PushConstantDwords * 4u) + request.layout.pushConstantSizeBytes > DepthRemapPushOffsetBytes) {
+            throw std::runtime_error("a remapped vertex shader's push data must end before the depth remap words");
+        }
+        moduleKey.push_back(request.context.vertex->depthRemapMode);
+    }
+    inputs.vertexAttributes.clear();
+    inputs.vertexAttributes.reserve(artifact.vertexInputs.size());
+    inputs.vertexClasses = {};
+    inputs.runtimeSelectors = {};
+    for (const auto& input : artifact.vertexInputs) {
+        if (!request.context.vertex || input.location >= request.context.vertex->resourcesNum || input.location >= request.context.vertex->resources.size()) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
+        const auto& vertex = *request.context.vertex;
+        const auto& resource = vertex.resources[input.location];
+        const auto fetchIndex = vertex.fetchEmbedded ? vertex.resourcesDst[input.location].fetchIndex : input.fetchIndex;
+        inputs.vertexAttributes.push_back({input.location, input.components, resource, fetchIndex});
+        if (!artifact.vertexInputPatches.empty()) {
+            const auto format = static_cast<IrBufferFormat>((resource.fields[3] >> 12u) & 0x7fu);
+            const auto numeric = registrationDefaults && format == IrBufferFormat::Invalid ? IrTextureNumericClass::Float : VertexInputNumericClass(format);
+            if (numeric == IrTextureNumericClass::Unsupported) throw std::runtime_error("unsupported prepared vertex format");
+            const auto kind = numeric == IrTextureNumericClass::Float ? 0u : numeric == IrTextureNumericClass::Sint ? 1u : 2u;
+            inputs.vertexClasses.at(input.location) = kind;
+            std::uint32_t selectors = kind << 12u;
+            auto& formatComponents = inputs.vertexAttributes.back().formatComponents;
+            formatComponents = 1u;
+            for (std::uint32_t component = 0; component < 4u; ++component) {
+                const auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
+                if (selector == 2u || selector == 3u) {
+                    const auto& fields = resource.fields;
+                    char message[192];
+                    std::snprintf(message, sizeof(message), "reserved prepared vertex component selector %u at location %u component %u (V#=[%08x %08x %08x %08x])",
+                        selector, input.location, component, fields[0], fields[1], fields[2], fields[3]);
+                    throw std::runtime_error(message);
+                }
+                if (selector >= 4u) formatComponents = std::max(formatComponents, selector - 3u);
+                selectors |= selector << (component * 3u);
+            }
+            moduleKey.push_back(artifact.registrationModule ? selectors & ~0xfffu : selectors);
+            if (artifact.registrationModule) inputs.runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
+        }
+    }
+    if (programKeyCensusEnabled()) programKeyCensus().Note(ProgramKeyCensus::Combine(lastPlanKeyHash, ProgramKeyCensus::Hash(std::span<const std::uint32_t>(moduleKey))));
+    auto& key = inputs.key;
+    key.assign(inputs.planKey.begin(), inputs.planKey.end());
+    key.push_back(moduleKey.size());
+    key.insert(key.end(), moduleKey.begin(), moduleKey.end());
+    key.push_back(request.context.userDataBaseRegister);
+    key.push_back(static_cast<std::uint64_t>(request.shader.stage) | (registrationDefaults ? 1ull << 32u : 0u) | (inputs.depthRemap ? 1ull << 33u : 0u) | (request.target.registrationModules ? 1ull << 34u : 0u));
+    key.push_back(request.layout.pushConstantOffsetBytes | (static_cast<std::uint64_t>(request.layout.pushConstantSizeBytes) << 32u));
+}
+
+// The program fields of every result with `inputs.key`: the artifact, the user data registers read,
+// the binding plan and the specialized module.
+std::shared_ptr<ProgramState> buildProgram(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ProgramInputs& inputs) {
+    auto state = std::make_shared<ProgramState>();
+    auto& result = state->program;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
         .memoryOffsetDword = artifact.memoryOffsetDword,
@@ -1100,64 +1210,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
     markSplit(MaterializeSplit::Artifact);
-    const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
-    const DescriptorBindingPlan* bindingPlan = &plan->bindings;
-    std::shared_ptr<PreparedModuleEntry> entry;
-    struct LocalModuleKeyStorage {};
-    auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
-    moduleKey.clear();
-    if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
-    if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
-    if (request.context.pixel) {
-        for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
-        moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
-        moduleKey.push_back(request.context.pixel->reversedBlend);
-        if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
-        if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
-    }
-    const bool depthRemap = request.target.depthRangeRemap && request.shader.stage == ShaderStage::Vertex && request.context.vertex.has_value();
-    if (depthRemap) {
-        if (request.context.vertex->depthRemapMode != 0u && request.layout.pushConstantOffsetBytes % (RuntimeAbi::PushConstantDwords * 4u) + request.layout.pushConstantSizeBytes > DepthRemapPushOffsetBytes) {
-            throw std::runtime_error("a remapped vertex shader's push data must end before the depth remap words");
-        }
-        moduleKey.push_back(request.context.vertex->depthRemapMode);
-    }
-    result.vertexAttributes.reserve(result.vertexInputs.size());
-    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
-    std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources / RuntimeAbi::VertexSelectorsPerDword> runtimeSelectors{};
-    for (const auto& input : result.vertexInputs) {
-        if (!request.context.vertex || input.location >= request.context.vertex->resourcesNum || input.location >= request.context.vertex->resources.size()) throw std::runtime_error("Shader cache: invalid vertex attribute metadata");
-        const auto& vertex = *request.context.vertex;
-        const auto& resource = vertex.resources[input.location];
-        const auto fetchIndex = vertex.fetchEmbedded ? vertex.resourcesDst[input.location].fetchIndex : input.fetchIndex;
-        result.vertexAttributes.push_back({input.location, input.components, resource, fetchIndex});
-        if (!artifact.vertexInputPatches.empty()) {
-            const auto format = static_cast<IrBufferFormat>((resource.fields[3] >> 12u) & 0x7fu);
-            const auto numeric = registrationDefaults && format == IrBufferFormat::Invalid ? IrTextureNumericClass::Float : VertexInputNumericClass(format);
-            if (numeric == IrTextureNumericClass::Unsupported) throw std::runtime_error("unsupported prepared vertex format");
-            const auto kind = numeric == IrTextureNumericClass::Float ? 0u : numeric == IrTextureNumericClass::Sint ? 1u : 2u;
-            vertexClasses.at(input.location) = kind;
-            std::uint32_t selectors = kind << 12u;
-            auto& formatComponents = result.vertexAttributes.back().formatComponents;
-            formatComponents = 1u;
-            for (std::uint32_t component = 0; component < 4u; ++component) {
-                const auto selector = (input.outputMask & (1u << component)) != 0u ? (resource.fields[3] >> (component * 3u)) & 7u : 0u;
-                if (selector == 2u || selector == 3u) {
-                    const auto& fields = resource.fields;
-                    char message[192];
-                    std::snprintf(message, sizeof(message), "reserved prepared vertex component selector %u at location %u component %u (V#=[%08x %08x %08x %08x])",
-                        selector, input.location, component, fields[0], fields[1], fields[2], fields[3]);
-                    throw std::runtime_error(message);
-                }
-                if (selector >= 4u) formatComponents = std::max(formatComponents, selector - 3u);
-                selectors |= selector << (component * 3u);
-            }
-            moduleKey.push_back(artifact.registrationModule ? selectors & ~0xfffu : selectors);
-            if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
-        }
-    }
-    if (programKeyCensusEnabled()) programKeyCensus().Note(ProgramKeyCensus::Combine(lastPlanKeyHash, ProgramKeyCensus::Hash(std::span<const std::uint32_t>(moduleKey))));
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap) {
+    const auto& plan = state->plan = preparedBindingPlan(variant, inputs.planKey, snapshot, exportMapping(request), request.target.registrationModules);
+    state->bindings = &plan->bindings;
+    const auto& moduleKey = inputs.moduleKey;
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || inputs.depthRemap) {
+        auto& entry = state->entry;
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -1179,11 +1236,11 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
                 if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
             }
-            if (depthRemap) {
+            if (inputs.depthRemap) {
                 for (std::uint32_t word = 0; word < PipelineSpecialization::DepthRemapWords; ++word) constants.push_back({PipelineSpecialization::DepthRemapBase + word, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
-                for (const auto& input : result.vertexInputs) {
+                for (const auto& input : artifact.vertexInputs) {
                     const auto selectors = moduleKey[index++];
                     const auto first = PipelineSpecialization::VertexBase + input.location * PipelineSpecialization::VertexWords;
                     for (std::uint32_t component = 0; component < 4u; ++component) constants.push_back({first + component, (selectors >> (component * 3u)) & 7u});
@@ -1192,7 +1249,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, inputs.vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, inputs.vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
@@ -1209,24 +1266,76 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto& module = entry->module;
         result.specializationId = module->specializationId;
         result.spirv = module->spirv;
-        bindingPlan = &entry->bindings;
+        state->bindings = &entry->bindings;
     } else {
         result.spirv = artifact.spirv;
     }
-    markSplit(MaterializeSplit::Program);
-    const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
-    const auto& tables = *resolved;
-    BindingAllocationResult bindings;
-    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
-    markSplit(MaterializeSplit::Populate);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
-    result.bindings = std::move(bindings.bindings);
-    if (std::ranges::none_of(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable || binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
-    result.pushConstants = std::move(bindings.pushConstants);
-    result.readsDepthRemapPush = depthRemap;
+    result.readsDepthRemapPush = inputs.depthRemap;
     if (request.shader.stage == ShaderStage::Compute) {
         for (std::uint32_t component = 0; component < PipelineSpecialization::WorkgroupOffsetWords; ++component) result.specialization.push_back({PipelineSpecialization::WorkgroupOffsetBase + component, 0u});
     }
+    return state;
+}
+
+// The program memo (Route step 6): one program per program key, for every source.
+struct ProgramKeyHash {
+    std::size_t operator()(const std::vector<std::uint64_t>& key) const {
+        std::uint64_t hash = 14695981039346656037ull;
+        for (const auto word : key) hash = (hash ^ word ^ (word >> 32u)) * 1099511628211ull;
+        return static_cast<std::size_t>(hash ^ (hash >> 29u));
+    }
+};
+
+struct ProgramMemo {
+    PrimedSharedMutex mutex;
+    std::unordered_map<std::vector<std::uint64_t>, std::shared_ptr<const ProgramState>, ProgramKeyHash> programs;
+};
+
+// The programs kept before the memo starts again: far more than a game binds, so a reset only
+// bounds a run that keeps making new keys.
+constexpr std::size_t ProgramMemoCapacity = 1u << 16u;
+
+std::shared_ptr<const ProgramState> memoizedProgram(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, const ProgramInputs& inputs) {
+    static auto* memo = new ProgramMemo();
+    auto& counters = programMemoCounters();
+    {
+        std::shared_lock lock(memo->mutex);
+        if (const auto found = memo->programs.find(inputs.key); found != memo->programs.end()) {
+            counters.hits.fetch_add(1, std::memory_order_relaxed);
+            return found->second;
+        }
+    }
+    auto built = buildProgram(variant, request, snapshot, inputs);
+    built->key = inputs.key;
+    counters.misses.fetch_add(1, std::memory_order_relaxed);
+    std::shared_ptr<const ProgramState> program = std::move(built);
+    std::unordered_map<std::vector<std::uint64_t>, std::shared_ptr<const ProgramState>, ProgramKeyHash> dropped;
+    std::unique_lock lock(memo->mutex);
+    if (memo->programs.size() >= ProgramMemoCapacity) {
+        dropped.swap(memo->programs);
+        counters.resets.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto [found, inserted] = memo->programs.emplace(program->key, program);
+    if (!inserted) program = found->second;
+    lock.unlock();
+    return program;
+}
+
+// One draw's result of `program`: its own bindings, push constants and per-draw values over the
+// program's fields.
+RecompileResult fillData(const ProgramState& program, const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, ProgramInputs& inputs) {
+    RecompileResult result = program.program;
+    const auto& artifact = variant.artifact;
+    result.vertexAttributes = std::move(inputs.vertexAttributes);
+    const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
+    const auto& tables = *resolved;
+    BindingAllocationResult bindings;
+    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *program.bindings, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
+    markSplit(MaterializeSplit::Populate);
+    result.bindings = std::move(bindings.bindings);
+    if (std::ranges::none_of(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable || binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
+    result.pushConstants = std::move(bindings.pushConstants);
     if (!artifact.stencilReferences.empty()) {
         if (artifact.stencilReferenceDword * sizeof(std::uint32_t) != result.pushConstants.size() || result.pushConstants.size() + sizeof(std::uint32_t) > request.layout.pushConstantSizeBytes) throw std::runtime_error("stencil replay push constant lies outside the stage range");
         result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));
@@ -1234,14 +1343,14 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     const auto& layout = variant.bindings.layout;
     if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
         const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;
-        if (layout.runtimeStateDwords > runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
+        if (layout.runtimeStateDwords > inputs.runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
         if (layout.UsesPushData()) {
             if ((first + layout.runtimeStateDwords) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("vertex selector state lies outside the push data");
-            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), runtimeSelectors.data(), layout.runtimeStateDwords * sizeof(std::uint32_t));
+            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), inputs.runtimeSelectors.data(), layout.runtimeStateDwords * sizeof(std::uint32_t));
         } else {
             const auto data = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
             if (data == result.bindings.end() || first + layout.runtimeStateDwords > data->guestDescriptor.size()) throw std::runtime_error("vertex selector state lies outside the shader data");
-            std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
+            std::copy_n(inputs.runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
         }
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
@@ -1257,6 +1366,33 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableFaults = tables.faults;
     }
     markSplit(MaterializeSplit::Tail);
+    return result;
+}
+
+// `programs` takes the program from the program memo (APS5_VERIFY_PROGRAM_SPLIT compares a sample
+// with a full materialization and keeps the full one on a difference); without it every call
+// builds its own program, as before the split.
+RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, bool programs = false) {
+    ResourceSnapshot merged;
+    const auto& snapshot = mergeTargetImage(variant, request, captured, registrationDefaults, merged);
+    struct ProgramInputsStorage {};
+    auto& inputs = HostThreadLocal<ProgramInputs, ProgramInputsStorage>();
+    readProgramInputs(variant, request, snapshot, registrationDefaults, inputs);
+    if (!programs) {
+        const auto program = buildProgram(variant, request, snapshot, inputs);
+        markSplit(MaterializeSplit::Program);
+        return fillData(*program, variant, request, snapshot, inputs);
+    }
+    const auto program = memoizedProgram(variant, request, snapshot, inputs);
+    markSplit(MaterializeSplit::Program);
+    auto result = fillData(*program, variant, request, snapshot, inputs);
+    result.programPart = program;
+    if (ProgramSplitVerifySampled()) {
+        auto full = materializeResult(variant, request, captured, registrationDefaults);
+        const auto mismatch = ResultMismatch(result, full);
+        NoteProgramSplitVerify(!mismatch.empty(), mismatch);
+        if (!mismatch.empty()) return full;
+    }
     return result;
 }
 
@@ -1444,15 +1580,6 @@ struct ResultMemoCounters {
 
 ResultMemoCounters& resultMemoCounters() {
     static ResultMemoCounters counters;
-    return counters;
-}
-
-struct ProgramMemoCounters {
-    std::atomic<std::uint64_t> hits{0}, misses{0}, resets{0}, verifyCalls{0}, verifyChecks{0}, verifyMismatches{0};
-};
-
-ProgramMemoCounters& programMemoCounters() {
-    static ProgramMemoCounters counters;
     return counters;
 }
 
@@ -1800,7 +1927,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.patched.fetch_add(1, std::memory_order_relaxed);
         if (VerifyMemoUserWordPatch()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot));
     } else {
-        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, ProgramSplit()));
         markSplit(MaterializeSplit::Tail);
     }
     result->cacheHit = cacheHit;

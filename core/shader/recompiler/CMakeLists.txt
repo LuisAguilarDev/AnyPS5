@@ -308,6 +308,7 @@ function(add_shader_recompiler target runtimeTarget)
             ProgramSplitVerifySampled
             NoteProgramSplitVerify
             ProgramMemoCounts
+            ProgramPart
             ThreadOwned
             ProgramRole
             UnresolvableSwappcTarget

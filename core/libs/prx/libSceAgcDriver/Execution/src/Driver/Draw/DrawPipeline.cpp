@@ -39,6 +39,11 @@ std::atomic<std::uint64_t> heldReadRanges{0};
 std::atomic<std::uint64_t> heldReadQueries{0};
 std::atomic<std::uint64_t> heldReadHits{0};
 
+// Whether joining the prep pool would wait on this thread.
+bool poolJoinWaits() {
+    return DrawPrepPool::Threads() != 0 && DrawPrepPool::Get().JoinWaits();
+}
+
 }
 
 namespace {
@@ -297,6 +302,9 @@ void DrawPipeline::rethrowFailure() {
 }
 
 void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, bool draw) {
+    // O8, no waits under the GPU lock: the pool's jobs and the finisher may wait for the spine,
+    // which needs the lock, so a holder that would join them is refused before it waits.
+    if (poolJoinWaits() || (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread())) DrawPrepPool::RefuseWaitUnderGpuLock("draw pipeline enqueue");
     if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -509,6 +517,8 @@ void DrawPipeline::noteFrameStepCommit(CommitKind kind, std::uint64_t spentNs, s
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    // O8: refused before the pool join, as below before the finisher and the FIFO.
+    if (poolJoinWaits()) DrawPrepPool::RefuseWaitUnderGpuLock("draw pipeline drain");
     if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
@@ -559,6 +569,7 @@ void DrawPipeline::ReleaseRunningReads() {
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
+    if (poolJoinWaits()) DrawPrepPool::RefuseWaitUnderGpuLock("draw pipeline pending label");
     if (DrawPrepPool::Threads() != 0) DrawPrepPool::Get().WaitAll();
     if (bytes == 0 || bytes > 8) return std::nullopt;
     if (DrawFinisher::Overlap()) {

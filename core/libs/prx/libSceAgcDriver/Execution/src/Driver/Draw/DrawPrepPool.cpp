@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockProfile.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <stdexcept>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -42,6 +45,14 @@ std::size_t DrawPrepPool::Depth() {
 
 bool DrawPrepPool::InPoolThread() {
     return poolThread;
+}
+
+bool DrawPrepPool::JoinWaits() const {
+    return !poolThread && !exemptThread && Pending();
+}
+
+void DrawPrepPool::RefuseWaitUnderGpuLock(const char* site) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error(std::string(site) + " would wait for the prep pool under the GPU lock");
 }
 
 void DrawPrepPool::ExemptThisThread() {
@@ -253,6 +264,7 @@ void DrawPrepPool::WaitForWriters(std::span<const Range> ranges) {
         if (!bounds.empty()) waitsAvoided.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    RefuseWaitUnderGpuLock("WaitForWriters");
     const auto start = std::chrono::steady_clock::now();
     progress.wait(lock, [&] { return !mayWriteAnyLocked(ranges); });
     const auto waited = elapsedNs(start);
@@ -264,6 +276,7 @@ void DrawPrepPool::WaitForWriters(std::span<const Range> ranges) {
 
 void DrawPrepPool::WaitAll() {
     if (poolThread || exemptThread || !Pending()) return;
+    RefuseWaitUnderGpuLock("WaitAll");
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
     progress.wait(lock, [&] { return submitted.load(std::memory_order_relaxed) == turn.load(std::memory_order_relaxed); });

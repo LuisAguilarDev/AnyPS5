@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrepPool.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -161,6 +163,46 @@ void ReadersOfSeveralRangesWaitForAnyWriter() {
     pool.WaitAll();
 }
 
+// O8: no waits under the GPU lock. A pending job may need the spine, and the spine the GPU lock, so
+// a holder of the lock that joins the pool, enqueues behind it, drains or looks up a pending label
+// fails with an error instead of hanging. A join that would not wait still passes.
+void JoinsUnderTheGpuLockFail() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    auto& pool = DrawPrepPool::Get();
+    Gate held, release;
+    const std::vector<Range> writes{{0xc0000, 0xc0100}};
+    pool.Submit([&](std::uint64_t seq) {
+        held.Open();
+        release.Wait();
+        Finish(pool, seq, writes);
+    }, writes);
+    held.Wait();
+    const auto refused = [](const char* what, const auto& wait) {
+        bool threw = false;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            try {
+                wait();
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+        }
+        Check(threw, what);
+    };
+    refused("WaitAll under the GPU lock did not refuse to wait for a pending job", [&] { pool.WaitAll(); });
+    refused("WaitForWriters under the GPU lock did not refuse to wait for a pending writer", [&] { pool.WaitForWriters(0xc0080, 4); });
+    refused("Enqueue under the GPU lock did not refuse to join the pool", [] { DrawPipeline::Queue0().Enqueue([] {}, {}); });
+    refused("Drain under the GPU lock did not refuse to join the pool", [] { DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet); });
+    refused("PendingLabel under the GPU lock did not refuse to join the pool", [] { static_cast<void>(DrawPipeline::Queue0().PendingLabel(0xc0000, 4)); });
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        pool.WaitForWriters(0xd0000, 4);
+    }
+    release.Open();
+    pool.WaitAll();
+    Check(DrawPipeline::Queue0().Outstanding() == 0, "a refused enqueue queued its commit");
+}
+
 }
 
 int main() {
@@ -173,6 +215,7 @@ int main() {
         RefinedJobReleasesDisjointReaders();
         RefineRefusedBehindPossibleWriters();
         ReadersOfSeveralRangesWaitForAnyWriter();
+        JoinsUnderTheGpuLockFail();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

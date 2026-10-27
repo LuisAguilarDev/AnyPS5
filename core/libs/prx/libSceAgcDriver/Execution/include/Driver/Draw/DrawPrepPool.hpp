@@ -35,6 +35,10 @@ public:
     static bool Lookup();
 
     bool Pending() const { return submitted.load(std::memory_order_acquire) != turn.load(std::memory_order_acquire); }
+    // Whether WaitAll would wait on this thread (jobs pending, and not a pool or exempt thread).
+    bool JoinWaits() const;
+    // O8, no waits under the GPU lock: on a thread that holds it, throws instead of waiting.
+    static void RefuseWaitUnderGpuLock(const char* site);
     std::uint64_t Enqueued() const { return turn.load(std::memory_order_acquire); }
     void Submit(Job job, std::optional<std::vector<Range>> bound = std::nullopt);
     bool MayWrite(std::uint64_t address, std::size_t bytes);

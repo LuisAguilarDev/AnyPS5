@@ -467,14 +467,11 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    add_test_executable(agc_driver_draw_prep_pool_bounds_tests
-            tests/DrawPrepPoolBounds.cpp
-            Execution/src/Driver/Draw/DrawPrepPool.cpp
-            Execution/src/FrameSteps.cpp
-            Execution/src/LockProfile.cpp
-    )
+    # Linked against the driver: the GPU lock guards of the pool's joins (DrawPrepPool::
+    # RefuseWaitUnderGpuLock) and the pipeline's enqueue, drain and pending-label checks.
+    add_test_executable(agc_driver_draw_prep_pool_bounds_tests tests/DrawPrepPoolBounds.cpp)
     target_include_directories(agc_driver_draw_prep_pool_bounds_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(agc_driver_draw_prep_pool_bounds_tests PRIVATE libc)
+    target_link_libraries(agc_driver_draw_prep_pool_bounds_tests PRIVATE libSceAgcDriver libc)
     set_target_properties(agc_driver_draw_prep_pool_bounds_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_draw_prep_pool_bounds_tests)
     add_test(NAME agc_driver_draw_prep_pool_bounds COMMAND agc_driver_draw_prep_pool_bounds_tests)

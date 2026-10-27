@@ -247,6 +247,11 @@ public:
         std::uint64_t digest;
     };
     void GuestInputDigests(std::span<const MovedBuffer> moved, const std::vector<std::uint8_t>* pendingWrites, std::vector<GuestInputDigest>& digests) const;
+    // The data words of a template hit (MovedBuffer::words) point into the program's bindings,
+    // which a later draw or a freed program rewrites: a chunked draw's record half copies them
+    // into kept and points its spans there. APS5_NO_HALF_WORD_COPY=1 leaves them in place.
+    static bool CopiesMovedWords();
+    static void KeepMovedWords(std::span<MovedBuffer> moved, std::vector<std::uint32_t>& kept);
     static std::uint64_t DigestGuestBytes(std::uint64_t address, std::size_t bytes);
     std::uint64_t RevalidateGeneration() const { return revalidateGeneration.load(std::memory_order_relaxed); }
     // Whether MarkGpuWrites records commands after the work: copy-backs of copied regions, and store

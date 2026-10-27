@@ -193,7 +193,7 @@ struct Totals {
     std::uint64_t submitValidateNs = 0;
     std::array<std::uint64_t, ProofBreakers> proofBreaks{};
     std::uint64_t targetMemoLookups = 0, targetMemoHits = 0, drawInputMemoLookups = 0, drawInputMemoHits = 0;
-    std::uint64_t drawStages = 0, stagedDraws = 0, halfChecks = 0, halfStale = 0;
+    std::uint64_t drawStages = 0, stagedDraws = 0, halfChecks = 0, halfStale = 0, halfCopies = 0, halfCopyNs = 0;
     std::array<std::uint64_t, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
 };
 
@@ -317,6 +317,8 @@ public:
         totals.stagedDraws = take(stagedDraws);
         totals.halfChecks = take(halfChecks);
         totals.halfStale = take(halfStale);
+        totals.halfCopies = take(halfCopies);
+        totals.halfCopyNs = take(halfCopyNs);
         takeAll(vkSubmitsBy, totals.vkSubmitsBy);
         return totals;
     }
@@ -348,7 +350,7 @@ public:
     Counter submitValidateNs{0};
     std::array<Counter, ProofBreakers> proofBreaks{};
     Counter targetMemoLookups{0}, targetMemoHits{0}, drawInputMemoLookups{0}, drawInputMemoHits{0};
-    Counter drawStages{0}, stagedDraws{0}, halfChecks{0}, halfStale{0};
+    Counter drawStages{0}, stagedDraws{0}, halfChecks{0}, halfStale{0}, halfCopies{0}, halfCopyNs{0};
     std::array<Counter, ThreadRoles * SubmitTriggers> vkSubmitsBy{};
 
 private:

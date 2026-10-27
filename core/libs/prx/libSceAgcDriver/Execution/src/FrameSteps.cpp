@@ -359,11 +359,11 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
     std::string line(text);
     const auto tail = std::snprintf(text, sizeof(text),
         "target_memo_hit%%=%.1f target_memo_lookups/f=%.1f draw_input_memo_hit%%=%.1f draw_input_memo_lookups/f=%.1f result_memo_hit%%=%.1f result_memo_lookups/f=%.1f result_memo_evictions/f=%.1f "
-        "stages/draw=%.2f program_keys/10s=%llu program_key_materializes/f=%.1f program_key_table_hit%%=%.1f program_key_overflow=%llu half_checks/f=%.1f half_stale/f=%.1f",
+        "stages/draw=%.2f program_keys/10s=%llu program_key_materializes/f=%.1f program_key_table_hit%%=%.1f program_key_overflow=%llu half_checks/f=%.1f half_stale/f=%.1f half_copy_us/draw=%.3f",
         Rate(totals.targetMemoHits, totals.targetMemoLookups), perFrame(totals.targetMemoLookups), Rate(totals.drawInputMemoHits, totals.drawInputMemoLookups), perFrame(totals.drawInputMemoLookups),
         Rate(shaders.resultMemoHits, resultLookups), perFrame(resultLookups), perFrame(shaders.resultMemoEvictions),
         PerItem(static_cast<double>(totals.drawStages), totals.stagedDraws), static_cast<unsigned long long>(shaders.programKeysDistinct), perFrame(shaders.programKeys), Rate(shaders.programKeyTableHits, shaders.programKeys), static_cast<unsigned long long>(shaders.programKeyOverflow),
-        perFrame(totals.halfChecks), perFrame(totals.halfStale));
+        perFrame(totals.halfChecks), perFrame(totals.halfStale), PerItem(Us(totals.halfCopyNs), totals.halfCopies));
     if (tail < 0) return {};
     return line + text + "\n";
 }

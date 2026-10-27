@@ -6449,6 +6449,83 @@ void chunkDeterminismTests() {
     std::cout << "chunks record the same commands on one and on three recorder threads\n";
 }
 
+// A chunked draw's record half reads the data words of its template hit (MovedBuffer::words) on a
+// recorder thread, after the spine moved on to later draws. The half keeps its own copy
+// (ShaderResources::KeepMovedWords), so the words it was queued with are the ones it records even
+// when their source is rewritten before the recorder thread takes the half. With
+// APS5_NO_HALF_WORD_COPY=1 the half reads the source in place and records the rewritten words.
+void chunkedHalfWordTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::DrawRecorders;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::RecordedChunk;
+    using AgcDriver::Graphics::RecordingContext;
+    using AgcDriver::Graphics::ShaderResources;
+    const bool copies = std::getenv("APS5_NO_HALF_WORD_COPY") == nullptr;
+    mock = MockVulkan{};
+    serializeMock = true;
+    auto context = mockContext();
+    context.limits.minStorageBufferOffsetAlignment = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        constexpr std::size_t compact = ShaderRecompiler::RuntimeAbi::UserDataDword + 4u;
+        const auto wordsFor = [](std::uint32_t last) {
+            auto words = ShaderDataWords({7, 8, last});
+            words.resize(compact);
+            return words;
+        };
+        const auto queued = wordsFor(100);
+        const auto rewritten = wordsFor(200);
+        auto source = queued;
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, wordsFor(9)));
+        vertex.shaderDataDwords = compact;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        Recorder recorder(context);
+        std::optional<ShaderResources> resources;
+        std::vector<ShaderResources::MovedBuffer> moved{{0, 0, source.size() * 4u, source}};
+        std::vector<std::uint32_t> kept;
+        std::vector<std::uint32_t> recorded;
+        std::atomic<bool> released{false};
+        std::shared_ptr<RecordedChunk> chunk;
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(recorder.Recorders() != nullptr, "the half word test runs without recorder threads");
+            resources.emplace(context, vertex, fragment, state.color, 0, 0);
+            ShaderResources::KeepMovedWords(moved, kept);
+            const Recorder::ChunkKeepScope scope(recorder);
+            const auto join = recorder.JoinChunk();
+            chunk = join.chunk;
+            // The recorder thread is held behind an earlier draw until the source is rewritten.
+            recorder.Recorders()->Record(join.thread, join.chunk, [&released](RecordingContext&, DrawRecorders::DrawStats&) {
+                while (!released.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            });
+            recorder.Recorders()->Record(join.thread, join.chunk, [&](RecordingContext& recording, DrawRecorders::DrawStats&) {
+                const auto bindings = resources->PrepareDrawBindings(recording, moved);
+                if (bindings == nullptr || bindings->snapshots.size() != 1) return;
+                const auto bytes = bindings->snapshots[0].Bytes();
+                recorded.resize(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(recorded.data(), bytes.data(), recorded.size() * sizeof(std::uint32_t));
+            });
+            std::copy(rewritten.begin(), rewritten.end(), source.begin());
+            released.store(true, std::memory_order_release);
+            recorder.SealChunk();
+        }
+        DrawRecorders::Wait(*chunk);
+        Require(chunk->failure == nullptr, "a recorder thread failed the half word chunk");
+        Require(!recorded.empty(), "the half's data words were not snapshotted");
+        if (copies) Require(recorded == queued, "a record half bound data words rewritten after it was queued instead of its own copy");
+        else Require(recorded == rewritten, "with APS5_NO_HALF_WORD_COPY=1 the record half did not read its data words in place");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+        resources.reset();
+    }
+    serializeMock = false;
+    Require(mock.live == 0, "the half word test leaked Vulkan objects");
+    std::cout << (copies ? "a record half binds the data words it was queued with\n" : "without the half word copy a record half reads its data words in place\n");
+}
+
 void chunkedWriteOnlySealTests() {
     using AgcDriver::Graphics::DrawRecorders;
     using AgcDriver::Graphics::PassAccess;
@@ -12369,6 +12446,15 @@ int main(int argc, char** argv) {
             setenv("APS5_DRAW_RECORD_THREADS", "2", 1);
 #endif
             chunkedWriteOnlySealTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--chunked-half-words") {
+#ifdef _WIN32
+            _putenv_s("APS5_DRAW_RECORD_THREADS", "2");
+#else
+            setenv("APS5_DRAW_RECORD_THREADS", "2", 1);
+#endif
+            chunkedHalfWordTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {

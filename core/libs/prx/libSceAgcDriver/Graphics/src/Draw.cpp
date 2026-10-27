@@ -3054,6 +3054,8 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         DrawInputs inputs;
         RecordedDraw record;
         std::vector<ShaderResources::MovedBuffer> moved;
+        // The moved data words, copied (ShaderResources::KeepMovedWords): moved's spans point here.
+        std::vector<std::uint32_t> movedWords;
         std::array<std::byte, PipelinePushConstantBytes> push{};
         std::uint64_t passKey = 0;
         bool readsTarget = false;
@@ -3084,6 +3086,15 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
     half->record.pipeline = record.pipeline;
     half->record.framebuffer = record.framebuffer;
     half->moved.assign(record.moved.begin(), record.moved.end());
+    if (AgcDriver::FrameSteps::Enabled()) {
+        const auto copyStart = std::chrono::steady_clock::now();
+        ShaderResources::KeepMovedWords(half->moved, half->movedWords);
+        auto& counters = AgcDriver::FrameSteps::Global();
+        AgcDriver::FrameSteps::Counters::AddNs(counters.halfCopyNs, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - copyStart).count());
+        AgcDriver::FrameSteps::Counters::Add(counters.halfCopies, 1);
+    } else {
+        ShaderResources::KeepMovedWords(half->moved, half->movedWords);
+    }
     half->record.moved = half->moved;
     if (record.pushBytes != nullptr) {
         half->push = *record.pushBytes;

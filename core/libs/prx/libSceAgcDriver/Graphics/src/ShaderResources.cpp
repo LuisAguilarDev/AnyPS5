@@ -6075,6 +6075,27 @@ void ShaderResources::GuestInputDigests(std::span<const MovedBuffer> moved, cons
     }
 }
 
+bool ShaderResources::CopiesMovedWords() {
+    static const bool copies = std::getenv("APS5_NO_HALF_WORD_COPY") == nullptr;
+    return copies;
+}
+
+void ShaderResources::KeepMovedWords(std::span<MovedBuffer> moved, std::vector<std::uint32_t>& kept) {
+    if (!CopiesMovedWords()) return;
+    std::size_t words = 0;
+    for (const auto& buffer : moved) words += buffer.words.size();
+    if (words == 0) return;
+    kept.clear();
+    // Reserved up front, so the spans taken below stay valid while the copies are appended.
+    kept.reserve(words);
+    for (auto& buffer : moved) {
+        if (buffer.words.empty()) continue;
+        const auto at = kept.size();
+        kept.insert(kept.end(), buffer.words.begin(), buffer.words.end());
+        buffer.words = std::span<const std::uint32_t>(kept.data() + at, buffer.words.size());
+    }
+}
+
 std::uint64_t ShaderResources::DigestGuestBytes(std::uint64_t address, std::size_t bytes) {
     constexpr std::uint64_t FnvOffset = 0xcbf29ce484222325ull;
     constexpr std::uint64_t FnvPrime = 0x100000001b3ull;

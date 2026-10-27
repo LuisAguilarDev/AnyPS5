@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -24,6 +25,7 @@
 #include <exception>
 #include <functional>
 #include <stdexcept>
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -3601,6 +3603,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    WaitForRecordHalves();
     revalidateGeneration.fetch_add(1, std::memory_order_relaxed);
     const UseScope use(*this, true);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4702,6 +4705,7 @@ bool ShaderResources::RefreshData(VkCommandBuffer commands, const CompiledShader
 
 bool ShaderResources::refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder) {
     Require(shader.program != nullptr, "missing compiled shader");
+    WaitForRecordHalves();
     revalidateGeneration.fetch_add(1, std::memory_order_relaxed);
     const auto& program = *shader.program;
     Require(program.bindings.size() == bindings.size(), "template bindings disagree with the shader");
@@ -6096,6 +6100,39 @@ void ShaderResources::KeepMovedWords(std::span<MovedBuffer> moved, std::vector<s
     }
 }
 
+bool ShaderResources::HoldsForRecordHalves() {
+    static const bool holds = std::getenv("APS5_RECORD_HALF_HOLD") != nullptr;
+    return holds;
+}
+
+void ShaderResources::HoldForRecordHalf(DrawRecorders& recorders) {
+    recordHalvesThreads.store(&recorders, std::memory_order_relaxed);
+    recordHalves.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void ShaderResources::ReleaseRecordHalf() {
+    if (recordHalves.fetch_sub(1, std::memory_order_acq_rel) == 1) recordHalves.notify_all();
+}
+
+// On the spine, under the GPU lock: the recorder threads never take it, so the halves record.
+void ShaderResources::WaitForRecordHalves() {
+    if (recordHalves.load(std::memory_order_acquire) == 0) return;
+    const auto start = std::chrono::steady_clock::now();
+    if (auto* threads = recordHalvesThreads.load(std::memory_order_relaxed)) threads->WakeQueued();
+    for (auto held = recordHalves.load(std::memory_order_acquire); held != 0; held = recordHalves.load(std::memory_order_acquire)) recordHalves.wait(held, std::memory_order_acquire);
+    if (!AgcDriver::FrameSteps::Enabled()) return;
+    auto& counters = AgcDriver::FrameSteps::Global();
+    AgcDriver::FrameSteps::Counters::Add(counters.holdWaits, 1);
+    AgcDriver::FrameSteps::Counters::AddNs(counters.holdWaitNs, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+ShaderResources::RecordHalfHold::RecordHalfHold(std::shared_ptr<ShaderResources> resources, DrawRecorders& recorders) : resources(std::move(resources)) {
+    this->resources->HoldForRecordHalf(recorders);
+}
+
+ShaderResources::RecordHalfHold::~RecordHalfHold() {
+    resources->ReleaseRecordHalf();
+}
 std::uint64_t ShaderResources::DigestGuestBytes(std::uint64_t address, std::size_t bytes) {
     constexpr std::uint64_t FnvOffset = 0xcbf29ce484222325ull;
     constexpr std::uint64_t FnvPrime = 0x100000001b3ull;

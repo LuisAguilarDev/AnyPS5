@@ -1,6 +1,7 @@
 #include "prx/libc/include/Api.hpp"
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameSteps.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawRecorders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -6526,6 +6527,105 @@ void chunkedHalfWordTests() {
     std::cout << (copies ? "a record half binds the data words it was queued with\n" : "without the half word copy a record half reads its data words in place\n");
 }
 
+// With the batched hand-off a sleeping recorder thread is not woken for one queued draw;
+// DrawRecorders::WakeQueued wakes it for what it has queued.
+void recorderWakeTests() {
+    using AgcDriver::Graphics::DrawRecorders;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::RecordedChunk;
+    using AgcDriver::Graphics::RecordingContext;
+    if (std::getenv("APS5_NO_BATCHED_RECORD_HANDOFF") != nullptr) return;
+    mock = MockVulkan{};
+    const auto context = mockContext();
+    constexpr auto Settle = std::chrono::milliseconds(50);
+    constexpr auto Deadline = std::chrono::seconds(5);
+    {
+        Recorder recorder(context);
+        {
+            DrawRecorders recorders(context, recorder, 1);
+            std::this_thread::sleep_for(Settle);
+            auto chunk = std::make_shared<RecordedChunk>();
+            std::atomic<bool> recorded{false};
+            recorders.Record(0, chunk, [&recorded](RecordingContext&, DrawRecorders::DrawStats&) { recorded.store(true, std::memory_order_release); });
+            std::this_thread::sleep_for(Settle);
+            Require(!recorded.load(std::memory_order_acquire), "a sleeping recorder thread took one queued draw without a wake");
+            recorders.WakeQueued();
+            const auto until = std::chrono::steady_clock::now() + Deadline;
+            while (!recorded.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            Require(recorded.load(std::memory_order_acquire), "WakeQueued left a sleeping recorder thread's queued draw unrecorded");
+            recorders.Seal(0, chunk);
+            DrawRecorders::Wait(*chunk);
+            Require(chunk->failure == nullptr, "a recorder thread failed the woken chunk");
+        }
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "the recorder wake test leaked Vulkan objects");
+    std::cout << "a sleeping recorder thread records its queued draws when woken\n";
+}
+
+// APS5_RECORD_HALF_HOLD=1: a queued record half holds its draw's resources, and the spine's wait
+// for the holds (ShaderResources::WaitForRecordHalves, before it revalidates or refreshes them)
+// wakes the recorder threads and returns once the half recorded, under the GPU lock as on the
+// spine (a recorder thread never takes it). The wait is counted (hold_waits, hold_wait_ms).
+void recordHalfHoldTests() {
+    using AgcDriver::Graphics::DrawRecorders;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::RecordedChunk;
+    using AgcDriver::Graphics::RecordingContext;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    serializeMock = true;
+    auto context = mockContext();
+    {
+        AgcDriver::Graphics::DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        constexpr std::size_t compact = ShaderRecompiler::RuntimeAbi::UserDataDword + 4u;
+        auto words = ShaderDataWords({7, 8, 9});
+        words.resize(compact);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, words));
+        vertex.shaderDataDwords = compact;
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        Recorder recorder(context);
+        std::shared_ptr<ShaderResources> resources;
+        std::atomic<bool> recorded{false};
+        std::shared_ptr<RecordedChunk> chunk;
+        auto& counters = AgcDriver::FrameSteps::Global();
+        const auto waits = counters.holdWaits.load();
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(recorder.Recorders() != nullptr, "the record half hold test runs without recorder threads");
+            Require(AgcDriver::FrameSteps::Enabled(), "the record half hold test runs without APS5_PROFILE_FRAME");
+            resources = std::make_shared<ShaderResources>(context, vertex, fragment, state.color, 0, 0);
+            resources->WaitForRecordHalves();
+            Require(counters.holdWaits.load() == waits, "a wait for no held record half was counted");
+            const Recorder::ChunkKeepScope scope(recorder);
+            const auto join = recorder.JoinChunk();
+            chunk = join.chunk;
+            auto hold = std::make_shared<ShaderResources::RecordHalfHold>(resources, *recorder.Recorders());
+            recorder.Recorders()->Record(join.thread, join.chunk, [&recorded, hold](RecordingContext&, DrawRecorders::DrawStats&) mutable {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                recorded.store(true, std::memory_order_release);
+                hold.reset();
+            });
+            hold.reset();
+            resources->WaitForRecordHalves();
+            Require(recorded.load(std::memory_order_acquire), "the wait for a held record half returned before the half recorded");
+            Require(counters.holdWaits.load() == waits + 1 && counters.holdWaitNs.load() != 0, "the wait for a held record half was not counted");
+            recorder.SealChunk();
+        }
+        DrawRecorders::Wait(*chunk);
+        Require(chunk->failure == nullptr, "a recorder thread failed the held chunk");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+        resources.reset();
+    }
+    serializeMock = false;
+    Require(mock.live == 0, "the record half hold test leaked Vulkan objects");
+    std::cout << "the spine's wait for a held record half wakes the recorder and returns once it recorded\n";
+}
+
 void chunkedWriteOnlySealTests() {
     using AgcDriver::Graphics::DrawRecorders;
     using AgcDriver::Graphics::PassAccess;
@@ -12455,6 +12555,18 @@ int main(int argc, char** argv) {
             setenv("APS5_DRAW_RECORD_THREADS", "2", 1);
 #endif
             chunkedHalfWordTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--record-half-hold") {
+#ifdef _WIN32
+            _putenv_s("APS5_DRAW_RECORD_THREADS", "2");
+            _putenv_s("APS5_PROFILE_FRAME", "1");
+#else
+            setenv("APS5_DRAW_RECORD_THREADS", "2", 1);
+            setenv("APS5_PROFILE_FRAME", "1", 1);
+#endif
+            recorderWakeTests();
+            recordHalfHoldTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {

@@ -508,6 +508,8 @@ void CheckMemoFormatting() {
     totals.halfStale = 2;
     totals.halfCopies = 20;
     totals.halfCopyNs = 2000;
+    totals.holdWaits = 3;
+    totals.holdWaitNs = 3000000;
     FrameSteps::Window window;
     window.frames = 2;
     window.shaders.resultMemoHits = 3;
@@ -523,7 +525,7 @@ void CheckMemoFormatting() {
     Contains(line, "result_memo_hit%=75.0 result_memo_lookups/f=2.0 result_memo_evictions/f=2.0 ");
     Contains(line, "stages/draw=2.50 ");
     Contains(line, "program_keys/10s=7 program_key_materializes/f=20.0 program_key_table_hit%=75.0 program_key_overflow=0 ");
-    Contains(line, "half_checks/f=10.0 half_stale/f=1.0 half_copy_us/draw=0.100");
+    Contains(line, "half_checks/f=10.0 half_stale/f=1.0 half_copy_us/draw=0.100 hold_waits/f=1.5 hold_wait_ms/f=1.50");
     Require(line.back() == '\n', "the memo line does not end the line");
     Contains(FrameSteps::FormatMemo(FrameSteps::Totals{}, FrameSteps::Window{}), "target_memo_hit%=0.0 ");
 }

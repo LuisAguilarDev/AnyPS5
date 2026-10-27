@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/LruStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -29,6 +30,7 @@ namespace AgcDriver::GuestMemory { struct UnchangedQuery; }
 
 namespace AgcDriver::Graphics {
 
+class DrawRecorders;
 class Recorder;
 class RecordingContext;
 
@@ -254,6 +256,22 @@ public:
     static void KeepMovedWords(std::span<MovedBuffer> moved, std::vector<std::uint32_t>& kept);
     static std::uint64_t DigestGuestBytes(std::uint64_t address, std::size_t bytes);
     std::uint64_t RevalidateGeneration() const { return revalidateGeneration.load(std::memory_order_relaxed); }
+    // APS5_RECORD_HALF_HOLD=1: a chunked draw's queued record half holds the resources it binds,
+    // and the spine waits for the holds (WaitForRecordHalves, waking the recorder threads) before
+    // it revalidates or refreshes them.
+    static bool HoldsForRecordHalves();
+    void HoldForRecordHalf(DrawRecorders& recorders);
+    void ReleaseRecordHalf();
+    void WaitForRecordHalves();
+    class RecordHalfHold {
+    public:
+        explicit RecordHalfHold(std::shared_ptr<ShaderResources> resources, DrawRecorders& recorders);
+        ~RecordHalfHold();
+        RecordHalfHold(const RecordHalfHold&) = delete;
+        RecordHalfHold& operator=(const RecordHalfHold&) = delete;
+    private:
+        std::shared_ptr<ShaderResources> resources;
+    };
     // Whether MarkGpuWrites records commands after the work: copy-backs of copied regions, and store
     // backs of written storage images. Such a use must keep that order (see recordDraw).
     bool OwesCopyBacks() const { return guestMemory.OwesCopyBacks(); }
@@ -722,6 +740,8 @@ private:
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
     std::atomic<std::uint64_t> revalidateGeneration{0};
+    std::atomic<std::uint32_t> recordHalves{0};
+    std::atomic<DrawRecorders*> recordHalvesThreads{nullptr};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

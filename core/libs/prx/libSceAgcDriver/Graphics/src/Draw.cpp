@@ -3064,6 +3064,9 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
         bool checksInputs = false;
         std::uint64_t resourcesGeneration = 0;
         std::vector<ShaderResources::GuestInputDigest> inputDigests;
+        // APS5_RECORD_HALF_HOLD=1: the spine waits for this half before it revalidates or refreshes
+        // the resources (released once the half recorded).
+        std::unique_ptr<ShaderResources::RecordHalfHold> hold;
         // APS5_PROFILE_FRAME: the moved buffers' words at queue time ([frame-steps-memo] half_stale).
         bool checksMoved = false;
         std::uint64_t movedDigest = 0;
@@ -3109,6 +3112,7 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
     half->readsTarget = readsTarget;
     half->pendingWrites = pendingWrites;
     half->pass = pass;
+    if (ShaderResources::HoldsForRecordHalves()) half->hold = std::make_unique<ShaderResources::RecordHalfHold>(record.resources, recorders);
     if (Recorder::ChecksRecordInputs()) {
         half->checksInputs = true;
         half->resourcesGeneration = record.resources->RevalidateGeneration();
@@ -3137,6 +3141,7 @@ void recordChunked(const Context& context, Recorder& recorder, DrawRecorders& re
             DrawTimer timer(DrawRecorders::Profiled());
             DrawOutcome unreported;
             static_cast<void>(recordDrawHalf(half->context, recording, half->state, half->draw, {}, half->inputs, half->record, half->passKey, half->readsTarget, false, &half->pendingWrites, half->pass, unreported, timer, nullptr));
+            half->hold.reset();
             if (!timer.profile) return;
             for (std::size_t part = 0; part < RecordPartCount; ++part) (part == RecordBindings ? stats.bindingsUs : stats.commandsUs) += timer.split.us[part];
             stats.freshSets = timer.split.bindings.freshSets;

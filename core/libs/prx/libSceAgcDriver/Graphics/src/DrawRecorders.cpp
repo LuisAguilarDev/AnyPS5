@@ -112,6 +112,16 @@ void DrawRecorders::Seal(std::size_t thread, const std::shared_ptr<RecordedChunk
     push(*workers.at(thread), Item{chunk, {}, true});
 }
 
+void DrawRecorders::WakeQueued() {
+    for (auto& worker : workers) {
+        std::unique_lock lock(worker->mutex);
+        if (!worker->sleeping || worker->items.empty()) continue;
+        worker->sleeping = false;
+        lock.unlock();
+        wakes.fetch_add(1, std::memory_order_relaxed);
+        worker->wake.notify_one();
+    }
+}
 void DrawRecorders::Wait(const RecordedChunk& chunk) {
     if (SpinUntil(HandoffSpinWindow(), [&] { return chunk.done.load(std::memory_order_acquire); })) return;
     while (!chunk.done.load(std::memory_order_acquire)) chunk.done.wait(false, std::memory_order_acquire);

@@ -71,6 +71,9 @@ public:
     void Record(std::size_t thread, const std::shared_ptr<RecordedChunk>& chunk, Work work);
     void Seal(std::size_t thread, const std::shared_ptr<RecordedChunk>& chunk);
     static void Wait(const RecordedChunk& chunk);
+    // Wakes every sleeping thread that has items queued (the batched hand-off leaves them asleep
+    // below HandoffDraws), for a wait on a queued item (ShaderResources::WaitForRecordHalves).
+    void WakeQueued();
     std::size_t Threads() const { return workers.size(); }
     // The most work items any thread had queued at once since start-up (the flood test's cap check).
     std::size_t MaxQueued() const { return maxQueued.load(std::memory_order_relaxed); }

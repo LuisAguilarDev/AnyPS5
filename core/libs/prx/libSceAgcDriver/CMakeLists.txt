@@ -2351,6 +2351,8 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_chunked_half_words_off COMMAND agc_driver_graphics_tests --chunked-half-words)
     set_tests_properties(agc_driver_chunked_half_words PROPERTIES ENVIRONMENT "APS5_DRAW_CHUNK_DRAWS=8" TIMEOUT 30)
     set_tests_properties(agc_driver_chunked_half_words_off PROPERTIES ENVIRONMENT "APS5_DRAW_CHUNK_DRAWS=8;APS5_NO_HALF_WORD_COPY=1" TIMEOUT 30)
+    add_test(NAME agc_driver_record_half_hold COMMAND agc_driver_graphics_tests --record-half-hold)
+    set_tests_properties(agc_driver_record_half_hold PROPERTIES ENVIRONMENT "APS5_DRAW_CHUNK_DRAWS=8" TIMEOUT 30)
     add_test(NAME agc_driver_depth_bounds_state COMMAND agc_driver_graphics_tests --depth-bounds-state)
     add_test(NAME agc_driver_msaa_dcc_state COMMAND agc_driver_graphics_tests --multisample-dcc-state)
     add_test(NAME agc_driver_unused_viewport_depth COMMAND agc_driver_graphics_tests --unused-viewport-depth)
@@ -2373,7 +2375,7 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_dithered_alpha_to_coverage PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_alpha_to_coverage_state agc_driver_undithered_alpha_to_coverage_state agc_driver_depth_bounds_state agc_driver_msaa_dcc_state agc_driver_unused_viewport_depth agc_driver_chunked_write_only_seal agc_driver_chunked_half_words agc_driver_chunked_half_words_off PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_alpha_to_coverage_state agc_driver_undithered_alpha_to_coverage_state agc_driver_depth_bounds_state agc_driver_msaa_dcc_state agc_driver_unused_viewport_depth agc_driver_chunked_write_only_seal agc_driver_chunked_half_words agc_driver_chunked_half_words_off agc_driver_record_half_hold PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         set_tests_properties(agc_driver_dithered_alpha_to_coverage ${multisampledDccClearTests} PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

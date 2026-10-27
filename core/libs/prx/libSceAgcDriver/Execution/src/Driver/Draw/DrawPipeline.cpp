@@ -60,8 +60,11 @@ bool DrawFinisher::Enabled() {
     return Graphics::DrawPipelineEnabled();
 }
 
+// A CB metadata pass with ranged writes is a commit of the pipeline (see Driver::precheckDraw);
+// APS5_NO_PIPELINED_METADATA_PASSES=1 drains the pipeline and runs it inline on the packet thread.
 bool DrawPipeline::MetadataPassesPipelined() {
-    return Graphics::DrawPipelineEnabled();
+    static const bool pipelined = std::getenv("APS5_NO_PIPELINED_METADATA_PASSES") == nullptr;
+    return pipelined;
 }
 
 namespace {

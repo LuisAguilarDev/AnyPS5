@@ -117,14 +117,15 @@ void expectEliminated(const std::string& what) {
 
 }
 
+// The passes are pipelined by default, with or without APS5_DRAW_PIPELINE=1;
+// APS5_NO_PIPELINED_METADATA_PASSES=1 runs them inline, in the same order.
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_PIPELINED_DRAWS", "1");
-    _putenv_s("APS5_DRAW_PIPELINE", "1");
 #else
     setenv("APS5_PIPELINED_DRAWS", "1", 1);
-    setenv("APS5_DRAW_PIPELINE", "1", 1);
 #endif
+    const bool pipelined = std::getenv("APS5_NO_PIPELINED_METADATA_PASSES") == nullptr;
     try {
         {
             GuestAllocations::Mutation mutation;
@@ -153,7 +154,7 @@ int main() {
         eliminate(second);
         submit(second);
         releaser.join();
-        check(DrawPipeline::PipelinedMetadataPasses() == before + 1u, "the second eliminate was not ordered with the commits (" + std::to_string(DrawPipeline::PipelinedMetadataPasses() - before) + " pipelined)");
+        check(DrawPipeline::PipelinedMetadataPasses() == before + (pipelined ? 1u : 0u), "the second eliminate was not ordered with the commits (" + std::to_string(DrawPipeline::PipelinedMetadataPasses() - before) + " pipelined)");
         expectEliminated("the eliminate after the queued stores");
         {
             GuestAllocations::Mutation mutation;
@@ -161,7 +162,7 @@ int main() {
             mutation.Remove(Cmask.data());
         }
         LibcRunShutdown_nid_postfix();
-        std::puts("pipelined metadata pass tests passed");
+        std::puts(pipelined ? "pipelined metadata pass tests passed" : "inline metadata pass tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

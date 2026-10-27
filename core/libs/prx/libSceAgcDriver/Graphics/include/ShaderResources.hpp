@@ -337,6 +337,10 @@ public:
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    // AppendContentKey with the data words, from the layout of the shader's program (built once per
+    // program) when the shader's bindings carry the layout's metadata, so only the draw's words are
+    // read; the full walk otherwise.
+    static void AppendDrawContentKey(const CompiledShader& shader, bool movableBuffers, std::vector<std::uint32_t>& key);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a

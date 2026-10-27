@@ -1274,7 +1274,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
         } else {
-            ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
+            ShaderResources::AppendDrawContentKey(shader, MovableBuffers(), key);
             memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
         }
         key[sizeAt] = static_cast<std::uint32_t>(key.size() - sizeAt - 1u);

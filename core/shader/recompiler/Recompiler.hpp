@@ -763,6 +763,9 @@ struct ResultKeyMemo {
 // filled from it. A result's words, push constants and per-binding guest descriptors stay its own.
 struct ProgramPart {
     std::vector<std::uint64_t> key;
+    // A consumer's layout of its per-draw key over this program (the driver's draw content key),
+    // built from the first result that needs it.
+    mutable AtomicSharedPtr<const void> keyLayout;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

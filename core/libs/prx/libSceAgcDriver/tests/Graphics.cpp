@@ -12100,6 +12100,80 @@ void ResourceContentKeyTests(bool benchmark) {
     }
 }
 
+// The draw content key of a result filled from a shared program (Route step 6c) takes its program
+// words from a layout built once per program and fills only the draw's words: it equals the full
+// content key for every draw of the program, moved buffers and written ones alike, and a result
+// whose binding metadata differs from the layout's falls back to the full key.
+void ProgramContentKeyTests() {
+    using AgcDriver::Graphics::ShaderResources;
+    using ShaderRecompiler::DescriptorKind;
+    using ShaderRecompiler::DescriptorRole;
+    auto part = std::make_shared<ShaderRecompiler::ProgramPart>();
+    const auto result = [&](std::uint32_t base, bool written) {
+        ShaderRecompiler::RecompileResult program;
+        program.variantId = 77;
+        program.programPart = part;
+        ShaderRecompiler::DescriptorBinding images{};
+        images.kind = DescriptorKind::SampledImage;
+        images.role = DescriptorRole::GuestImages;
+        images.count = 2;
+        images.guestDescriptor = {base, 1, 2, 3, 4, 5, 6, 7, base + 1, 9, 10, 11, 12, 13, 14, 15};
+        images.imageWritten = {false, true};
+        images.imageSamplers = {3u, 4u};
+        program.bindings.push_back(std::move(images));
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = DescriptorKind::StorageBuffer;
+        data.role = DescriptorRole::ShaderData;
+        data.count = 1;
+        data.guestDescriptor = {base, base * 3u, 5u};
+        program.bindings.push_back(std::move(data));
+        ShaderRecompiler::DescriptorBinding buffers{};
+        buffers.kind = DescriptorKind::StorageBuffer;
+        buffers.role = DescriptorRole::GuestBuffers;
+        buffers.count = 3;
+        buffers.guestDescriptor = {base << 8u, 0x10000u, 4u, 0x1234u, base << 9u, 0x10000u, 4u, 0x5678u, 0u, 0u, 0u, 0x9abcu};
+        buffers.bufferWritten = {written, false, false};
+        program.bindings.push_back(std::move(buffers));
+        return program;
+    };
+    for (const bool movable : {false, true}) {
+        part = std::make_shared<ShaderRecompiler::ProgramPart>();
+        // One set of metadata vectors for every draw, as results of one binding plan share them.
+        const auto first = result(0x1000u, true);
+        const auto share = [&](ShaderRecompiler::RecompileResult program) {
+            for (std::size_t b = 0; b < program.bindings.size(); ++b) {
+                program.bindings[b].imageWritten = first.bindings[b].imageWritten;
+                program.bindings[b].imageSamplers = first.bindings[b].imageSamplers;
+                program.bindings[b].bufferWritten = first.bindings[b].bufferWritten;
+            }
+            return program;
+        };
+        const std::vector<ShaderRecompiler::RecompileResult> draws{share(result(0x1000u, true)), share(result(0x2000u, true)), share(result(0x3000u, true))};
+        for (const auto& draw : draws) {
+            const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Fragment, &draw, 0};
+            std::vector<std::uint32_t> key{0xabcdu};
+            ShaderResources::AppendDrawContentKey(shader, movable, key);
+            auto full = std::vector<std::uint32_t>{0xabcdu};
+            ShaderResources::AppendContentKey(shader, true, movable, full);
+            Require(key == full, "program content key: a draw of the program differs from its full content key");
+        }
+        const auto layout = part->keyLayout.load(std::memory_order_acquire);
+        Require(layout != nullptr, "program content key: the program kept no key layout");
+        const auto other = result(0x4000u, false);
+        const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Fragment, &other, 0};
+        std::vector<std::uint32_t> key;
+        ShaderResources::AppendDrawContentKey(shader, movable, key);
+        Require(key == ShaderResources::ContentKey(shader, true, movable), "program content key: a result with other binding metadata differs from its full content key");
+        Require(part->keyLayout.load(std::memory_order_acquire) == layout, "program content key: a result with other metadata replaced the program's layout");
+        auto alone = draws.front();
+        alone.programPart = nullptr;
+        const AgcDriver::Graphics::CompiledShader single{ShaderRecompiler::ShaderStage::Fragment, &alone, 0};
+        key.clear();
+        ShaderResources::AppendDrawContentKey(single, movable, key);
+        Require(key == ShaderResources::ContentKey(single, true, movable), "program content key: a result without a program differs from its full content key");
+    }
+}
+
 // The pipeline journal without a GPU: the recipe codec and the store key agree with each other and
 // with the canonical state, identities follow the module and the specialization, the journal
 // records each pipeline once, and a replay into the recording context (the lavapipe test replays
@@ -12762,6 +12836,10 @@ int main(int argc, char** argv) {
             ResourceContentKeyTests(std::string_view(argv[1]) == "--benchmark-resource-content-key");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--program-content-key") {
+            ProgramContentKeyTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
@@ -12846,6 +12924,7 @@ int main(int argc, char** argv) {
         }
         RunGuestLeaseWaitTests();
         ResourceContentKeyTests(false);
+        ProgramContentKeyTests();
         stateTests();
         pipelineStoreLazyBufferPoolTests();
         retainedPixelStageTests();

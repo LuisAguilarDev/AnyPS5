@@ -2656,8 +2656,33 @@ void ShaderResources::reportDescriptorCaches() const {
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
+// Which guest words of a binding a content key holds: none, all of them, or each buffer element's
+// words with the base of a read-only element masked out (a moved read-only buffer keeps its key).
+enum class KeyWords { None, All, MovableBuffers };
+
+KeyWords ContentKeyWords(const ShaderRecompiler::DescriptorBinding& binding, bool dataWords, bool movableBuffers) {
+    if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) return KeyWords::MovableBuffers;
+    return (dataWords && !movableBuffers) || !DataRole(binding.role) ? KeyWords::All : KeyWords::None;
+}
+
 template<typename TVisitor>
-void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+void VisitBindingWords(const ShaderRecompiler::DescriptorBinding& binding, KeyWords words, const TVisitor& visit) {
+    if (words == KeyWords::MovableBuffers) {
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* descriptor = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            const bool empty = descriptor[2] == 0 || (descriptor[0] == 0 && (descriptor[1] & 0xffffu) == 0);
+            if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(descriptor[index]); }
+            else { for (const auto word : {0u, descriptor[1] & 0xffff0000u, 0u, descriptor[3]}) visit(word); }
+        }
+    } else if (words == KeyWords::All) {
+        for (const auto word : binding.guestDescriptor) visit(word);
+    }
+}
+
+// `mark(binding, words)` is called where each binding's guest words start.
+template<typename TVisitor, typename TMark>
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit, const TMark& mark) {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     visit(dataWords ? 1u : 0u);
@@ -2676,19 +2701,12 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
             }
         }
     };
-    for (const auto& binding : program.bindings) {
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        const auto& binding = program.bindings[index];
         for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
-        if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
-            for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
-                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
-                else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
-            }
-        } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
-            for (const auto word : binding.guestDescriptor) visit(word);
-        }
+        const auto words = ContentKeyWords(binding, dataWords, movableBuffers);
+        mark(index, words);
+        VisitBindingWords(binding, words, visit);
         packBits(binding.imageWritten);
         packBits(binding.samplerDepthCompare);
         packBits(binding.imageDepthCompare);
@@ -2706,6 +2724,90 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
         for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
     }
+}
+
+template<typename TVisitor>
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+    VisitContentKey(shader, dataWords, movableBuffers, visit, [](std::size_t, KeyWords) {});
+}
+
+namespace {
+
+// The draw content key of one program with the place of each binding's guest words (Route step 6c):
+// a result whose header and binding metadata equal the ones it was built from differs from it only
+// in those words.
+struct DrawKeyLayout {
+    struct Slot {
+        std::size_t at = 0;
+        KeyWords words = KeyWords::None;
+        std::size_t guestWords = 0;
+    };
+    ShaderRecompiler::ShaderStage stage{};
+    bool movableBuffers = false;
+    std::uint64_t variant = 0;
+    // The bindings without their guest words.
+    std::vector<ShaderRecompiler::DescriptorBinding> bindings;
+    std::vector<Slot> slots;
+    std::vector<std::uint32_t> words;
+};
+
+bool SameKeyMetadata(const ShaderRecompiler::DescriptorBinding& layout, std::size_t guestWords, const ShaderRecompiler::DescriptorBinding& binding) {
+    return layout.kind == binding.kind && layout.role == binding.role && layout.descriptorSet == binding.descriptorSet && layout.binding == binding.binding && layout.count == binding.count && layout.readOnly == binding.readOnly && layout.imageShape == binding.imageShape &&
+        guestWords == binding.guestDescriptor.size() && layout.imageWritten == binding.imageWritten && layout.samplerDepthCompare == binding.samplerDepthCompare && layout.imageDepthCompare == binding.imageDepthCompare && layout.imageAtomic == binding.imageAtomic &&
+        layout.samplerUnnormalized == binding.samplerUnnormalized && layout.samplerIntegerBorder == binding.samplerIntegerBorder && layout.samplerCoordinatesIgnored == binding.samplerCoordinatesIgnored && layout.imageUnnormalized == binding.imageUnnormalized &&
+        layout.imageUnnormalizedBaseLevel == binding.imageUnnormalizedBaseLevel && layout.bufferWritten == binding.bufferWritten && layout.imageSamplers == binding.imageSamplers && layout.imageShapes == binding.imageShapes;
+}
+
+std::shared_ptr<const DrawKeyLayout> BuildDrawKeyLayout(const CompiledShader& shader, bool movableBuffers) {
+    auto layout = std::make_shared<DrawKeyLayout>();
+    layout->stage = shader.stage;
+    layout->movableBuffers = movableBuffers;
+    layout->variant = shader.program->PipelineVariantId();
+    VisitContentKey(shader, true, movableBuffers, [&](std::uint32_t word) { layout->words.push_back(word); }, [&](std::size_t index, KeyWords words) {
+        layout->slots.push_back({layout->words.size(), words, shader.program->bindings[index].guestDescriptor.size()});
+    });
+    layout->bindings = shader.program->bindings;
+    for (auto& binding : layout->bindings) binding.guestDescriptor = {};
+    return layout;
+}
+
+bool AppendFromLayout(const DrawKeyLayout& layout, const CompiledShader& shader, bool movableBuffers, std::vector<std::uint32_t>& key) {
+    const auto& program = *shader.program;
+    if (layout.stage != shader.stage || layout.movableBuffers != movableBuffers || layout.variant != program.PipelineVariantId() || layout.bindings.size() != program.bindings.size()) return false;
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        if (!SameKeyMetadata(layout.bindings[index], layout.slots[index].guestWords, program.bindings[index])) return false;
+    }
+    const auto start = key.size();
+    key.insert(key.end(), layout.words.begin(), layout.words.end());
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        auto* out = key.data() + start + layout.slots[index].at;
+        VisitBindingWords(program.bindings[index], layout.slots[index].words, [&](std::uint32_t word) { *out++ = word; });
+    }
+    return true;
+}
+
+}
+
+void ShaderResources::AppendDrawContentKey(const CompiledShader& shader, bool movableBuffers, std::vector<std::uint32_t>& key) {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& part = shader.program->programPart;
+    if (part == nullptr) return AppendContentKey(shader, true, movableBuffers, key);
+    const auto layout = std::static_pointer_cast<const DrawKeyLayout>(part->keyLayout.load(std::memory_order_acquire));
+    if (layout == nullptr) {
+        AppendContentKey(shader, true, movableBuffers, key);
+        part->keyLayout.store(BuildDrawKeyLayout(shader, movableBuffers), std::memory_order_release);
+        return;
+    }
+    const auto start = key.size();
+    if (!AppendFromLayout(*layout, shader, movableBuffers, key)) return AppendContentKey(shader, true, movableBuffers, key);
+    if (!ShaderRecompiler::ProgramSplitVerifySampled()) return;
+    std::vector<std::uint32_t> full;
+    AppendContentKey(shader, true, movableBuffers, full);
+    const bool mismatch = !std::equal(key.begin() + static_cast<std::ptrdiff_t>(start), key.end(), full.begin(), full.end());
+    ShaderRecompiler::NoteProgramSplitVerify(mismatch, "draw content key");
+    if (!mismatch) return;
+    key.resize(start);
+    key.insert(key.end(), full.begin(), full.end());
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {

@@ -932,6 +932,40 @@ bool programKeyCensusEnabled() {
 // The binding-plan key of this thread's last preparedBindingPlan, hashed (program-key census).
 thread_local std::uint64_t lastPlanKeyHash = 0;
 
+MaterializeSplit& materializeSplit() {
+    static MaterializeSplit* split = new MaterializeSplit();
+    return *split;
+}
+
+// The clock of this thread's sampled Recompile(request, capture) call, null while the call is not
+// timed: materializeResult marks its parts on it.
+thread_local MaterializeSplit::Sample* splitSample = nullptr;
+
+void markSplit(MaterializeSplit::Part part) {
+    if (splitSample != nullptr) splitSample->Mark(part);
+}
+
+// APS5_PROFILE_FRAME: times one call in MaterializeSplit::SampleEvery and books it when the call
+// ends, whichever way it ends.
+class SplitScope {
+public:
+    SplitScope() {
+        if (!programKeyCensusEnabled() || !materializeSplit().Sampled()) return;
+        sample.emplace();
+        splitSample = &*sample;
+    }
+    SplitScope(const SplitScope&) = delete;
+    SplitScope& operator=(const SplitScope&) = delete;
+    ~SplitScope() {
+        if (!sample) return;
+        splitSample = nullptr;
+        materializeSplit().Add(*sample);
+    }
+
+private:
+    std::optional<MaterializeSplit::Sample> sample;
+};
+
 std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& variant, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exports, bool fragmentDescriptorSet) {
     struct BindingPlanKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, BindingPlanKeyStorage>();
@@ -1065,6 +1099,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto index = reg - request.context.userDataBaseRegister;
         result.userDataRegisterReads |= reg >= request.context.userDataBaseRegister && index < 64u ? std::uint64_t{1} << index : ~std::uint64_t{0};
     }
+    markSplit(MaterializeSplit::Artifact);
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
@@ -1178,10 +1213,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
+    markSplit(MaterializeSplit::Program);
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
     const auto& tables = *resolved;
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
+    markSplit(MaterializeSplit::Populate);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     if (std::ranges::none_of(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::BdaPagetable || binding.role == DescriptorRole::FaultBuffer; })) result.bdaAbiVersion = 0u;
@@ -1219,6 +1256,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
     }
+    markSplit(MaterializeSplit::Tail);
     return result;
 }
 
@@ -1688,11 +1726,13 @@ void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& 
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = resultMemoCounters();
+    const SplitScope split;
     std::uint64_t shape = 0;
     SnapshotParts parts{};
     const auto hashStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto hash = snapshotHash(request, snapshot, &shape, profile ? &parts : nullptr);
     if (profile) counters.hashNanoseconds.fetch_add(elapsedNanoseconds(hashStarted, std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    markSplit(MaterializeSplit::Hash);
     const bool patching = MemoUserWordPatch() && !variant->bindings.layout.userDataRegisters.empty();
     std::uint64_t index = 0;
     std::uint64_t shapeIndex = 0;
@@ -1710,6 +1750,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
                 counters.hits.fetch_add(1, std::memory_order_relaxed);
                 if (memoHit != nullptr) *memoHit = true;
                 reportResultMemo();
+                markSplit(MaterializeSplit::Lookup);
                 return entry.result;
             }
         }
@@ -1719,14 +1760,17 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             if (similar != source.memoShapes.end() && similar->second->variantId == variant->artifact.variantId && similar->second->shape == shape) donor = similar->second->result;
         }
     }
+    markSplit(MaterializeSplit::Lookup);
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_ptr<RecompileResult> result = donor != nullptr ? patchForwardedUserWords(*donor, *variant, snapshot) : nullptr;
+    markSplit(MaterializeSplit::Patch);
     if (result != nullptr) {
         memoUserWordPatches().fetch_add(1, std::memory_order_relaxed);
         counters.patched.fetch_add(1, std::memory_order_relaxed);
         if (VerifyMemoUserWordPatch()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot));
     } else {
         result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
+        markSplit(MaterializeSplit::Tail);
     }
     result->cacheHit = cacheHit;
     if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
@@ -1763,7 +1807,10 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             if (patching) source.memoShapes[shapeIndex] = victim;
         }
     }
+    markSplit(MaterializeSplit::Insert);
     if (profile && evicted != nullptr) releaseEvicted(std::move(evicted));
+    evicted.reset();
+    markSplit(MaterializeSplit::Release);
     reportResultMemo();
     return shared;
 }
@@ -2035,6 +2082,10 @@ ResultMemoTotals ResultMemoCounts() {
 
 ProgramKeyCensus::Counts TakeProgramKeyCensus() {
     return programKeyCensus().Take();
+}
+
+MaterializeSplit::Counts TakeMaterializeSplit() {
+    return materializeSplit().Take();
 }
 
 ResultMemoMissCauses ResultMemoMisses() {

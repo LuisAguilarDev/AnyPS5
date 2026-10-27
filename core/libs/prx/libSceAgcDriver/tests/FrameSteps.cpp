@@ -524,6 +524,10 @@ void CheckMemoFormatting() {
     window.shaders.programKeys = 40;
     window.shaders.programKeysDistinct = 7;
     window.shaders.programKeyTableHits = 30;
+    window.shaders.split.calls = 64;
+    window.shaders.split.sampled = 4;
+    window.shaders.split.ns[ShaderRecompiler::MaterializeSplit::Hash] = 2000;
+    window.shaders.split.ns[ShaderRecompiler::MaterializeSplit::Populate] = 12000;
     const auto line = FrameSteps::FormatMemo(totals, window);
     Contains(line, "[frame-steps-memo] ");
     Contains(line, "proof_breaks/f=5.0 proof_breaks/f(other/store/written/write_changed/gpu_hold/non_draw_commit/completion_label/copied_writer/resource_write_back)=1.0/0.0/0.0/0.0/4.0/0.0/0.0/0.0/0.0 ");
@@ -532,7 +536,8 @@ void CheckMemoFormatting() {
     Contains(line, "stages/draw=2.50 ");
     Contains(line, "program_keys/10s=7 program_key_materializes/f=20.0 program_key_table_hit%=75.0 program_key_overflow=0 ");
     Contains(line, "half_checks/f=10.0 half_stale/f=1.0 half_copy_us/draw=0.100 hold_waits/f=1.5 hold_wait_ms/f=1.50 ");
-    Contains(line, "epoch_proof_reuse%=75.0 epoch_proofs/f=20.0 refresh_proof_reuse%=75.0 refresh_proofs/f=4.0 proof_verify_checks=5 proof_verify_mismatches=1\n");
+    Contains(line, "epoch_proof_reuse%=75.0 epoch_proofs/f=20.0 refresh_proof_reuse%=75.0 refresh_proofs/f=4.0 proof_verify_checks=5 proof_verify_mismatches=1 ");
+    Contains(line, "recompile_calls/f=32.0 recompile_sampled=4 recompile_us/call=3.50 recompile_split_us/call(hash/lookup/patch/artifact/program/populate/tail/insert/release)=0.50/0.00/0.00/0.00/0.00/3.00/0.00/0.00/0.00\n");
     Require(line.back() == '\n', "the memo line does not end the line");
     Contains(FrameSteps::FormatMemo(FrameSteps::Totals{}, FrameSteps::Window{}), "target_memo_hit%=0.0 ");
 }
@@ -551,6 +556,25 @@ void CheckProgramKeyCensus() {
     const auto key = ShaderRecompiler::ProgramKeyCensus::Combine(ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint64_t>(plan)), ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint32_t>(module)));
     module[1] = 6;
     Require(key != ShaderRecompiler::ProgramKeyCensus::Combine(ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint64_t>(plan)), ShaderRecompiler::ProgramKeyCensus::Hash(std::span<const std::uint32_t>(module))), "a changed module key kept the program key");
+}
+
+void CheckMaterializeSplit() {
+    using Split = ShaderRecompiler::MaterializeSplit;
+    Split split;
+    std::size_t sampled = 0;
+    for (std::size_t call = 0; call < 2 * Split::SampleEvery; ++call) {
+        if (!split.Sampled()) continue;
+        ++sampled;
+        Split::Sample sample;
+        sample.ns[Split::Hash] = 100;
+        sample.ns[Split::Populate] = 300;
+        split.Add(sample);
+    }
+    Require(sampled == 2, "the split did not time one call in SampleEvery");
+    const auto counts = split.Take();
+    Require(counts.calls == 2 * Split::SampleEvery && counts.sampled == 2 && counts.ns[Split::Hash] == 200 && counts.ns[Split::Populate] == 600, "the split did not sum its sampled parts");
+    const auto next = split.Take();
+    Require(next.calls == 0 && next.sampled == 0 && next.ns[Split::Hash] == 0, "the split's next window did not start empty");
 }
 
 }
@@ -583,6 +607,7 @@ int main() {
         CheckFifoFormatting();
         CheckMemoFormatting();
         CheckProgramKeyCensus();
+        CheckMaterializeSplit();
         std::cout << "frame steps tests passed\n";
         return 0;
     } catch (const std::exception& error) {

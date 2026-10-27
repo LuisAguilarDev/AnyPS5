@@ -5,6 +5,7 @@
 #include "SharedVector.hpp"
 #include "PipelineSpecialization.hpp"
 #include "ProgramKeyCensus.hpp"
+#include "MaterializeSplit.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
 #include <array>
@@ -833,6 +834,9 @@ struct ResultMemoTotals {
 // APS5_PROFILE_FRAME: the program keys (variant, binding-plan key, module key) materialized since
 // the last call ([frame-steps-memo]).
 [[nodiscard]] ProgramKeyCensus::Counts TakeProgramKeyCensus();
+// APS5_PROFILE_FRAME: Recompile(request, capture)'s calls since the last call and the time of
+// its parts on the sampled ones ([frame-steps-memo] recompile_split_us/call).
+[[nodiscard]] MaterializeSplit::Counts TakeMaterializeSplit();
 
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile

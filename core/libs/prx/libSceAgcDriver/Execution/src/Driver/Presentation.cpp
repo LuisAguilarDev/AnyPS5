@@ -263,6 +263,7 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
         FrameSteps::GlobalChain().Take();
         static_cast<void>(FrameSteps::TakeThreadCpuNs());
         static_cast<void>(ShaderRecompiler::TakeProgramKeyCensus());
+        static_cast<void>(ShaderRecompiler::TakeMaterializeSplit());
         previousMemo = ShaderRecompiler::ResultMemoCounts();
         const auto counts = VulkanDevice::PresentCounts();
         previousGpuBusyMs = counts.gpuBusyMs;
@@ -289,6 +290,7 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     window.shaders.programKeysDistinct = census.distinct;
     window.shaders.programKeyTableHits = census.tableHits;
     window.shaders.programKeyOverflow = census.overflow;
+    window.shaders.split = ShaderRecompiler::TakeMaterializeSplit();
     std::array<std::uint64_t, FrameSteps::KernelWaitKinds> waits{};
     KernelFrameWaitNanos_nid_postfix(waits.data(), waits.size());
     for (std::size_t i = 0; i < waits.size(); ++i) window.kernelWaitNs[i] = waits[i] - previousWaits[i];

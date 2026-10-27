@@ -13,7 +13,9 @@
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <sstream>
@@ -51,6 +53,35 @@ bool g_robust2 = false;
 bool g_waveLdsMemoryBarriers = false;
 bool g_deviceScopeLdsMemoryBarriers = false;
 bool g_code = false;
+std::size_t g_benchMaterialize = 0;
+
+// --bench-materialize N (with APS5_PROFILE_FRAME=1): N materializations of the captured request,
+// each with the first buffer's base moved (a result memo miss, the program unchanged, as a draw
+// whose V# moved), then N of one snapshot (memo hits); prints the time per call and its sampled
+// split (MaterializeSplit).
+void BenchMaterialize(const ShaderRecompiler::PreparedShaderInvocation& invocation, const ShaderRecompiler::ResourceCapture& capture) {
+    using Clock = std::chrono::steady_clock;
+    const auto print = [](const char* name, std::size_t calls, Clock::duration elapsed) {
+        const auto split = ShaderRecompiler::TakeMaterializeSplit();
+        std::printf("  bench %s: %zu calls, %.2f us per call; sampled %llu, us per call:", name, calls, std::chrono::duration<double, std::micro>(elapsed).count() / static_cast<double>(calls), static_cast<unsigned long long>(split.sampled));
+        for (std::size_t part = 0; part < ShaderRecompiler::MaterializeSplit::Parts; ++part) {
+            std::printf(" %s %.2f", ShaderRecompiler::MaterializeSplit::Names[part], split.sampled != 0 ? static_cast<double>(split.ns[part]) / 1000.0 / static_cast<double>(split.sampled) : 0.0);
+        }
+        std::printf("\n");
+    };
+    auto moved = capture;
+    const bool movable = !moved.snapshot.buffers.empty();
+    static_cast<void>(ShaderRecompiler::TakeMaterializeSplit());
+    auto started = Clock::now();
+    for (std::size_t i = 0; i < g_benchMaterialize; ++i) {
+        if (movable) moved.snapshot.buffers[0].dwords[0] += 0x100u;
+        static_cast<void>(invocation.Materialize(moved));
+    }
+    print(movable ? "moved buffer base (misses)" : "no buffer to move", g_benchMaterialize, Clock::now() - started);
+    started = Clock::now();
+    for (std::size_t i = 0; i < g_benchMaterialize; ++i) static_cast<void>(invocation.Materialize(moved));
+    print("one snapshot (hits)", g_benchMaterialize, Clock::now() - started);
+}
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -141,6 +172,7 @@ bool Replay(const char* path) {
                 phase = "materialize";
                 const auto result = invocation->Materialize(*capture);
                 std::printf("  materialized: %zu SPIR-V words\n", result->spirv.size());
+                if (g_benchMaterialize != 0) BenchMaterialize(*invocation, *capture);
             }
             return true;
         } catch (const std::exception& error) {
@@ -190,7 +222,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--bench-materialize N] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     int failures = 0;
@@ -237,6 +269,11 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--materialize") {
             g_materialize = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--bench-materialize" && i + 1 < argc) {
+            g_materialize = true;
+            g_benchMaterialize = static_cast<std::size_t>(std::strtoull(argv[++i], nullptr, 10));
             continue;
         }
         if (std::string(argv[i]) == "--spv") {

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMESTEPS_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
+#include "MaterializeSplit.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -202,11 +203,12 @@ struct ChainTotals {
     std::uint64_t firstSubmitNs = 0, firstSubmits = 0, tailNs = 0, tails = 0;
 };
 
-// The recompiler's counts over the window (ShaderRecompiler::ResultMemoCounts deltas and the
-// program-key census).
+// The recompiler's counts over the window (ShaderRecompiler::ResultMemoCounts deltas, the
+// program-key census and the sampled split of Recompile(request, capture)).
 struct ShaderTotals {
     std::uint64_t resultMemoHits = 0, resultMemoMisses = 0, resultMemoEvictions = 0;
     std::uint64_t programKeys = 0, programKeysDistinct = 0, programKeyTableHits = 0, programKeyOverflow = 0;
+    ShaderRecompiler::MaterializeSplit::Counts split;
 };
 
 struct Window {

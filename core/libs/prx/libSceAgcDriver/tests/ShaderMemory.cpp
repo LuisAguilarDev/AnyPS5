@@ -1195,6 +1195,33 @@ void verifyResultMemoMissCauses() {
     require(released.evictedLastReferences - releasedBefore.evictedLastReferences == releases, "result memo misses: evicted results no caller holds were not counted as last references");
 }
 
+// APS5_PROFILE_FRAME: Recompile(request, capture) times its parts on one call in 16, and the parts
+// of a sampled miss are the memo's and materializeResult's.
+void verifyRecompileSplit() {
+    using namespace ShaderRecompiler;
+    using Part = MaterializeSplit::Part;
+    // Enough sampled calls that each timed group adds up to more than one clock tick.
+    constexpr std::size_t Distinct = 256;
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, Distinct> targets{};
+    alignas(16) static std::array<std::array<std::uint32_t, 4>, Distinct> tables{};
+    static_cast<void>(TakeMaterializeSplit());
+    for (std::size_t i = 0; i < Distinct; ++i) {
+        tables[i] = memoTableBuffer(targets[i]);
+        static_cast<void>(materializeMemoTable(tables[i], true));
+    }
+    const auto misses = TakeMaterializeSplit();
+    require(misses.calls == Distinct, "recompile split: the calls were not counted");
+    require(misses.sampled == Distinct / MaterializeSplit::SampleEvery, "recompile split: not one call in 16 was timed");
+    require(misses.ns[Part::Artifact] + misses.ns[Part::Program] + misses.ns[Part::Populate] + misses.ns[Part::Tail] != 0, "recompile split: the sampled misses did not time materializeResult");
+    for (std::size_t i = 0; i < Distinct; ++i) static_cast<void>(materializeMemoTable(tables[Distinct - 1], true));
+    const auto hits = TakeMaterializeSplit();
+    require(hits.calls == Distinct && hits.sampled == Distinct / MaterializeSplit::SampleEvery, "recompile split: the hits were not counted");
+    require(hits.ns[Part::Hash] + hits.ns[Part::Lookup] != 0, "recompile split: the sampled hits did not time their hash and lookup");
+    for (const auto part : {Part::Patch, Part::Artifact, Part::Program, Part::Populate, Part::Tail, Part::Insert, Part::Release}) {
+        require(hits.ns[part] == 0, "recompile split: a memo hit was timed as a materialization");
+    }
+}
+
 void verifySharedBindingMetadata() {
     using namespace ShaderRecompiler;
     alignas(16) static std::array<std::uint32_t, 4> output{};
@@ -8592,6 +8619,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--shared-binding-metadata") {
             verifySharedBindingMetadata();
             std::cout << "Results of one binding plan share its binding metadata until a copy writes it\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--recompile-split") {
+            verifyRecompileSplit();
+            std::cout << "APS5_PROFILE_FRAME times the parts of one Recompile(request, capture) call in 16\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-miss-causes") {

@@ -129,6 +129,22 @@ std::string NameList(const std::array<const char*, Size>& names) {
     return list;
 }
 
+// The sampled parts of Recompile(request, capture), in us per call: each part's sampled total over
+// the sampled calls, so the parts add up to recompile_us/call.
+std::string FormatRecompileSplit(const ShaderRecompiler::MaterializeSplit::Counts& split, std::uint64_t frames) {
+    using Split = ShaderRecompiler::MaterializeSplit;
+    std::uint64_t total = 0;
+    for (const auto ns : split.ns) total += ns;
+    char text[160];
+    std::snprintf(text, sizeof(text), " recompile_calls/f=%.1f recompile_sampled=%llu recompile_us/call=%.2f recompile_split_us/call(", PerFrame(static_cast<double>(split.calls), frames), static_cast<unsigned long long>(split.sampled), PerItem(Us(total), split.sampled));
+    auto line = std::string(text) + NameList(Split::Names) + ")=";
+    for (std::size_t part = 0; part < Split::Parts; ++part) {
+        std::snprintf(text, sizeof(text), "%s%.2f", part == 0 ? "" : "/", PerItem(Us(split.ns[part]), split.sampled));
+        line += text;
+    }
+    return line;
+}
+
 // Each value per frame, '/'-separated: milliseconds of nanosecond totals, or counts.
 template <std::size_t Size>
 std::string PerFrameList(const std::array<std::uint64_t, Size>& values, std::uint64_t frames, bool nanoseconds) {
@@ -370,7 +386,7 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
         Rate(totals.epochProofReuses, epochProofs), perFrame(epochProofs), Rate(totals.refreshProofReuses, refreshProofs), perFrame(refreshProofs),
         static_cast<unsigned long long>(totals.proofVerifyChecks), static_cast<unsigned long long>(totals.proofVerifyMismatches));
     if (tail < 0) return {};
-    return line + text + "\n";
+    return line + text + FormatRecompileSplit(shaders.split, frames) + "\n";
 }
 
 std::size_t FormatRunId(std::span<char> out, std::string_view describe, std::string_view built, std::span<std::string_view> environment) {

@@ -79,8 +79,10 @@ void Run(AgcDriver::VulkanDevice& device, bool integer) {
         const auto pixel = invocation.Materialize(*capture);
         Require(pixel->variantId == artifact.variantId && pixel->specialization.empty(), "export mapping did not materialize a prepared fragment module");
         if (!first) first = pixel;
-        else if (mapping == 0xe4u) Require(pixel == first, "export mapping did not reuse the materialized result");
-        else Require(pixel != first, "export mapping reused stale materialized data");
+        // With the program split (the default) the same mapping fills a new result over the same
+        // program; with APS5_NO_PROGRAM_SPLIT=1 the result memo returns the same object.
+        else if (mapping == 0xe4u) Require(pixel->programPart != nullptr ? pixel->programPart == first->programPart && ShaderRecompiler::ResultMismatch(*pixel, *first).empty() : pixel == first, "export mapping did not reuse the materialized result");
+        else Require(pixel != first && (pixel->programPart == nullptr || pixel->programPart != first->programPart), "export mapping reused stale materialized data");
         for (const bool cached : {true, false}) {
             request.useCache = cached;
             const auto materialized = MaterializeShader(request, *capture, *handle);

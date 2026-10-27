@@ -152,13 +152,19 @@ void Run(AgcDriver::VulkanDevice& device) {
     const auto preparedCapture = invocation.Capture(preparedRuntime);
     const auto firstResult = invocation.Materialize(*preparedCapture);
     const auto repeatedCapture = invocation.Capture(preparedRuntime);
-    Require(invocation.Materialize(*repeatedCapture) == firstResult, "prepared invocation rebuilt an unchanged materialized result");
+    // With the program split (the default) an unchanged capture fills a new result over the same
+    // program; with APS5_NO_PROGRAM_SPLIT=1 the result memo returns the same object.
+    const auto sameResult = [&](const std::shared_ptr<const ShaderRecompiler::RecompileResult>& result) {
+        if (result->programPart == nullptr) return result == firstResult;
+        return result->programPart == firstResult->programPart && ShaderRecompiler::ResultMismatch(*result, *firstResult).empty();
+    };
+    Require(sameResult(invocation.Materialize(*repeatedCapture)), "prepared invocation rebuilt an unchanged materialized result");
     users[0] += 1;
     const auto changedCapture = invocation.Capture(preparedRuntime);
     const auto changedResult = invocation.Materialize(*changedCapture);
     Require(changedResult != firstResult && changedResult->spirv.data() == firstResult->spirv.data(), "prepared invocation did not distinguish changed runtime data");
     users[0] -= 1;
-    Require(invocation.Materialize(*preparedCapture) == firstResult, "prepared invocation evicted the previous runtime data");
+    Require(sameResult(invocation.Materialize(*preparedCapture)), "prepared invocation evicted the previous runtime data");
     auto replacement = OpenVulkanTestDevice();
     Require(replacement != nullptr && replacement->Serial() != device.Serial(), "replacement device was not created");
     auto replacementRequest = request;

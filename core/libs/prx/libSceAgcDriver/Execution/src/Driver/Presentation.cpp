@@ -294,6 +294,9 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     window.shaders.programKeyOverflow = census.overflow;
     window.shaders.split = ShaderRecompiler::TakeMaterializeSplit();
     const auto programs = ShaderRecompiler::ProgramMemoCounts();
+    window.shaders.programMemoHits = programs.hits - previousPrograms.hits;
+    window.shaders.programMemoMisses = programs.misses - previousPrograms.misses;
+    window.shaders.programMemoResets = programs.resets - previousPrograms.resets;
     window.shaders.programSplitVerifyChecks = programs.verifyChecks - previousPrograms.verifyChecks;
     window.shaders.programSplitVerifyMismatches = programs.verifyMismatches - previousPrograms.verifyMismatches;
     previousPrograms = programs;

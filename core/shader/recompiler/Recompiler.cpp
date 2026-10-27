@@ -1328,6 +1328,7 @@ RecompileResult fillData(const ProgramState& program, const CompiledVariant& var
     RecompileResult result = program.program;
     const auto& artifact = variant.artifact;
     result.vertexAttributes = std::move(inputs.vertexAttributes);
+    markSplit(MaterializeSplit::Artifact);
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);
     const auto& tables = *resolved;
     BindingAllocationResult bindings;
@@ -1882,9 +1883,14 @@ void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& 
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
 std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
+    const SplitScope split;
+    if (ProgramSplit()) {
+        auto result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, true));
+        result->cacheHit = cacheHit;
+        return result;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = resultMemoCounters();
-    const SplitScope split;
     std::uint64_t shape = 0;
     SnapshotParts parts{};
     const auto hashStarted = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1927,7 +1933,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.patched.fetch_add(1, std::memory_order_relaxed);
         if (VerifyMemoUserWordPatch()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot));
     } else {
-        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, ProgramSplit()));
+        result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot));
         markSplit(MaterializeSplit::Tail);
     }
     result->cacheHit = cacheHit;

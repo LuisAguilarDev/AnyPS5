@@ -1154,8 +1154,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> materializeMemoTable(co
     return Recompile(request, *capture);
 }
 
+// The result memo runs only with APS5_NO_PROGRAM_SPLIT=1: the program memo replaces it.
+bool resultMemoActive() {
+    return std::getenv("APS5_NO_PROGRAM_SPLIT") != nullptr;
+}
+
 void verifyResultMemoMissCauses() {
     using namespace ShaderRecompiler;
+    if (!resultMemoActive()) return;
     alignas(16) static std::array<std::uint32_t, 4> output{};
     alignas(16) static std::array<std::uint32_t, 4> other{};
     alignas(16) static std::array<std::uint32_t, 4> first{};
@@ -1196,7 +1202,8 @@ void verifyResultMemoMissCauses() {
 }
 
 // APS5_PROFILE_FRAME: Recompile(request, capture) times its parts on one call in 16, and the parts
-// of a sampled miss are the memo's and materializeResult's.
+// of a sampled miss are the memo's and materializeResult's. With the program split a repeated
+// snapshot fills the memoized program again and never touches the result memo's parts.
 void verifyRecompileSplit() {
     using namespace ShaderRecompiler;
     using Part = MaterializeSplit::Part;
@@ -1216,6 +1223,13 @@ void verifyRecompileSplit() {
     for (std::size_t i = 0; i < Distinct; ++i) static_cast<void>(materializeMemoTable(tables[Distinct - 1], true));
     const auto hits = TakeMaterializeSplit();
     require(hits.calls == Distinct && hits.sampled == Distinct / MaterializeSplit::SampleEvery, "recompile split: the hits were not counted");
+    if (!resultMemoActive()) {
+        require(hits.ns[Part::Program] + hits.ns[Part::Populate] != 0, "recompile split: a program memo hit did not time its fill");
+        for (const auto part : {Part::Hash, Part::Lookup, Part::Patch, Part::Insert, Part::Release}) {
+            require(hits.ns[part] == 0, "recompile split: the program split timed a result memo part");
+        }
+        return;
+    }
     require(hits.ns[Part::Hash] + hits.ns[Part::Lookup] != 0, "recompile split: the sampled hits did not time their hash and lookup");
     for (const auto part : {Part::Patch, Part::Artifact, Part::Program, Part::Populate, Part::Tail, Part::Insert, Part::Release}) {
         require(hits.ns[part] == 0, "recompile split: a memo hit was timed as a materialization");
@@ -1286,6 +1300,7 @@ void verifyProgramSplit() {
     require(guestWords(*a) == std::vector<std::uint32_t>(first.begin(), first.end()) && guestWords(*b) == std::vector<std::uint32_t>(second.begin(), second.end()), "program split: a result does not carry its own draw's V#");
     if (!split) {
         require(a->programPart == nullptr && b->programPart == nullptr && after.misses == before.misses && after.hits == before.hits, "program split: APS5_NO_PROGRAM_SPLIT=1 still materialized through a program");
+        require(materializeMemoTable(first, true) == a, "program split: APS5_NO_PROGRAM_SPLIT=1 lost the result memo");
         return;
     }
     require(a->programPart != nullptr && a->programPart == b->programPart, "program split: two draws of one program did not share it");
@@ -1294,6 +1309,15 @@ void verifyProgramSplit() {
     const auto c = materializeMemoTable(reformatted, true);
     require(c->programPart != nullptr && c->programPart != a->programPart, "program split: another V# format shared the program");
     require(ProgramMemoCounts().verifyMismatches == before.verifyMismatches, "program split: the reformatted result differs from its full materialization");
+    // The program memo replaces the result memo: the same snapshot again is filled again into the
+    // same program, and the result memo is neither looked up nor filled.
+    const auto memoBefore = ResultMemoCounts();
+    const auto programsBefore = ProgramMemoCounts();
+    const auto again = materializeMemoTable(first, true);
+    const auto memoAfter = ResultMemoCounts();
+    require(again != a && again->programPart == a->programPart && ProgramMemoCounts().hits - programsBefore.hits == 1, "program split: the same snapshot again did not fill the memoized program");
+    require(memoAfter.hits == memoBefore.hits && memoAfter.misses == memoBefore.misses, "program split: the result memo is still looked up");
+    require(guestWords(*again) == guestWords(*a), "program split: the same snapshot again filled other words");
 }
 
 void verifySharedBindingMetadata() {
@@ -1326,6 +1350,7 @@ void verifySharedBindingMetadata() {
 
 void verifyResultMemoMovedTable() {
     using namespace ShaderRecompiler;
+    if (!resultMemoActive()) return;
     alignas(16) static std::array<std::uint32_t, 4> output{};
     alignas(16) static std::array<std::uint32_t, 4> other{};
     alignas(16) static std::array<std::uint32_t, 4> first{};

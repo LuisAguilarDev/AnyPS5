@@ -524,6 +524,9 @@ void CheckMemoFormatting() {
     window.shaders.programKeys = 40;
     window.shaders.programKeysDistinct = 7;
     window.shaders.programKeyTableHits = 30;
+    window.shaders.programMemoHits = 19;
+    window.shaders.programMemoMisses = 1;
+    window.shaders.programMemoResets = 1;
     window.shaders.programSplitVerifyChecks = 6;
     window.shaders.programSplitVerifyMismatches = 2;
     window.shaders.split.calls = 64;
@@ -538,7 +541,7 @@ void CheckMemoFormatting() {
     Contains(line, "stages/draw=2.50 ");
     Contains(line, "program_keys/10s=7 program_key_materializes/f=20.0 program_key_table_hit%=75.0 program_key_overflow=0 ");
     Contains(line, "half_checks/f=10.0 half_stale/f=1.0 half_copy_us/draw=0.100 hold_waits/f=1.5 hold_wait_ms/f=1.50 ");
-    Contains(line, "epoch_proof_reuse%=75.0 epoch_proofs/f=20.0 refresh_proof_reuse%=75.0 refresh_proofs/f=4.0 proof_verify_checks=5 proof_verify_mismatches=1 program_split_verify_checks=6 program_split_verify_mismatches=2 ");
+    Contains(line, "epoch_proof_reuse%=75.0 epoch_proofs/f=20.0 refresh_proof_reuse%=75.0 refresh_proofs/f=4.0 proof_verify_checks=5 proof_verify_mismatches=1 program_memo_hit%=95.0 program_memo_lookups/f=10.0 program_memo_resets=1 program_split_verify_checks=6 program_split_verify_mismatches=2 ");
     Contains(line, "recompile_calls/f=32.0 recompile_sampled=4 recompile_us/call=3.50 recompile_split_us/call(hash/lookup/patch/artifact/program/populate/tail/insert/release)=0.50/0.00/0.00/0.00/0.00/3.00/0.00/0.00/0.00\n");
     Require(line.back() == '\n', "the memo line does not end the line");
     Contains(FrameSteps::FormatMemo(FrameSteps::Totals{}, FrameSteps::Window{}), "target_memo_hit%=0.0 ");

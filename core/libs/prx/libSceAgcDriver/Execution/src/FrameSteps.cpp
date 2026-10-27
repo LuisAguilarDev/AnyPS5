@@ -387,7 +387,10 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
         static_cast<unsigned long long>(totals.proofVerifyChecks), static_cast<unsigned long long>(totals.proofVerifyMismatches));
     if (tail < 0) return {};
     line += text;
-    std::snprintf(text, sizeof(text), " program_split_verify_checks=%llu program_split_verify_mismatches=%llu", static_cast<unsigned long long>(shaders.programSplitVerifyChecks), static_cast<unsigned long long>(shaders.programSplitVerifyMismatches));
+    const auto programLookups = shaders.programMemoHits + shaders.programMemoMisses;
+    std::snprintf(text, sizeof(text), " program_memo_hit%%=%.1f program_memo_lookups/f=%.1f program_memo_resets=%llu program_split_verify_checks=%llu program_split_verify_mismatches=%llu",
+        Rate(shaders.programMemoHits, programLookups), perFrame(programLookups), static_cast<unsigned long long>(shaders.programMemoResets),
+        static_cast<unsigned long long>(shaders.programSplitVerifyChecks), static_cast<unsigned long long>(shaders.programSplitVerifyMismatches));
     return line + text + FormatRecompileSplit(shaders.split, frames) + "\n";
 }
 

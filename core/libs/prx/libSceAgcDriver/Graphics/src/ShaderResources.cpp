@@ -3509,7 +3509,15 @@ private:
     std::unique_lock<GuestMemory::GpuMutexType> gpu;
 };
 bool ShaderResources::EpochProofs() {
-    return DrawPipelineEnabled();
+    return EpochProofsEnabled();
+}
+
+namespace {
+std::atomic<std::uint64_t> epochProofReuses{0};
+}
+
+std::uint64_t ShaderResources::EpochProofReuses() {
+    return epochProofReuses.load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -3578,6 +3586,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         noteEpochProof(true, false, false);
         NoteEpochProofUse(EpochProofKind::Resources, use, false);
+        epochProofReuses.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     const bool ok = revalidateFull(shaders, report);

@@ -153,8 +153,16 @@ void CheckVerifyCatchesStaleProof() {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        // Epoch proofs are on by default, without APS5_DRAW_PIPELINE; the _off test runs with
+        // APS5_NO_EPOCH_PROOFS=1 and expects them off.
+        const bool expectOff = argc == 2 && std::string(argv[1]) == "--expect-off";
+        Require(Graphics::EpochProofsEnabled() == !expectOff, expectOff ? "APS5_NO_EPOCH_PROOFS=1 left epoch proofs on" : "epoch proofs are not on by default");
+        if (expectOff) {
+            std::cout << "epoch proof switch test passed\n";
+            return 0;
+        }
         CheckReuseInsideWindow();
         CheckWritersForceFullRevalidate();
         CheckCommitterLockKeepsProof();

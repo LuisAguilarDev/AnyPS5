@@ -20,6 +20,13 @@ struct EpochProofToken {
     bool operator==(const EpochProofToken&) const = default;
 };
 
+// On by default, with or without APS5_DRAW_PIPELINE (they never call the draw finisher);
+// APS5_NO_EPOCH_PROOFS=1 runs every Revalidate and storage refresh in full, as before.
+inline bool EpochProofsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_EPOCH_PROOFS") == nullptr;
+    return enabled;
+}
+
 inline EpochProofToken CurrentEpochProof(std::uint64_t pendingSerial) {
     return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), pendingSerial};
 }

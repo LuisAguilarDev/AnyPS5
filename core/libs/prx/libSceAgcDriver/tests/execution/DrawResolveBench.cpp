@@ -362,17 +362,22 @@ void CheckStreams() {
 // submission are skipped after its first, and a CPU write to a texture between two submissions (an
 // ordering point) makes the first draw of the next one prove again. APS5_VERIFY_RESCACHE_EPOCH_GATE=1
 // proves the skipped ones too and aborts on a disagreement; APS5_NO_RESCACHE_EPOCH_GATE=1 proves
-// every draw.
+// every draw. The epoch proofs (on unless APS5_NO_EPOCH_PROOFS=1) skip the same proofs before the
+// gate is reached, so a proof skipped by either counts.
 void CheckEpochGate() {
     constexpr std::size_t draws = 64;
     const bool gate = std::getenv("APS5_NO_RESCACHE_EPOCH_GATE") == nullptr;
+    const bool epochProofs = AgcDriver::Graphics::ShaderResources::EpochProofs();
     for (const std::uint8_t value : {std::uint8_t{0x10}, std::uint8_t{0x20}}) {
         std::fill(Texels, Texels + TextureBytes, static_cast<std::byte>(value));
         const auto before = AgcDriver::Graphics::ShaderResources::GatedProofs();
+        const auto reusedBefore = AgcDriver::Graphics::ShaderResources::EpochProofReuses();
         static_cast<void>(Submit(Stream(Kind::Textures, draws, 0)));
         const auto gated = AgcDriver::Graphics::ShaderResources::GatedProofs() - before;
+        const auto reused = AgcDriver::Graphics::ShaderResources::EpochProofReuses() - reusedBefore;
+        if (!epochProofs) Require(reused == 0, "a stream of template hits reused " + std::to_string(reused) + " epoch proofs with the proofs off");
         if (!gate) Require(gated == 0, "a stream of template hits skipped " + std::to_string(gated) + " proofs with the gate off");
-        else Require(gated + 4u >= draws && gated < draws, "a stream of " + std::to_string(draws) + " template hits after a CPU write skipped " + std::to_string(gated) + " proofs");
+        else Require(gated + reused + 4u >= draws && gated + reused < draws, "a stream of " + std::to_string(draws) + " template hits after a CPU write skipped " + std::to_string(gated) + " proofs at the gate and reused " + std::to_string(reused) + " epoch proofs");
     }
 }
 

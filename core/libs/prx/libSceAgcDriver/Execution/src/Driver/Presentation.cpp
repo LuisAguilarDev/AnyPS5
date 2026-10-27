@@ -256,6 +256,7 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     static double previousGpuBusyMs = 0;
     static double previousGpuGapMs = 0;
     static ShaderRecompiler::ResultMemoTotals previousMemo;
+    static ShaderRecompiler::ProgramMemoTotals previousPrograms;
     static std::array<std::uint64_t, FrameSteps::KernelWaitKinds> previousWaits{};
     if (!started) {
         started = true;
@@ -265,6 +266,7 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
         static_cast<void>(ShaderRecompiler::TakeProgramKeyCensus());
         static_cast<void>(ShaderRecompiler::TakeMaterializeSplit());
         previousMemo = ShaderRecompiler::ResultMemoCounts();
+        previousPrograms = ShaderRecompiler::ProgramMemoCounts();
         const auto counts = VulkanDevice::PresentCounts();
         previousGpuBusyMs = counts.gpuBusyMs;
         previousGpuGapMs = counts.gpuGapMs;
@@ -291,6 +293,10 @@ void Driver::reportFrameSteps(std::int64_t nowNs) {
     window.shaders.programKeyTableHits = census.tableHits;
     window.shaders.programKeyOverflow = census.overflow;
     window.shaders.split = ShaderRecompiler::TakeMaterializeSplit();
+    const auto programs = ShaderRecompiler::ProgramMemoCounts();
+    window.shaders.programSplitVerifyChecks = programs.verifyChecks - previousPrograms.verifyChecks;
+    window.shaders.programSplitVerifyMismatches = programs.verifyMismatches - previousPrograms.verifyMismatches;
+    previousPrograms = programs;
     std::array<std::uint64_t, FrameSteps::KernelWaitKinds> waits{};
     KernelFrameWaitNanos_nid_postfix(waits.data(), waits.size());
     for (std::size_t i = 0; i < waits.size(); ++i) window.kernelWaitNs[i] = waits[i] - previousWaits[i];

@@ -1447,6 +1447,37 @@ ResultMemoCounters& resultMemoCounters() {
     return counters;
 }
 
+struct ProgramMemoCounters {
+    std::atomic<std::uint64_t> hits{0}, misses{0}, resets{0}, verifyCalls{0}, verifyChecks{0}, verifyMismatches{0};
+};
+
+ProgramMemoCounters& programMemoCounters() {
+    static ProgramMemoCounters counters;
+    return counters;
+}
+
+// APS5_VERIFY_PROGRAM_SPLIT: 0 when unset, else the program-split results per check (a value
+// that is not a positive number checks one in 64).
+std::uint64_t programSplitVerifyEvery() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_PROGRAM_SPLIT");
+        if (text == nullptr) return std::uint64_t{0};
+        const auto value = std::strtoull(text, nullptr, 10);
+        return value != 0 ? static_cast<std::uint64_t>(value) : std::uint64_t{64};
+    }();
+    return every;
+}
+
+// The bindings' words and metadata of two results, in consumer terms.
+std::string_view bindingMismatch(const DescriptorBinding& left, const DescriptorBinding& right) {
+    if (left.kind != right.kind || left.role != right.role || left.descriptorSet != right.descriptorSet || left.binding != right.binding || left.count != right.count || left.readOnly != right.readOnly || left.imageShape != right.imageShape) return "binding layout";
+    if (left.guestDescriptor != right.guestDescriptor) return "binding guest words";
+    const bool sameMetadata = left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageAtomic64 == right.imageAtomic64 && left.imageShapes == right.imageShapes &&
+        left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored &&
+        left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent;
+    return sameMetadata ? std::string_view{} : std::string_view{"binding metadata"};
+}
+
 struct ResultMemoMissCounters {
     std::atomic<std::uint64_t> firstSeen{0}, unchanged{0}, userDataOnly{0}, basesOnly{0}, basesAndSrtOnly{0}, vertexBasesOnly{0}, evictedReleases{0}, evictedLastReferences{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ResultMemoMissComponent::Count)> byComponent{};
@@ -2086,6 +2117,55 @@ ProgramKeyCensus::Counts TakeProgramKeyCensus() {
 
 MaterializeSplit::Counts TakeMaterializeSplit() {
     return materializeSplit().Take();
+}
+
+std::string_view ResultMismatch(const RecompileResult& left, const RecompileResult& right) {
+    if (left.variantId != right.variantId || left.memoryOffsetDword != right.memoryOffsetDword || left.shaderDataDwords != right.shaderDataDwords || left.imageMetadataDword != right.imageMetadataDword || left.runtimeImageCount != right.runtimeImageCount || left.runtimeImageResources != right.runtimeImageResources ||
+        left.registrationModule != right.registrationModule || left.bdaAbiVersion != right.bdaAbiVersion || left.windowLaneGuards != right.windowLaneGuards || left.runtimeAbiVersion != right.runtimeAbiVersion || left.vertexInputs != right.vertexInputs || left.vertexInputPatches != right.vertexInputPatches ||
+        left.vertexOffsetSgpr != right.vertexOffsetSgpr || left.instanceOffsetSgpr != right.instanceOffsetSgpr || left.vertexOffsetShared != right.vertexOffsetShared || left.instanceOffsetShared != right.instanceOffsetShared || left.vertexOffsetConflict != right.vertexOffsetConflict || left.instanceOffsetConflict != right.instanceOffsetConflict ||
+        left.hostSubgroupSize != right.hostSubgroupSize || left.fullSubgroups != right.fullSubgroups || left.functionLdsBuffer != right.functionLdsBuffer || left.parameterExports != right.parameterExports || left.fragmentParameters != right.fragmentParameters || left.barycentricEmulation != right.barycentricEmulation ||
+        left.meshBarycentrics != right.meshBarycentrics || left.stencilReferences != right.stencilReferences || left.stencilReplaySafe != right.stencilReplaySafe || left.bdaWrites != right.bdaWrites || left.stencilReferenceDword != right.stencilReferenceDword || left.workgroupMemoryDwords != right.workgroupMemoryDwords) {
+        return "artifact";
+    }
+    if (left.specializationId != right.specializationId || left.specialization != right.specialization || (left.spirv.data() != right.spirv.data() && left.spirv != right.spirv)) return "module";
+    if (left.userDataRegisterReads != right.userDataRegisterReads) return "user data registers";
+    if (left.bindings.size() != right.bindings.size()) return "binding layout";
+    for (std::size_t b = 0; b < left.bindings.size(); ++b) {
+        if (const auto field = bindingMismatch(left.bindings[b], right.bindings[b]); !field.empty()) return field;
+    }
+    if (left.pushConstants != right.pushConstants || left.readsDepthRemapPush != right.readsDepthRemapPush) return "push constants";
+    if (left.shaderDataUserWords != right.shaderDataUserWords || left.bufferBaseSlots != right.bufferBaseSlots) return "shader data slots";
+    if (left.vertexAttributes.size() != right.vertexAttributes.size()) return "vertex attributes";
+    for (std::size_t a = 0; a < left.vertexAttributes.size(); ++a) {
+        const auto& l = left.vertexAttributes[a];
+        const auto& r = right.vertexAttributes[a];
+        if (l.location != r.location || l.components != r.components || l.resource.fields != r.resource.fields || l.fetchIndex != r.fetchIndex || l.formatComponents != r.formatComponents) return "vertex attributes";
+    }
+    if (left.poisonedSrtReads != right.poisonedSrtReads || left.imageTableRanges != right.imageTableRanges || left.imageTableReadRanges != right.imageTableReadRanges || left.imageTableShader != right.imageTableShader || left.imageTableFaults != right.imageTableFaults || left.imageTablePoison.size() != right.imageTablePoison.size()) return "image tables";
+    for (std::size_t p = 0; p < left.imageTablePoison.size(); ++p) {
+        const auto& l = left.imageTablePoison[p];
+        const auto& r = right.imageTablePoison[p];
+        if (l.words != r.words || l.dwordCount != r.dwordCount || l.resource != r.resource || l.reason != r.reason) return "image tables";
+    }
+    return {};
+}
+
+bool ProgramSplitVerifySampled() {
+    const auto every = programSplitVerifyEvery();
+    return every != 0 && programMemoCounters().verifyCalls.fetch_add(1, std::memory_order_relaxed) % every == 0;
+}
+
+void NoteProgramSplitVerify(bool mismatch, std::string_view what) {
+    auto& counters = programMemoCounters();
+    counters.verifyChecks.fetch_add(1, std::memory_order_relaxed);
+    if (!mismatch) return;
+    constexpr std::uint64_t PrintedMismatches = 16;
+    if (counters.verifyMismatches.fetch_add(1, std::memory_order_relaxed) < PrintedMismatches) std::fprintf(stderr, "[program-split] APS5_VERIFY_PROGRAM_SPLIT: a split result differs from its full materialization in %.*s\n", static_cast<int>(what.size()), what.data());
+}
+
+ProgramMemoTotals ProgramMemoCounts() {
+    const auto& counters = programMemoCounters();
+    return {counters.hits.load(std::memory_order_relaxed), counters.misses.load(std::memory_order_relaxed), counters.resets.load(std::memory_order_relaxed), counters.verifyChecks.load(std::memory_order_relaxed), counters.verifyMismatches.load(std::memory_order_relaxed)};
 }
 
 ResultMemoMissCauses ResultMemoMisses() {

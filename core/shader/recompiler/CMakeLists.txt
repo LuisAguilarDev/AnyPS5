@@ -304,6 +304,10 @@ function(add_shader_recompiler target runtimeTarget)
             LinkUserDataTail
             TakeProgramKeyCensus
             TakeMaterializeSplit
+            ResultMismatch
+            ProgramSplitVerifySampled
+            NoteProgramSplitVerify
+            ProgramMemoCounts
             ThreadOwned
             ProgramRole
             UnresolvableSwappcTarget

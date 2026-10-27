@@ -838,6 +838,22 @@ struct ResultMemoTotals {
 // its parts on the sampled ones ([frame-steps-memo] recompile_split_us/call).
 [[nodiscard]] MaterializeSplit::Counts TakeMaterializeSplit();
 
+// The first field in which two results differ, "" when they are equal: every field a consumer
+// reads, the bindings' guest words and metadata included (APS5_VERIFY_PROGRAM_SPLIT).
+[[nodiscard]] std::string_view ResultMismatch(const RecompileResult& left, const RecompileResult& right);
+// APS5_VERIFY_PROGRAM_SPLIT: true for the program-split results to check against a full
+// materialization, one in 64 (one in N with APS5_VERIFY_PROGRAM_SPLIT=N).
+[[nodiscard]] bool ProgramSplitVerifySampled();
+// Counts one APS5_VERIFY_PROGRAM_SPLIT check and, with `mismatch`, a mismatch in `what`
+// (printed for the first ones).
+void NoteProgramSplitVerify(bool mismatch, std::string_view what);
+// The program memo's lookups and the APS5_VERIFY_PROGRAM_SPLIT checks since the start
+// (APS5_PROFILE_FRAME takes deltas).
+struct ProgramMemoTotals {
+    std::uint64_t hits = 0, misses = 0, resets = 0, verifyChecks = 0, verifyMismatches = 0;
+};
+[[nodiscard]] ProgramMemoTotals ProgramMemoCounts();
+
 // Debug aid (see DebugProbe in Translation/TranslationContext.hpp): the APS5_PROBE register probe is
 // only applied while a driver has it active, so it can be limited to one dispatch; the recompile
 // cache keys on it.

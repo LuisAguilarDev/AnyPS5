@@ -386,6 +386,8 @@ std::string FormatMemo(const Totals& totals, const Window& window) {
         Rate(totals.epochProofReuses, epochProofs), perFrame(epochProofs), Rate(totals.refreshProofReuses, refreshProofs), perFrame(refreshProofs),
         static_cast<unsigned long long>(totals.proofVerifyChecks), static_cast<unsigned long long>(totals.proofVerifyMismatches));
     if (tail < 0) return {};
+    line += text;
+    std::snprintf(text, sizeof(text), " program_split_verify_checks=%llu program_split_verify_mismatches=%llu", static_cast<unsigned long long>(shaders.programSplitVerifyChecks), static_cast<unsigned long long>(shaders.programSplitVerifyMismatches));
     return line + text + FormatRecompileSplit(shaders.split, frames) + "\n";
 }
 

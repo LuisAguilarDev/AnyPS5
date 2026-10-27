@@ -208,6 +208,7 @@ struct ChainTotals {
 struct ShaderTotals {
     std::uint64_t resultMemoHits = 0, resultMemoMisses = 0, resultMemoEvictions = 0;
     std::uint64_t programKeys = 0, programKeysDistinct = 0, programKeyTableHits = 0, programKeyOverflow = 0;
+    std::uint64_t programSplitVerifyChecks = 0, programSplitVerifyMismatches = 0;
     ShaderRecompiler::MaterializeSplit::Counts split;
 };
 

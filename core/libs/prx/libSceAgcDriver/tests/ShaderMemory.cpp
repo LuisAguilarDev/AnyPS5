@@ -1222,6 +1222,42 @@ void verifyRecompileSplit() {
     }
 }
 
+// APS5_VERIFY_PROGRAM_SPLIT compares a split result with a full materialization field by field:
+// equal results compare equal, and a change to the words, the push constants, the binding
+// metadata or the program is named.
+void verifyResultMismatch() {
+    using namespace ShaderRecompiler;
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    alignas(16) static std::array<std::uint32_t, 4> other{};
+    alignas(16) static std::array<std::uint32_t, 4> first{};
+    alignas(16) static std::array<std::uint32_t, 4> second{};
+    first = memoTableBuffer(output);
+    second = memoTableBuffer(other);
+    const auto a = materializeMemoTable(first, true);
+    const auto b = materializeMemoTable(second, true);
+    require(ResultMismatch(*a, *a).empty() && ResultMismatch(*a, RecompileResult(*a)).empty(), "result mismatch: a result differs from its copy");
+    require(ResultMismatch(*a, *b) == "binding guest words", "result mismatch: another V# was not named as the binding words");
+    auto changed = *a;
+    changed.pushConstants.push_back(std::byte{1});
+    require(ResultMismatch(*a, changed) == "push constants", "result mismatch: the push constants were not compared");
+    changed = *a;
+    const auto buffers = std::ranges::find_if(changed.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::GuestBuffers; });
+    require(buffers != changed.bindings.end() && !buffers->bufferWritten.empty(), "result mismatch: the materialized shader has no written guest buffer");
+    buffers->bufferWritten[0] = !buffers->bufferWritten[0];
+    require(ResultMismatch(*a, changed) == "binding metadata", "result mismatch: the binding metadata was not compared");
+    changed = *a;
+    ++changed.specializationId;
+    require(ResultMismatch(*a, changed) == "module", "result mismatch: the module was not compared");
+    changed = *a;
+    changed.userDataRegisterReads ^= 1u;
+    require(ResultMismatch(*a, changed) == "user data registers", "result mismatch: the user data register mask was not compared");
+    const auto before = ProgramMemoCounts();
+    NoteProgramSplitVerify(false, {});
+    NoteProgramSplitVerify(true, "push constants");
+    const auto after = ProgramMemoCounts();
+    require(after.verifyChecks - before.verifyChecks == 2 && after.verifyMismatches - before.verifyMismatches == 1, "result mismatch: the verify checks and mismatches were not counted");
+}
+
 void verifySharedBindingMetadata() {
     using namespace ShaderRecompiler;
     alignas(16) static std::array<std::uint32_t, 4> output{};
@@ -8619,6 +8655,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--shared-binding-metadata") {
             verifySharedBindingMetadata();
             std::cout << "Results of one binding plan share its binding metadata until a copy writes it\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-mismatch") {
+            verifyResultMismatch();
+            std::cout << "APS5_VERIFY_PROGRAM_SPLIT compares two results field by field and counts its checks\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--recompile-split") {
